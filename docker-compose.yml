@@ -1,0 +1,155 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.0-pg16
+    container_name: techflow-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-techflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-techflow}
+      POSTGRES_DB: ${POSTGRES_DB:-techflow}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./database/migrations/001_initial.sql:/docker-entrypoint-initdb.d/02-migrations.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-techflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - techflow
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: techflow-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - techflow
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: techflow-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - techflow
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: techflow-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://***REDACTED_USER***:***REDACTED_PASS***@postgres:5432/${POSTGRES_DB:-techflow}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      API_KEY: ${API_KEY:-test-key-12345}
+      CORS_ORIGINS: http://localhost:3000,http://localhost:8000
+    ports:
+      - "8000:8000"
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - techflow
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: techflow-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://***REDACTED_USER***:***REDACTED_PASS***@postgres:5432/${POSTGRES_DB:-techflow}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER}
+      GMAIL_CREDENTIALS_FILE: ${GMAIL_CREDENTIALS_FILE:-gmail_credentials.json}
+      GMAIL_TOKEN_FILE: ${GMAIL_TOKEN_FILE:-gmail_token.json}
+    command: python -m workers.message_processor
+    volumes:
+      - .:/app
+      - ./gmail_credentials.json:/app/gmail_credentials.json:ro
+      - ./gmail_token.json:/app/gmail_token.json
+    networks:
+      - techflow
+
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    container_name: techflow-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    depends_on:
+      - api
+    networks:
+      - techflow
+
+  grafana:
+    image: grafana/grafana:10.3.3
+    container_name: techflow-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: ''
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana_dashboard.json:/var/lib/grafana/dashboards/techflow.json:ro
+    depends_on:
+      - prometheus
+    networks:
+      - techflow
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  techflow:
+    driver: bridge

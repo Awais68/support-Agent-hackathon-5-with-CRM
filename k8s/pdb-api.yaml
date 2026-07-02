@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: techflow-api-pdb
+  namespace: techflow
+  labels:
+    app: api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: api

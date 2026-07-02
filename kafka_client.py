@@ -1,0 +1,384 @@
+"""Kafka client for TechFlow CRM Digital FTE with DLQ routing and retry logic."""
+
+import json
+from datetime import datetime
+from typing import Any, Callable, Dict, Optional
+from uuid import UUID
+import asyncio
+
+from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+import structlog
+from tenacity import (
+    AsyncRetrying,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
+
+logger = structlog.get_logger(__name__)
+
+# Topic definitions
+INBOUND_EMAIL_TOPIC = "inbound.email"
+INBOUND_WHATSAPP_TOPIC = "inbound.whatsapp"
+INBOUND_WEBFORM_TOPIC = "inbound.webform"
+AGENT_PROCESSING_TOPIC = "agent.processing"
+AGENT_COMPLETED_TOPIC = "agent.completed"
+NOTIFICATIONS_OUTBOUND_TOPIC = "notifications.outbound"
+ESCALATIONS_TOPIC = "escalations"
+METRICS_EVENTS_TOPIC = "metrics.events"
+DLQ_TOPIC = "dlq"
+
+ALL_TOPICS = [
+    INBOUND_EMAIL_TOPIC,
+    INBOUND_WHATSAPP_TOPIC,
+    INBOUND_WEBFORM_TOPIC,
+    AGENT_PROCESSING_TOPIC,
+    AGENT_COMPLETED_TOPIC,
+    NOTIFICATIONS_OUTBOUND_TOPIC,
+    ESCALATIONS_TOPIC,
+    METRICS_EVENTS_TOPIC,
+    DLQ_TOPIC,
+]
+
+
+class JSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder for UUID and datetime objects."""
+
+    def default(self, obj: Any) -> Any:
+        if isinstance(obj, UUID):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+
+
+class KafkaMessage:
+    """Envelope for Kafka messages with metadata."""
+
+    def __init__(
+        self,
+        topic: str,
+        payload: Dict[str, Any],
+        message_id: str = None,
+        timestamp: Optional[datetime] = None,
+        headers: Dict[str, str] = {},
+    ):
+        self.topic = topic
+        self.payload = payload
+        self.message_id = message_id or str(UUID(int=int(datetime.now().timestamp() * 1000000)))
+        self.timestamp = timestamp or datetime.utcnow()
+        self.headers = headers
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "message_id": self.message_id,
+            "topic": self.topic,
+            "timestamp": self.timestamp.isoformat(),
+            "payload": self.payload,
+            "headers": self.headers,
+        }
+
+    def to_json(self) -> str:
+        """Convert to JSON string."""
+        return json.dumps(self.to_dict(), cls=JSONEncoder)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "KafkaMessage":
+        """Create from dictionary."""
+        return cls(
+            topic=data["topic"],
+            payload=data["payload"],
+            message_id=data.get("message_id"),
+            timestamp=datetime.fromisoformat(data["timestamp"])
+            if isinstance(data.get("timestamp"), str)
+            else data.get("timestamp"),
+            headers=data.get("headers", {}),
+        )
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "KafkaMessage":
+        """Create from JSON string."""
+        return cls.from_dict(json.loads(json_str))
+
+
+class KafkaProducerClient:
+    """Async Kafka producer with DLQ routing and retry logic."""
+
+    def __init__(self, bootstrap_servers: str):
+        self.bootstrap_servers = bootstrap_servers
+        self.producer: Optional[AIOKafkaProducer] = None
+        self.retry_policy = AsyncRetrying(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        )
+
+    async def start(self) -> None:
+        """Start the producer."""
+        self.producer = AIOKafkaProducer(
+            bootstrap_servers=self.bootstrap_servers,
+            value_serializer=lambda v: v.encode("utf-8"),
+            compression_type="gzip",
+        )
+        await self.producer.start()
+        logger.info("Kafka producer started", servers=self.bootstrap_servers)
+
+    async def stop(self) -> None:
+        """Stop the producer."""
+        if self.producer:
+            await self.producer.stop()
+            logger.info("Kafka producer stopped")
+
+    async def send_message(
+        self, topic: str, payload: Dict[str, Any], key: Optional[str] = None
+    ) -> str:
+        """Send a message to a Kafka topic with retry logic."""
+        message = KafkaMessage(topic, payload)
+
+        try:
+            async for attempt in self.retry_policy:
+                with attempt:
+                    if not self.producer:
+                        raise RuntimeError("Producer not started")
+
+                    await self.producer.send_and_wait(
+                        topic,
+                        value=message.to_json(),
+                        key=key.encode("utf-8") if key else None,
+                    )
+
+            logger.info(
+                "Message sent",
+                topic=topic,
+                message_id=message.message_id,
+                payload_keys=list(payload.keys()),
+            )
+            return message.message_id
+
+        except Exception as e:
+            logger.error(
+                "Failed to send message, routing to DLQ",
+                topic=topic,
+                error=str(e),
+                payload_keys=list(payload.keys()),
+            )
+            # Route to DLQ
+            dlq_payload = {
+                "original_topic": topic,
+                "original_payload": payload,
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            try:
+                if self.producer:
+                    await self.producer.send_and_wait(
+                        DLQ_TOPIC,
+                        value=KafkaMessage(DLQ_TOPIC, dlq_payload).to_json(),
+                        key=key.encode("utf-8") if key else None,
+                    )
+                logger.info(f"Message routed to DLQ: {message.message_id}")
+            except Exception as dlq_error:
+                logger.critical(
+                    "DLQ routing failed",
+                    original_error=str(e),
+                    dlq_error=str(dlq_error),
+                )
+            raise
+
+
+class KafkaConsumerClient:
+    """Async Kafka consumer with error handling."""
+
+    def __init__(self, bootstrap_servers: str, group_id: str):
+        self.bootstrap_servers = bootstrap_servers
+        self.group_id = group_id
+        self.consumer: Optional[AIOKafkaConsumer] = None
+
+    async def start(self, topics: list[str]) -> None:
+        """Start the consumer."""
+        self.consumer = AIOKafkaConsumer(
+            *topics,
+            bootstrap_servers=self.bootstrap_servers,
+            group_id=self.group_id,
+            value_deserializer=lambda m: m.decode("utf-8"),
+            auto_offset_reset="earliest",
+            enable_auto_commit=True,
+        )
+        await self.consumer.start()
+        logger.info(
+            "Kafka consumer started",
+            group_id=self.group_id,
+            topics=topics,
+            servers=self.bootstrap_servers,
+        )
+
+    async def stop(self) -> None:
+        """Stop the consumer."""
+        if self.consumer:
+            await self.consumer.stop()
+            logger.info("Kafka consumer stopped")
+
+    async def consume_messages(
+        self,
+        on_message: Callable[[KafkaMessage], Any],
+        timeout_ms: int = 1000,
+    ) -> None:
+        """Consume messages from subscribed topics."""
+        if not self.consumer:
+            raise RuntimeError("Consumer not started")
+
+        try:
+            async for raw_message in self.consumer:
+                try:
+                    message = KafkaMessage.from_json(raw_message.value)
+                    logger.info(
+                        "Message received",
+                        topic=message.topic,
+                        message_id=message.message_id,
+                    )
+
+                    # Call handler
+                    result = on_message(message)
+                    if isinstance(result, (asyncio.coroutine, asyncio.Task)):
+                        await result
+
+                except json.JSONDecodeError as e:
+                    logger.error(
+                        "Failed to parse message",
+                        error=str(e),
+                        raw_value=raw_message.value[:200],
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Handler error",
+                        error=str(e),
+                        message_topic=getattr(message, "topic", "unknown"),
+                    )
+
+        except asyncio.CancelledError:
+            logger.info("Consumer cancelled")
+        except Exception as e:
+            logger.error("Consumer error", error=str(e))
+            raise
+
+
+def create_inbound_email_message(
+    customer_email: str,
+    sender_name: str,
+    subject: str,
+    body: str,
+    message_id: str = None,
+) -> KafkaMessage:
+    """Create an inbound email message."""
+    return KafkaMessage(
+        topic=INBOUND_EMAIL_TOPIC,
+        payload={
+            "customer_email": customer_email,
+            "sender_name": sender_name,
+            "subject": subject,
+            "body": body,
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+        message_id=message_id,
+        headers={"content_type": "email"},
+    )
+
+
+def create_inbound_whatsapp_message(
+    customer_phone: str,
+    customer_name: str,
+    message_body: str,
+    media_url: Optional[str] = None,
+    message_id: str = None,
+) -> KafkaMessage:
+    """Create an inbound WhatsApp message."""
+    return KafkaMessage(
+        topic=INBOUND_WHATSAPP_TOPIC,
+        payload={
+            "customer_phone": customer_phone,
+            "customer_name": customer_name,
+            "message_body": message_body,
+            "media_url": media_url,
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+        message_id=message_id,
+        headers={"content_type": "whatsapp"},
+    )
+
+
+def create_inbound_webform_message(
+    customer_email: str,
+    customer_name: str,
+    subject: str,
+    message_body: str,
+    category: str = "general",
+    priority: str = "medium",
+    customer_phone: Optional[str] = None,
+    message_id: str = None,
+) -> KafkaMessage:
+    """Create an inbound web form message."""
+    payload = {
+        "customer_email": customer_email,
+        "customer_name": customer_name,
+        "subject": subject,
+        "message_body": message_body,
+        "category": category,
+        "priority": priority,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    if customer_phone:
+        payload["customer_phone"] = customer_phone
+
+    return KafkaMessage(
+        topic=INBOUND_WEBFORM_TOPIC,
+        payload=payload,
+        message_id=message_id,
+        headers={"content_type": "webform"},
+    )
+
+
+def create_agent_processing_message(
+    ticket_id: str,
+    customer_id: str,
+    input_message: str,
+    channel: str,
+    message_id: str = None,
+) -> KafkaMessage:
+    """Create an agent processing event."""
+    return KafkaMessage(
+        topic=AGENT_PROCESSING_TOPIC,
+        payload={
+            "ticket_id": ticket_id,
+            "customer_id": customer_id,
+            "input_message": input_message,
+            "channel": channel,
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+        message_id=message_id,
+        headers={"event_type": "agent_processing"},
+    )
+
+
+def create_escalation_message(
+    ticket_id: str,
+    customer_id: str,
+    reason: str,
+    priority: str = "high",
+    context: Optional[Dict[str, Any]] = None,
+    message_id: str = None,
+) -> KafkaMessage:
+    """Create an escalation event."""
+    return KafkaMessage(
+        topic=ESCALATIONS_TOPIC,
+        payload={
+            "ticket_id": ticket_id,
+            "customer_id": customer_id,
+            "reason": reason,
+            "priority": priority,
+            "context": context or {},
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+        message_id=message_id,
+        headers={"event_type": "escalation"},
+    )

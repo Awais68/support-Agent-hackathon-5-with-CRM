@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: techflow-db-init
+  namespace: techflow
+  labels:
+    app: db-init
+    job: seed
+  annotations:
+    description: "One-time database migration and seed job. Idempotent — safe to re-run."
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: seed
+        image: techflow-api:latest
+        imagePullPolicy: Always
+        command:
+        - python
+        - -m
+        - database.seed
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: techflow-secrets
+              key: database-url
+        - name: RUN_MODE
+          value: "seed"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "250m"
+      # Ensure postgres is running before this job starts
+      # The job should be applied after k8s/postgres.yaml (StatefulSet) is deployed
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300

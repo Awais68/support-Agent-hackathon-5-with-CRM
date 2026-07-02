@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: techflow-config
+  namespace: techflow
+data:
+  kafka-servers: "kafka-0.kafka-headless.techflow.svc.cluster.local:9092,kafka-1.kafka-headless.techflow.svc.cluster.local:9092"
+  postgres-host: "postgres-0.postgres-headless.techflow.svc.cluster.local"
+  postgres-port: "5432"
+  postgres-db: "techflow"
+  api-host: "0.0.0.0"
+  api-port: "8000"
+  cors-origins: "https://app.techflow.com,https://www.techflow.com"
+  log-level: "info"
