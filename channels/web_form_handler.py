@@ -2,6 +2,8 @@
 
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, EmailStr, validator
+from pydantic import ValidationError as PydanticValidationError
+from exceptions import sanitize_error_message
 import structlog
 
 from kafka_client import KafkaProducerClient, create_inbound_webform_message
@@ -67,9 +69,9 @@ class WebFormHandler:
         try:
             submission = WebFormSubmission(**data)
             return True, submission, None
-        except Exception as e:
-            logger.warning("Web form validation error", error=str(e))
-            return False, None, str(e)
+        except (PydanticValidationError, ValueError, Exception) as e:
+            logger.warning("Web form validation error", error=sanitize_error_message(str(e)))
+            return False, None, sanitize_error_message(str(e))
 
     async def process_submission(
         self, submission: WebFormSubmission
@@ -117,7 +119,7 @@ class WebFormHandler:
         except Exception as e:
             logger.error(
                 "Error processing web form submission",
-                error=str(e),
+                error=sanitize_error_message(str(e)),
                 email=submission.email,
             )
             raise
@@ -146,7 +148,7 @@ class WebFormHandler:
         except Exception as e:
             logger.error(
                 "Error handling web form attachment",
-                error=str(e),
+                error=sanitize_error_message(str(e)),
                 email=email,
                 filename=filename,
             )

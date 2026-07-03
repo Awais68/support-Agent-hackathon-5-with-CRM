@@ -41,11 +41,13 @@ spec:
             configMapKeyRef:
               name: techflow-config
               key: kafka-servers
-        - name: OPENAI_API_KEY
+        - name: OPENROUTER_API_KEY
           valueFrom:
             secretKeyRef:
               name: techflow-secrets
-              key: openai-api-key
+              key: openrouter-api-key
+        - name: OPENROUTER_BASE_URL
+          value: "https://openrouter.ai/api/v1"
         - name: API_KEY
           valueFrom:
             secretKeyRef:

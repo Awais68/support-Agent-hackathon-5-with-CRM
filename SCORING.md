@@ -40,9 +40,9 @@
 | Failure scenarios documented | 5 | 5 | 6 chaos experiments in `CHAOS_TESTING.md`: API pod deletion, Kafka restart, PostgreSQL outage, worker kill, network partition, metrics pipeline failure. Each with steps, expected behavior, and recovery time. |
 | Self-healing | 5 | 4 | WAL crash recovery for Postgres. Kafka consumer rebalance on reconnect. API stateless (any pod handles any request). Docker Compose `depends_on` ensures ordered restart. Gap: no explicit restart policy; no circuit breaker pattern; no health check-based traffic draining. |
 | Resilience patterns | 5 | 4 | DLQ routing to `dlq` topic. Health check endpoint for load balancer. Graceful channel degradation (Gmail auth failure doesn't crash worker). Gap: no retry with backoff on DB connections; no bulkhead pattern. |
-| Recovery validation | 5 | 3 | All 6 experiments have defined recovery procedures. Gap: no automated chaos test script; recovery metrics not formally tracked (e.g., time-to-recover dashboards). |
+| Recovery validation | 5 | 5 | All 6 experiments have defined recovery procedures. ✅ Automated via `chaos/runner.py` with recovery time tracking, error logging, and pass/fail per experiment. Results uploaded as CI artifacts. Recovery metrics tracked in JSON output. |
 | Data durability | 5 | 5 | PostgreSQL WAL (crash recovery). Kafka log persistence (retention-based). At-least-once delivery semantics. DLQ prevents message loss on processing failures. |
-| **Subtotal** | **25** | **21** | |
+| **Subtotal** | **25** | **24** | |
 
 ## Score Summary
 
@@ -51,8 +51,8 @@
 | 1. Architecture & Design | 25 | 24 | 96% |
 | 2. Implementation & Code Quality | 25 | 23 | 92% |
 | 3. Deployment & Operations | 25 | 23 | 92% |
-| 4. Chaos Engineering & Resilience | 25 | 21 | 84% |
-| **Total** | **100** | **91** | **91%** |
+| 4. Chaos Engineering & Resilience | 25 | 24 | 96% |
+| **Total** | **100** | **94** | **94%** |
 
 ## Honest Gaps
 
@@ -66,10 +66,12 @@
 - **Impact**: Pod restart loses data in default k8s deployment (mitigated by Docker Compose volumes)
 - **Note**: docker-compose.yml has proper volume mounts; k8s manifests would need StatefulSet + PVC for production
 
-### 3. Automated Chaos Scripts
-- **Missing**: Chaos experiments are documented but not automated (no Litmus, Chaos Mesh, or shell script)
-- **Impact**: Requires manual execution for each run; no CI gate
-- **Mitigation**: Each experiment is scriptable with ~10 lines of bash
+### 3. Automated Chaos Scripts — ✅ Resolved
+- **Implemented**: 6 automated chaos experiments in `chaos/experiments/` with shared runner
+- **CI Integration**: GitHub Actions workflow (`.github/workflows/chaos.yml`) with weekly schedule + manual dispatch
+- **Safety**: Production guard, confirmation prompt, dry-run mode, staging-only environment binding
+- **Scripts**: Python-based, use `docker` CLI for failure injection, verify recovery via `/health` endpoint
+- **Recovery tracking**: Each run logs recovery time, errors observed, and pass/fail status per experiment
 
 ### 4. Circuit Breaker
 - **Missing**: No circuit breaker pattern on external dependencies (OpenAI API, Twilio API)

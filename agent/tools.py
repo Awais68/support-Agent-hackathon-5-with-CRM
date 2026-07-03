@@ -1,21 +1,21 @@
 """Agent tools for TechFlow CRM Digital FTE using OpenAI SDK with real DB/Kafka integration."""
 
 import json
+import os
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
 from uuid import UUID
-from datetime import datetime
+from datetime import UTC, datetime
 
 import asyncpg
 import structlog
 from openai import AsyncOpenAI
+from exceptions import sanitize_error_message
+from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
-from agent.formatters import add_knowledge_base_source
 from database import queries as db
 from kafka_client import (
     KafkaProducerClient,
     create_escalation_message,
-    create_agent_processing_message,
 )
 
 logger = structlog.get_logger(__name__)
@@ -212,12 +212,23 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             category=category,
         )
 
-        # Get embedding for the query
-        embedding_resp = await context.openai_client.embeddings.create(
-            input=query,
-            model="text-embedding-3-small",
-        )
-        embedding = embedding_resp.data[0].embedding
+        embedding_model = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
+        _cb = get_circuit_breaker("openai")
+        try:
+            async with _cb:
+                embedding_resp = await context.openai_client.embeddings.create(
+                    input=query,
+                    model=embedding_model,
+                )
+            embedding = embedding_resp.data[0].embedding
+        except CircuitBreakerError:
+            logger.error("Knowledge base search failed (OpenAI circuit open)", query=query)
+            return {
+                "found": False,
+                "results": [],
+                "message": "Unable to search knowledge base. Please escalate to human support.",
+                "error": "AI service temporarily unavailable",
+            }
 
         # Search database using pgvector
         results = await db.search_knowledge_base(
@@ -244,13 +255,21 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             else f"No articles found for '{query}'. Please escalate to human support.",
         }
 
-    except Exception as e:
-        logger.error("Knowledge base search failed", error=str(e), query=args.get("query"))
+    except (asyncpg.PostgresError, ConnectionError) as e:
+        logger.error("Knowledge base search failed (DB)", error=sanitize_error_message(str(e)), query=args.get("query"))
         return {
             "found": False,
             "results": [],
-            "message": f"Unable to search knowledge base: {str(e)}. Please escalate to human support.",
-            "error": str(e),
+            "message": "Unable to search knowledge base. Please escalate to human support.",
+            "error": sanitize_error_message(str(e)),
+        }
+    except Exception as e:
+        logger.error("Knowledge base search failed", error=sanitize_error_message(str(e)), query=args.get("query"))
+        return {
+            "found": False,
+            "results": [],
+            "message": "Unable to search knowledge base. Please escalate to human support.",
+            "error": sanitize_error_message(str(e)),
         }
 
 
@@ -297,10 +316,10 @@ async def create_ticket(args: dict, context: ToolContext) -> dict:
             "tracking_url": f"https://support.techflow.com/tickets/{ticket_number}",
         }
 
-    except Exception as e:
+    except (asyncpg.PostgresError, ConnectionError) as e:
         logger.error(
-            "Ticket creation failed",
-            error=str(e),
+            "Ticket creation failed (DB)",
+            error=sanitize_error_message(str(e)),
             email=args.get("customer_email"),
         )
         return {
@@ -308,7 +327,20 @@ async def create_ticket(args: dict, context: ToolContext) -> dict:
             "ticket_id": None,
             "status": "error",
             "tracking_url": None,
-            "error": str(e),
+            "error": sanitize_error_message(str(e)),
+        }
+    except Exception as e:
+        logger.error(
+            "Ticket creation failed",
+            error=sanitize_error_message(str(e)),
+            email=args.get("customer_email"),
+        )
+        return {
+            "ticket_number": None,
+            "ticket_id": None,
+            "status": "error",
+            "tracking_url": None,
+            "error": sanitize_error_message(str(e)),
         }
 
 
@@ -361,17 +393,29 @@ async def get_customer_history(args: dict, context: ToolContext) -> dict:
             else f"No previous tickets found for {customer_email}.",
         }
 
-    except Exception as e:
+    except (asyncpg.PostgresError, ConnectionError) as e:
         logger.error(
-            "History retrieval failed",
-            error=str(e),
+            "History retrieval failed (DB)",
+            error=sanitize_error_message(str(e)),
             email=args.get("customer_email"),
         )
         return {
             "ticket_count": 0,
             "tickets": [],
-            "message": f"Unable to retrieve history. Error: {str(e)}",
-            "error": str(e),
+            "message": "Unable to retrieve history.",
+            "error": sanitize_error_message(str(e)),
+        }
+    except Exception as e:
+        logger.error(
+            "History retrieval failed",
+            error=sanitize_error_message(str(e)),
+            email=args.get("customer_email"),
+        )
+        return {
+            "ticket_count": 0,
+            "tickets": [],
+            "message": "Unable to retrieve history.",
+            "error": sanitize_error_message(str(e)),
         }
 
 
@@ -427,17 +471,29 @@ async def escalate_to_human(args: dict, context: ToolContext) -> dict:
             f"A human agent will review and respond shortly.",
         }
 
-    except Exception as e:
+    except (asyncpg.PostgresError, ConnectionError) as e:
         logger.error(
-            "Escalation failed",
-            error=str(e),
+            "Escalation failed (DB/Kafka)",
+            error=sanitize_error_message(str(e)),
             ticket_id=args.get("ticket_id"),
         )
         return {
             "escalated": False,
             "escalation_id": None,
-            "message": f"Escalation failed: {str(e)}",
-            "error": str(e),
+            "message": "Escalation failed.",
+            "error": sanitize_error_message(str(e)),
+        }
+    except Exception as e:
+        logger.error(
+            "Escalation failed",
+            error=sanitize_error_message(str(e)),
+            ticket_id=args.get("ticket_id"),
+        )
+        return {
+            "escalated": False,
+            "escalation_id": None,
+            "message": "Escalation failed.",
+            "error": sanitize_error_message(str(e)),
         }
 
 
@@ -491,7 +547,7 @@ async def send_response(args: dict, context: ToolContext) -> dict:
                 "channel": channel,
                 "content": response_body,
                 "response_type": response_type,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             },
             key=ticket_id,
         )
@@ -509,18 +565,31 @@ async def send_response(args: dict, context: ToolContext) -> dict:
             "message": f"Response sent to {customer_email} via {channel}.",
         }
 
-    except Exception as e:
+    except (asyncpg.PostgresError, ConnectionError) as e:
         logger.error(
-            "Failed to send response",
-            error=str(e),
+            "Failed to send response (DB/Kafka)",
+            error=sanitize_error_message(str(e)),
             ticket_id=args.get("ticket_id"),
             channel=args.get("channel"),
         )
         return {
             "sent": False,
             "message_id": None,
-            "message": f"Failed to send response: {str(e)}",
-            "error": str(e),
+            "message": "Failed to send response.",
+            "error": sanitize_error_message(str(e)),
+        }
+    except Exception as e:
+        logger.error(
+            "Failed to send response",
+            error=sanitize_error_message(str(e)),
+            ticket_id=args.get("ticket_id"),
+            channel=args.get("channel"),
+        )
+        return {
+            "sent": False,
+            "message_id": None,
+            "message": "Failed to send response.",
+            "error": sanitize_error_message(str(e)),
         }
 
 
@@ -543,7 +612,7 @@ async def execute_tool(name: str, args: dict, context: ToolContext) -> str:
         else:
             result = {"error": f"Unknown tool: {name}"}
     except Exception as e:
-        result = {"error": str(e)}
+        result = {"error": sanitize_error_message(str(e))}
     return json.dumps(result)
 
 

@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keda
+  labels:
+    name: keda
+---
+# Helm install command (run manually, not via kubectl apply):
+#
+#   helm repo add kedacore https://kedacore.github.io/charts
+#   helm repo update
+#   helm install keda kedacore/keda \
+#     --namespace keda \
+#     --create-namespace \
+#     --version 2.15.0
+#
+# Verify:
+#   kubectl get pods -n keda
+#   kubectl get crd | grep keda
+#
+# To uninstall:
+#   helm uninstall keda -n keda
+#
+# For Oracle Cloud OKE, KEDA scrapes Kafka lag via:
+#   kafka.admin.client configuration in TriggerAuthentication
+#
+# CRDs are installed automatically by the Helm chart.
+# No manual resource creation needed here — this file serves as documentation.

@@ -1,14 +1,163 @@
 """Tests for cross-channel identity resolution via customer_identifiers table."""
+"""Tests for pg_trgm fuzzy matching identity resolution."""
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
-from datetime import datetime
+from datetime import UTC, datetime
 
 from database import queries as db
 
 
 pytestmark = pytest.mark.asyncio
+
+
+class TestFuzzySearchCustomers:
+    """Test fuzzy search by name/email using pg_trgm."""
+
+    async def test_fuzzy_search_by_email_found(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = [
+            {"id": UUID("11111111-1111-1111-1111-111111111111"), "email": "jon@example.com", "name": "Jon Doe", "similarity": 0.6},
+            {"id": UUID("22222222-2222-2222-2222-222222222222"), "email": "john@example.net", "name": "John Doe", "similarity": 0.35},
+        ]
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        results = await db.fuzzy_search_customers(
+            mock_db_pool, "john@example.com", search_field="email", threshold=0.3
+        )
+
+        assert len(results) == 2
+        assert results[0]["similarity"] >= 0.3
+
+    async def test_fuzzy_search_email_below_threshold(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = []
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        results = await db.fuzzy_search_customers(
+            mock_db_pool, "bob@example.com", search_field="email", threshold=0.8
+        )
+
+        assert len(results) == 0
+
+    async def test_fuzzy_search_by_name(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = [
+            {"id": UUID("11111111-1111-1111-1111-111111111111"), "name": "Jon Doe", "email": "jon@example.com", "similarity": 0.55},
+        ]
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        results = await db.fuzzy_search_customers(
+            mock_db_pool, "John Doe", search_field="name", threshold=0.3
+        )
+
+        assert len(results) == 1
+        assert results[0]["similarity"] >= 0.3
+
+    async def test_fuzzy_search_invalid_field(self, mock_db_pool):
+        with pytest.raises(ValueError):
+            await db.fuzzy_search_customers(
+                mock_db_pool, "test", search_field="phone"
+            )
+
+    async def test_fuzzy_search_empty_term(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = []
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        results = await db.fuzzy_search_customers(
+            mock_db_pool, "", search_field="email", threshold=0.3
+        )
+
+        assert results == []
+
+
+class TestFindCustomerByNameEmail:
+    """Test exact-then-fuzzy customer lookup."""
+
+    async def test_exact_email_match_returns_first(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.return_value = {
+            "id": UUID("11111111-1111-1111-1111-111111111111"),
+            "email": "john@example.com",
+            "name": "John Doe",
+            "company": "Acme Corp",
+            "tier": "starter",
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+            "metadata": {},
+        }
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        result = await db.find_customer_by_name_email(
+            mock_db_pool, "john@example.com"
+        )
+
+        assert result is not None
+        assert result["email"] == "john@example.com"
+        # Should NOT have called fuzzy query
+        assert mock_conn.fetchrow.call_count == 1
+
+    async def test_exact_not_found_then_fuzzy_email(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            None,  # exact match → not found
+            {  # fuzzy email match → found
+                "id": UUID("11111111-1111-1111-1111-111111111111"),
+                "email": "jon@example.com",
+                "name": "Jon Doe",
+                "company": "Acme Corp",
+                "tier": "starter",
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
+                "metadata": {},
+                "sim": 0.6,
+            },
+        ]
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        result = await db.find_customer_by_name_email(
+            mock_db_pool, "john@example.com"
+        )
+
+        assert result is not None
+        assert result["email"] == "jon@example.com"
+
+    async def test_no_match_returns_none(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            None,  # exact match → not found
+            None,  # fuzzy email → not found
+        ]
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        result = await db.find_customer_by_name_email(
+            mock_db_pool, "nonexistent@example.com"
+        )
+
+        assert result is None
+
+    async def test_fuzzy_name_fallback(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            None,  # exact email → not found
+            None,  # fuzzy email → not found
+            {  # fuzzy name → found
+                "id": UUID("11111111-1111-1111-1111-111111111111"),
+                "email": "jsmith@other.com",
+                "name": "Jon Smith",
+                "sim": 0.5,
+            },
+        ]
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        result = await db.find_customer_by_name_email(
+            mock_db_pool, "new-email@test.com", name="John Smith"
+        )
+
+        assert result is not None
+        assert result["name"] == "Jon Smith"
 
 
 class TestGetCustomerByIdentifier:
@@ -90,7 +239,7 @@ class TestAddCustomerIdentifier:
             "customer_id": customer_id,
             "identifier_type": "phone",
             "identifier_value": "+14155559999",
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(UTC),
         }
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
@@ -136,8 +285,8 @@ class TestGetCustomerOrCreateByIdentifier:
             "name": "Alice Johnson",
             "company": "Acme Corp",
             "tier": "enterprise",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
             "metadata": {},
         }
 
@@ -153,15 +302,17 @@ class TestGetCustomerOrCreateByIdentifier:
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
         mock_conn.fetchrow.side_effect = [
-            None,  # SELECT - not found
-            {  # INSERT customers RETURNING
+            None,  # Step 1: exact match → not found
+            None,  # Step 2: fuzzy email match → not found
+            None,  # Step 3: fuzzy name match → not found
+            {  # Step 4: INSERT customers RETURNING
                 "id": UUID("33333333-3333-3333-3333-333333333333"),
                 "email": "newuser@test.com",
                 "name": "New User",
                 "company": None,
                 "tier": "starter",
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
                 "metadata": {},
             },
         ]
@@ -173,6 +324,99 @@ class TestGetCustomerOrCreateByIdentifier:
         assert result["email"] == "newuser@test.com"
         assert result["name"] == "New User"
         assert result["tier"] == "starter"
+
+
+    async def test_fuzzy_email_fallback_links_identifier(self, mock_db_pool):
+        """Exact lookup fails but fuzzy email matches → links identifier to matched customer."""
+        mock_conn = AsyncMock()
+        self._setup_conn_with_transaction(mock_conn)
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        matched_id = UUID("66666666-6666-6666-6666-666666666666")
+        mock_conn.fetchrow.side_effect = [
+            None,  # Step 1: exact match → not found
+            {  # Step 2: fuzzy email match → FOUND
+                "id": matched_id,
+                "email": "jon@example.com",
+                "name": "Jon Doe",
+                "company": "Acme Corp",
+                "tier": "starter",
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
+                "metadata": {},
+                "sim": 0.6,
+            },
+        ]
+
+        result = await db.get_customer_or_create_by_identifier(
+            mock_db_pool, "email", "john@example.com", name="John Doe"
+        )
+
+        assert result["id"] == matched_id
+        # Should have linked the new identifier to existing customer
+        mock_conn.execute.assert_called_once()
+
+    async def test_fuzzy_name_fallback(self, mock_db_pool):
+        """Email fuzzy fails, but name fuzzy matches → links identifier."""
+        mock_conn = AsyncMock()
+        self._setup_conn_with_transaction(mock_conn)
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        matched_id = UUID("77777777-7777-7777-7777-777777777777")
+        mock_conn.fetchrow.side_effect = [
+            None,  # Step 1: exact match → not found
+            None,  # Step 2: fuzzy email → not found
+            {  # Step 3: fuzzy name → FOUND
+                "id": matched_id,
+                "email": "jdoe@other.com",
+                "name": "Jon Doe",
+                "company": "Acme Corp",
+                "tier": "starter",
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
+                "metadata": {},
+                "sim": 0.55,
+            },
+        ]
+
+        result = await db.get_customer_or_create_by_identifier(
+            mock_db_pool, "email", "new-email@test.com", name="John Doe"
+        )
+
+        assert result["id"] == matched_id
+
+    async def test_low_similarity_does_not_match(self, mock_db_pool):
+        """Fuzzy result below threshold → creates new customer."""
+        mock_conn = AsyncMock()
+        self._setup_conn_with_transaction(mock_conn)
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        new_id = UUID("88888888-8888-8888-8888-888888888888")
+        mock_conn.fetchrow.side_effect = [
+            None,  # Step 1: exact match → not found
+            {  # Step 2: fuzzy email match → below threshold
+                "id": UUID("99999999-9999-9999-9999-999999999999"),
+                "sim": 0.1,
+            },
+            None,  # Step 3: fuzzy name match → not found
+            {  # Step 4: INSERT new customer
+                "id": new_id,
+                "email": "nobody@example.com",
+                "name": "New Person",
+                "company": None,
+                "tier": "starter",
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
+                "metadata": {},
+            },
+        ]
+
+        result = await db.get_customer_or_create_by_identifier(
+            mock_db_pool, "email", "nobody@example.com", name="New Person",
+            fuzzy_threshold=0.8,
+        )
+
+        assert result["id"] == new_id
 
 
 class TestLinkIdentifiers:
@@ -210,8 +454,8 @@ class TestGetCustomerHistory:
                 "priority": "medium",
                 "channel": "email",
                 "category": "technical",
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
                 "resolved_at": None,
                 "message_count": 3,
             },
@@ -223,8 +467,8 @@ class TestGetCustomerHistory:
                 "priority": "medium",
                 "channel": "whatsapp",
                 "category": "general",
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
                 "resolved_at": None,
                 "message_count": 1,
             },
@@ -271,15 +515,17 @@ class TestCrossChannelResolution:
 
         # First contact: WhatsApp
         mock_conn.fetchrow.side_effect = [
-            None,  # SELECT by phone - not found
-            {  # INSERT customer
+            None,  # Step 1: exact match → not found
+            # Step 2: identifier_type != "email" → skip fuzzy email
+            None,  # Step 3: fuzzy name match ("WhatsApp User") → not found
+            {  # Step 4: INSERT customer
                 "id": shared_customer_id,
                 "email": "+14155551234@phone.techflow.io",
                 "name": "WhatsApp User",
                 "company": None,
                 "tier": "starter",
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
                 "metadata": {},
             },
         ]
@@ -299,8 +545,8 @@ class TestCrossChannelResolution:
                 "name": "Alice Johnson",
                 "company": "Acme Corp",
                 "tier": "enterprise",
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
                 "metadata": {},
             },
         ]
@@ -328,15 +574,17 @@ class TestCrossChannelResolution:
         mock_conn.execute.return_value = None
 
         mock_conn.fetchrow.side_effect = [
-            None,  # SELECT by email - not found
-            {  # INSERT customer
+            None,  # Step 1: exact match → not found
+            None,  # Step 2: fuzzy email match → not found
+            None,  # Step 3: fuzzy name match → not found
+            {  # Step 4: INSERT customer
                 "id": customer_id,
                 "email": "bob@startupinc.com",
                 "name": "Bob Smith",
                 "company": "Startup Inc",
                 "tier": "growth",
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
                 "metadata": {},
             },
         ]
@@ -360,8 +608,8 @@ class TestCrossChannelResolution:
             "name": "Bob Smith",
             "company": "Startup Inc",
             "tier": "growth",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
             "metadata": {},
         }
 

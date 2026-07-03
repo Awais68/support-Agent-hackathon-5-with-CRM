@@ -2,7 +2,7 @@
 
 import asyncio
 import os
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Dict, Any
 
 import asyncpg
@@ -10,6 +10,7 @@ import structlog
 
 from kafka_client import KafkaProducerClient
 from database import queries as db
+from exceptions import sanitize_error_message
 
 logger = structlog.get_logger(__name__)
 
@@ -52,7 +53,7 @@ class MetricsCollector:
             return metrics
 
         except Exception as e:
-            logger.error("Error collecting metrics", error=str(e))
+            logger.error("Error collecting metrics", error=sanitize_error_message(str(e)))
             return {}
 
     async def _get_ticket_metrics(self) -> Dict[str, float]:
@@ -68,7 +69,7 @@ class MetricsCollector:
                 )
 
                 # Tickets created in last hour
-                one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+                one_hour_ago = datetime.now(UTC) - timedelta(hours=1)
                 created_last_hour = await conn.fetchval(
                     "SELECT COUNT(*) FROM tickets WHERE created_at >= $1",
                     one_hour_ago,
@@ -77,7 +78,7 @@ class MetricsCollector:
                 # Average tickets per hour (based on existing tickets)
                 created_today = await conn.fetchval(
                     "SELECT COUNT(*) FROM tickets WHERE created_at >= $1",
-                    datetime.utcnow().replace(hour=0, minute=0, second=0),
+                    datetime.now(UTC).replace(hour=0, minute=0, second=0),
                 )
 
                 metrics = {
@@ -99,7 +100,7 @@ class MetricsCollector:
                 return metrics
 
         except Exception as e:
-            logger.error("Error getting ticket metrics", error=str(e))
+            logger.error("Error getting ticket metrics", error=sanitize_error_message(str(e)))
             return {}
 
     async def _get_resolution_metrics(self) -> Dict[str, float]:
@@ -144,7 +145,7 @@ class MetricsCollector:
                 return metrics
 
         except Exception as e:
-            logger.error("Error getting resolution metrics", error=str(e))
+            logger.error("Error getting resolution metrics", error=sanitize_error_message(str(e)))
             return {}
 
     async def _get_agent_metrics(self) -> Dict[str, float]:
@@ -190,7 +191,7 @@ class MetricsCollector:
                 return metrics
 
         except Exception as e:
-            logger.error("Error getting agent metrics", error=str(e))
+            logger.error("Error getting agent metrics", error=sanitize_error_message(str(e)))
             return {}
 
     async def _get_channel_metrics(self) -> Dict[str, float]:
@@ -210,7 +211,7 @@ class MetricsCollector:
                 return metrics
 
         except Exception as e:
-            logger.error("Error getting channel metrics", error=str(e))
+            logger.error("Error getting channel metrics", error=sanitize_error_message(str(e)))
             return {}
 
     async def report_metrics(self, metrics: Dict[str, Any]) -> None:
@@ -222,7 +223,7 @@ class MetricsCollector:
                     {
                         "metric_name": metric_name,
                         "metric_value": metric_value,
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": datetime.now(UTC).isoformat(),
                         "metric_type": "gauge",
                     },
                     key=metric_name,
@@ -242,7 +243,7 @@ class MetricsCollector:
             )
 
         except Exception as e:
-            logger.error("Error reporting metrics", error=str(e))
+            logger.error("Error reporting metrics", error=sanitize_error_message(str(e)))
 
 
 async def run_metrics_collector(
@@ -263,6 +264,6 @@ async def run_metrics_collector(
             metrics = await collector.collect_metrics()
             await collector.report_metrics(metrics)
         except Exception as e:
-            logger.error("Error in metrics collection loop", error=str(e))
+            logger.error("Error in metrics collection loop", error=sanitize_error_message(str(e)))
 
         await asyncio.sleep(collection_interval)

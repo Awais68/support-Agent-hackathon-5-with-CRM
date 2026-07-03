@@ -3,7 +3,32 @@
 import os
 import sys
 import asyncio
+from pathlib import Path
+
+from dotenv import load_dotenv
 import uvicorn
+
+
+def load_environment():
+    """Load environment-specific .env file based on ENVIRONMENT setting.
+
+    Priority (highest to lowest):
+      1. Shell environment variables (already set, not overridden)
+      2. .env.<ENVIRONMENT>  (e.g. .env.development, .env.production)
+      3. .env  (fallback with common defaults)
+    """
+    env = os.getenv("ENVIRONMENT", "development")
+    env_specific = Path(f".env.{env}")
+    env_default = Path(".env")
+
+    if env_specific.exists():
+        load_dotenv(env_specific)
+        print(f"Loaded environment: .env.{env}")
+    elif env_default.exists():
+        load_dotenv(env_default)
+        print(f"Loaded environment: .env (fallback)")
+    else:
+        print("Warning: No .env file found — relying on shell environment")
 
 
 def run_api_mode():
@@ -32,6 +57,7 @@ async def run_worker_mode():
 
 def main():
     """Main entry point - routes to API or worker mode."""
+    load_environment()
     mode = os.getenv("RUN_MODE", "api").lower()
 
     print(f"TechFlow CRM Digital FTE - Starting in {mode} mode")

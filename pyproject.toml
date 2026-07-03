@@ -36,6 +36,10 @@ dependencies = [
     "structlog>=24.1.0",
     "aiofiles>=23.2.0",
     "httpx>=0.26.0",
+
+    # Rate limiting & caching
+    "slowapi>=0.1.9",
+    "redis[hiredis]>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +52,20 @@ dev = [
     "ruff>=0.2.0",
     "mypy>=1.8.0",
 ]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+ignore_missing_imports = true
 
 [build-system]
 requires = ["hatchling"]

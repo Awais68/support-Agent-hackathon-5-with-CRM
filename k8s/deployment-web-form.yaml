@@ -1,0 +1,75 @@
+# NOTE: NEXT_PUBLIC_* env vars are baked into the JS bundle at BUILD time by Next.js.
+# At runtime these values in the pod are only used by server-side code (API routes, rewrites).
+# To change the API URL for client-side fetch, rebuild the image with the correct --build-arg.
+# See web-form/Dockerfile for available build args.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: techflow-web-form
+  namespace: techflow
+  labels:
+    app: web-form
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-form
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: web-form
+        version: v1
+    spec:
+      containers:
+      - name: web-form
+        image: ghcr.io/specifyplus/web-form:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+          protocol: TCP
+        env:
+        - name: NEXT_PUBLIC_API_URL
+          valueFrom:
+            configMapKeyRef:
+              name: techflow-config
+              key: api-url
+        - name: NEXT_PUBLIC_COMPANY_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: techflow-config
+              key: company-name
+        - name: NEXT_PUBLIC_SUPPORT_EMAIL
+          valueFrom:
+            configMapKeyRef:
+              name: techflow-config
+              key: support-email
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "300m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 2

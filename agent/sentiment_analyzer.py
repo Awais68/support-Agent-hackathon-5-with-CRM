@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Sequence
 import structlog
+from exceptions import sanitize_error_message
 
 logger = structlog.get_logger(__name__)
 
@@ -326,7 +327,7 @@ async def analyze_sentiment(
         score = max(0.0, min(1.0, (compound + 1.0) / 2.0))
         return score
     except Exception as e:
-        logger.error("Sentiment analysis failed", error=str(e), message_preview=message[:80])
+        logger.error("Sentiment analysis failed", error=sanitize_error_message(str(e)), message_preview=message[:80])
         return 0.5
 
 
@@ -379,5 +380,5 @@ async def analyze_sentiment_detailed(
         )
 
     except Exception as e:
-        logger.error("Detailed sentiment analysis failed", error=str(e), message_preview=message[:80])
+        logger.error("Detailed sentiment analysis failed", error=sanitize_error_message(str(e)), message_preview=message[:80])
         return SentimentDetail()

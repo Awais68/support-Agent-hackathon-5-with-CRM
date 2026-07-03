@@ -3,6 +3,7 @@
 import json
 from typing import Any, Dict, List, Callable
 import structlog
+from exceptions import sanitize_error_message
 
 logger = structlog.get_logger(__name__)
 
@@ -55,11 +56,11 @@ class MCPTool:
                 "result": result,
             }
         except Exception as e:
-            logger.error("Tool execution failed", tool=self.name, error=str(e))
+            logger.error("Tool execution failed", tool=self.name, error=sanitize_error_message(str(e)))
             return {
                 "status": "error",
                 "tool": self.name,
-                "error": str(e),
+                "error": sanitize_error_message(str(e)),
             }
 
 

@@ -1,0 +1,16 @@
+node_modules
+.next
+out
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+.pytest_cache/
+__pycache__/
+*.pyc

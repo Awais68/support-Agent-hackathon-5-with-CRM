@@ -17,6 +17,7 @@ from pathlib import Path
 
 import asyncpg
 import structlog
+from exceptions import sanitize_error_message
 
 logger = structlog.get_logger(__name__)
 
@@ -111,8 +112,8 @@ async def run_pending_migrations(
             await mark_migration_applied(pool, version, mfile.name)
             newly_applied.append(mfile.name)
             logger.info("Migration applied successfully", filename=mfile.name)
-        except Exception as e:
-            logger.error("Migration failed", filename=mfile.name, error=str(e))
+        except (asyncpg.PostgresError, Exception) as e:
+            logger.error("Migration failed", filename=mfile.name, error=sanitize_error_message(str(e)))
             raise
 
     return newly_applied
@@ -264,7 +265,7 @@ async def seed(pool: asyncpg.Pool) -> dict[str, any]:
     try:
         async with pool.acquire() as conn:
             await conn.set_type_codec("vector", encoder=str, decoder=list, schema="public")
-    except Exception:
+    except (asyncpg.PostgresError, Exception):
         logger.warning("Could not register pgvector codec (vector type may not exist yet)")
 
     # 4. Run pending migrations
@@ -292,7 +293,15 @@ async def main() -> None:
     )
 
     logger.info("Connecting to database", db_url=db_url)
-    pool = await asyncpg.create_pool(db_url)
+    pool_min = int(os.getenv("DATABASE_POOL_MIN", "1"))
+    pool_max = int(os.getenv("DATABASE_POOL_MAX", "5"))
+    db_ssl = os.getenv("DATABASE_SSL", "disable")
+    pool = await asyncpg.create_pool(
+        db_url,
+        min_size=pool_min,
+        max_size=pool_max,
+        ssl=db_ssl,
+    )
 
     try:
         results = await seed(pool)
@@ -319,7 +328,7 @@ async def main() -> None:
             k: v for k, v in results.items() if k != "data_counts"
         })
     except Exception as e:
-        logger.error("Seed failed", error=str(e))
+        logger.error("Seed failed", error=sanitize_error_message(str(e)))
         sys.exit(1)
     finally:
         await pool.close()

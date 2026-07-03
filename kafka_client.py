@@ -1,7 +1,8 @@
 """Kafka client for TechFlow CRM Digital FTE with DLQ routing and retry logic."""
 
 import json
-from datetime import datetime
+import os
+from datetime import UTC, datetime
 from typing import Any, Callable, Dict, Optional
 from uuid import UUID
 import asyncio
@@ -14,6 +15,9 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type,
 )
+
+from exceptions import sanitize_error_message
+from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
 logger = structlog.get_logger(__name__)
 
@@ -66,7 +70,7 @@ class KafkaMessage:
         self.topic = topic
         self.payload = payload
         self.message_id = message_id or str(UUID(int=int(datetime.now().timestamp() * 1000000)))
-        self.timestamp = timestamp or datetime.utcnow()
+        self.timestamp = timestamp or datetime.now(UTC)
         self.headers = headers
 
     def to_dict(self) -> Dict[str, Any]:
@@ -114,12 +118,25 @@ class KafkaProducerClient:
             retry=retry_if_exception_type((ConnectionError, TimeoutError)),
         )
 
+    def _sasl_config(self) -> dict:
+        """Build SASL config dict from environment variables."""
+        protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+        config = {"security_protocol": protocol}
+        if protocol in ("SASL_PLAINTEXT", "SASL_SSL"):
+            config.update({
+                "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+                "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
+                "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
+            })
+        return config
+
     async def start(self) -> None:
         """Start the producer."""
         self.producer = AIOKafkaProducer(
             bootstrap_servers=self.bootstrap_servers,
             value_serializer=lambda v: v.encode("utf-8"),
             compression_type="gzip",
+            **self._sasl_config(),
         )
         await self.producer.start()
         logger.info("Kafka producer started", servers=self.bootstrap_servers)
@@ -142,11 +159,13 @@ class KafkaProducerClient:
                     if not self.producer:
                         raise RuntimeError("Producer not started")
 
-                    await self.producer.send_and_wait(
-                        topic,
-                        value=message.to_json(),
-                        key=key.encode("utf-8") if key else None,
-                    )
+                    _kafka_cb = get_circuit_breaker("kafka")
+                    async with _kafka_cb:
+                        await self.producer.send_and_wait(
+                            topic,
+                            value=message.to_json(),
+                            key=key.encode("utf-8") if key else None,
+                        )
 
             logger.info(
                 "Message sent",
@@ -156,33 +175,35 @@ class KafkaProducerClient:
             )
             return message.message_id
 
-        except Exception as e:
+        except (ConnectionError, TimeoutError, CircuitBreakerError, Exception) as e:
             logger.error(
                 "Failed to send message, routing to DLQ",
                 topic=topic,
-                error=str(e),
+                error=sanitize_error_message(str(e)),
                 payload_keys=list(payload.keys()),
             )
             # Route to DLQ
             dlq_payload = {
                 "original_topic": topic,
                 "original_payload": payload,
-                "error": str(e),
-                "timestamp": datetime.utcnow().isoformat(),
+                "error": sanitize_error_message(str(e)),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
             try:
                 if self.producer:
-                    await self.producer.send_and_wait(
-                        DLQ_TOPIC,
-                        value=KafkaMessage(DLQ_TOPIC, dlq_payload).to_json(),
-                        key=key.encode("utf-8") if key else None,
-                    )
+                    _dlq_cb = get_circuit_breaker("kafka")
+                    async with _dlq_cb:
+                        await self.producer.send_and_wait(
+                            DLQ_TOPIC,
+                            value=KafkaMessage(DLQ_TOPIC, dlq_payload).to_json(),
+                            key=key.encode("utf-8") if key else None,
+                        )
                 logger.info(f"Message routed to DLQ: {message.message_id}")
             except Exception as dlq_error:
                 logger.critical(
                     "DLQ routing failed",
-                    original_error=str(e),
-                    dlq_error=str(dlq_error),
+                    original_error=sanitize_error_message(str(e)),
+                    dlq_error=sanitize_error_message(str(dlq_error)),
                 )
             raise
 
@@ -195,6 +216,18 @@ class KafkaConsumerClient:
         self.group_id = group_id
         self.consumer: Optional[AIOKafkaConsumer] = None
 
+    def _sasl_config(self) -> dict:
+        """Build SASL config dict from environment variables."""
+        protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+        config = {"security_protocol": protocol}
+        if protocol in ("SASL_PLAINTEXT", "SASL_SSL"):
+            config.update({
+                "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+                "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
+                "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
+            })
+        return config
+
     async def start(self, topics: list[str]) -> None:
         """Start the consumer."""
         self.consumer = AIOKafkaConsumer(
@@ -204,6 +237,7 @@ class KafkaConsumerClient:
             value_deserializer=lambda m: m.decode("utf-8"),
             auto_offset_reset="earliest",
             enable_auto_commit=True,
+            **self._sasl_config(),
         )
         await self.consumer.start()
         logger.info(
@@ -252,14 +286,14 @@ class KafkaConsumerClient:
                 except Exception as e:
                     logger.error(
                         "Handler error",
-                        error=str(e),
+                        error=sanitize_error_message(str(e)),
                         message_topic=getattr(message, "topic", "unknown"),
                     )
 
         except asyncio.CancelledError:
             logger.info("Consumer cancelled")
         except Exception as e:
-            logger.error("Consumer error", error=str(e))
+            logger.error("Consumer error", error=sanitize_error_message(str(e)))
             raise
 
 
@@ -278,7 +312,7 @@ def create_inbound_email_message(
             "sender_name": sender_name,
             "subject": subject,
             "body": body,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         },
         message_id=message_id,
         headers={"content_type": "email"},
@@ -300,7 +334,7 @@ def create_inbound_whatsapp_message(
             "customer_name": customer_name,
             "message_body": message_body,
             "media_url": media_url,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         },
         message_id=message_id,
         headers={"content_type": "whatsapp"},
@@ -325,7 +359,7 @@ def create_inbound_webform_message(
         "message_body": message_body,
         "category": category,
         "priority": priority,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
     if customer_phone:
         payload["customer_phone"] = customer_phone
@@ -353,7 +387,7 @@ def create_agent_processing_message(
             "customer_id": customer_id,
             "input_message": input_message,
             "channel": channel,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         },
         message_id=message_id,
         headers={"event_type": "agent_processing"},
@@ -377,7 +411,7 @@ def create_escalation_message(
             "reason": reason,
             "priority": priority,
             "context": context or {},
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         },
         message_id=message_id,
         headers={"event_type": "escalation"},

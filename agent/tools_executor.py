@@ -1,12 +1,16 @@
 """Tool executor for customer success agent - executes tools called by LLM."""
 
 import json
+import os
 from typing import Any, Dict, Optional
 from uuid import UUID
 
 import asyncpg
 import structlog
 from openai import AsyncOpenAI
+from openai import APIError as OpenAIAPIError, APITimeoutError, APIConnectionError
+from exceptions import sanitize_error_message
+from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
 from database import queries as db
 from kafka_client import KafkaProducerClient
@@ -32,11 +36,17 @@ class ToolExecutor:
     ) -> Dict[str, Any]:
         """Search knowledge base by semantic similarity."""
         try:
-            # Generate embedding for query
-            embedding_response = await self.openai_client.embeddings.create(
-                input=query,
-                model="text-embedding-3-small",
-            )
+            embedding_model = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
+            _cb = get_circuit_breaker("openai")
+            try:
+                async with _cb:
+                    embedding_response = await self.openai_client.embeddings.create(
+                        input=query,
+                        model=embedding_model,
+                    )
+            except CircuitBreakerError:
+                logger.error("KB search failed (OpenAI circuit open)", query=query)
+                return {"error": "AI service temporarily unavailable", "query": query, "results": []}
             query_embedding = embedding_response.data[0].embedding
 
             # Search using pgvector similarity
@@ -70,9 +80,15 @@ class ToolExecutor:
                 "count": len(results),
             }
 
+        except (OpenAIAPIError, APITimeoutError, APIConnectionError) as e:
+            logger.error("KB search failed (OpenAI)", error=sanitize_error_message(str(e)), query=query)
+            return {"error": sanitize_error_message(str(e)), "query": query, "results": []}
+        except (asyncpg.PostgresError, ConnectionError) as e:
+            logger.error("KB search failed (DB)", error=sanitize_error_message(str(e)), query=query)
+            return {"error": sanitize_error_message(str(e)), "query": query, "results": []}
         except Exception as e:
-            logger.error("KB search failed", error=str(e), query=query)
-            return {"error": str(e), "query": query, "results": []}
+            logger.error("KB search failed", error=sanitize_error_message(str(e)), query=query)
+            return {"error": sanitize_error_message(str(e)), "query": query, "results": []}
 
     async def create_ticket(
         self,
@@ -108,9 +124,12 @@ class ToolExecutor:
                 "priority": ticket["priority"],
             }
 
+        except (asyncpg.PostgresError, ConnectionError) as e:
+            logger.error("Failed to create ticket (DB)", error=sanitize_error_message(str(e)), customer_email=customer_email)
+            return {"error": sanitize_error_message(str(e))}
         except Exception as e:
-            logger.error("Failed to create ticket", error=str(e), customer_email=customer_email)
-            return {"error": str(e)}
+            logger.error("Failed to create ticket", error=sanitize_error_message(str(e)), customer_email=customer_email)
+            return {"error": sanitize_error_message(str(e))}
 
     async def get_customer_history(
         self, customer_email: str, limit: int = 10, include_resolved: bool = True
@@ -145,9 +164,12 @@ class ToolExecutor:
                 "count": len(history),
             }
 
+        except (asyncpg.PostgresError, ConnectionError) as e:
+            logger.error("Failed to get customer history (DB)", error=sanitize_error_message(str(e)), customer_email=customer_email)
+            return {"error": sanitize_error_message(str(e)), "count": 0, "tickets": []}
         except Exception as e:
-            logger.error("Failed to get customer history", error=str(e), customer_email=customer_email)
-            return {"error": str(e), "count": 0, "tickets": []}
+            logger.error("Failed to get customer history", error=sanitize_error_message(str(e)), customer_email=customer_email)
+            return {"error": sanitize_error_message(str(e)), "count": 0, "tickets": []}
 
     async def escalate_to_human(
         self, ticket_id: UUID, reason: str, priority_level: str = "high"
@@ -184,9 +206,12 @@ class ToolExecutor:
                 "eta_human_response": "15 minutes",
             }
 
+        except (asyncpg.PostgresError, ConnectionError) as e:
+            logger.error("Failed to escalate ticket (DB/Kafka)", error=sanitize_error_message(str(e)), ticket_id=str(ticket_id))
+            return {"error": sanitize_error_message(str(e)), "status": "escalation_failed"}
         except Exception as e:
-            logger.error("Failed to escalate ticket", error=str(e), ticket_id=str(ticket_id))
-            return {"error": str(e), "status": "escalation_failed"}
+            logger.error("Failed to escalate ticket", error=sanitize_error_message(str(e)), ticket_id=str(ticket_id))
+            return {"error": sanitize_error_message(str(e)), "status": "escalation_failed"}
 
     async def send_response(
         self, ticket_id: UUID, message: str, channel: str
@@ -235,9 +260,12 @@ class ToolExecutor:
                 "sent_at": msg["created_at"].isoformat(),
             }
 
+        except (asyncpg.PostgresError, ConnectionError) as e:
+            logger.error("Failed to send response (DB/Kafka)", error=sanitize_error_message(str(e)), ticket_id=str(ticket_id))
+            return {"error": sanitize_error_message(str(e)), "status": "send_failed"}
         except Exception as e:
-            logger.error("Failed to send response", error=str(e), ticket_id=str(ticket_id))
-            return {"error": str(e), "status": "send_failed"}
+            logger.error("Failed to send response", error=sanitize_error_message(str(e)), ticket_id=str(ticket_id))
+            return {"error": sanitize_error_message(str(e)), "status": "send_failed"}
 
     async def execute_tool(
         self, tool_name: str, tool_input: Dict[str, Any]
@@ -288,8 +316,8 @@ class ToolExecutor:
                 return {"error": f"Unknown tool: {tool_name}"}
 
         except json.JSONDecodeError as e:
-            logger.error("Invalid tool input JSON", error=str(e), tool_name=tool_name)
+            logger.error("Invalid tool input JSON", error=sanitize_error_message(str(e)), tool_name=tool_name)
             return {"error": f"Invalid JSON: {str(e)}"}
         except Exception as e:
-            logger.error("Tool execution failed", tool_name=tool_name, error=str(e))
-            return {"error": f"Tool execution failed: {str(e)}"}
+            logger.error("Tool execution failed", tool_name=tool_name, error=sanitize_error_message(str(e)))
+            return {"error": f"Tool execution failed: {sanitize_error_message(str(e))}"}

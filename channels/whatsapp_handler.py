@@ -5,12 +5,14 @@ import base64
 import hmac
 import hashlib
 from typing import Optional, Dict, Any
-from urllib.parse import urlencode
 
+import asyncio
 import structlog
 from twilio.rest import Client
+from exceptions import sanitize_error_message
 
 from kafka_client import KafkaProducerClient, create_inbound_whatsapp_message
+from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
 logger = structlog.get_logger(__name__)
 
@@ -65,7 +67,7 @@ class WhatsAppHandler:
             return is_valid
 
         except Exception as e:
-            logger.error("Webhook validation error", error=str(e))
+            logger.error("Webhook validation error", error=sanitize_error_message(str(e)))
             return False
 
     async def parse_webhook(self, form_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -107,7 +109,7 @@ class WhatsAppHandler:
             }
 
         except Exception as e:
-            logger.error("Error parsing WhatsApp webhook", error=str(e))
+            logger.error("Error parsing WhatsApp webhook", error=sanitize_error_message(str(e)))
             return None
 
     async def handle_incoming_message(
@@ -142,7 +144,7 @@ class WhatsAppHandler:
         except Exception as e:
             logger.error(
                 "Error handling WhatsApp message",
-                error=str(e),
+                error=sanitize_error_message(str(e)),
                 from_number=from_number,
             )
 
@@ -168,13 +170,25 @@ class WhatsAppHandler:
             if not to_number.startswith("whatsapp:"):
                 to_number = f"whatsapp:{to_number}"
 
-            # Send message
-            message = self.client.messages.create(
-                from_=f"whatsapp:{self.whatsapp_number}",
-                to=to_number,
-                body=message_body,
-                media_url=media_url,
-            )
+            _twilio_cb = get_circuit_breaker("twilio")
+            try:
+                async with _twilio_cb:
+                    loop = asyncio.get_event_loop()
+                    message = await loop.run_in_executor(
+                        None,
+                        lambda: self.client.messages.create(
+                            from_=f"whatsapp:{self.whatsapp_number}",
+                            to=to_number,
+                            body=message_body,
+                            media_url=media_url,
+                        ),
+                    )
+            except CircuitBreakerError:
+                logger.warning(
+                    "WhatsApp circuit open, message not sent",
+                    to_number=to_number,
+                )
+                return "circuit-open"
 
             logger.info(
                 "WhatsApp message sent",
@@ -188,7 +202,7 @@ class WhatsAppHandler:
         except Exception as e:
             logger.error(
                 "Error sending WhatsApp message",
-                error=str(e),
+                error=sanitize_error_message(str(e)),
                 to_number=to_number,
             )
             raise
@@ -205,12 +219,26 @@ class WhatsAppHandler:
             if not to_number.startswith("whatsapp:"):
                 to_number = f"whatsapp:{to_number}"
 
-            message = self.client.messages.create(
-                from_=f"whatsapp:{self.whatsapp_number}",
-                to=to_number,
-                content_sid=template_sid,
-                content_variables=parameters or [],
-            )
+            _twilio_cb = get_circuit_breaker("twilio")
+            try:
+                async with _twilio_cb:
+                    loop = asyncio.get_event_loop()
+                    message = await loop.run_in_executor(
+                        None,
+                        lambda: self.client.messages.create(
+                            from_=f"whatsapp:{self.whatsapp_number}",
+                            to=to_number,
+                            content_sid=template_sid,
+                            content_variables=parameters or [],
+                        ),
+                    )
+            except CircuitBreakerError:
+                logger.warning(
+                    "WhatsApp circuit open, template message not sent",
+                    to_number=to_number,
+                    template_sid=template_sid,
+                )
+                return "circuit-open"
 
             logger.info(
                 "WhatsApp template message sent",
@@ -224,7 +252,7 @@ class WhatsAppHandler:
         except Exception as e:
             logger.error(
                 "Error sending WhatsApp template message",
-                error=str(e),
+                error=sanitize_error_message(str(e)),
                 to_number=to_number,
             )
             raise

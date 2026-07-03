@@ -1,8 +1,12 @@
 """Embeddings service for semantic search in knowledge base."""
 
+import os
 from typing import List
 import structlog
 from openai import AsyncOpenAI
+from openai import APIError as OpenAIAPIError, APITimeoutError, APIConnectionError
+from exceptions import sanitize_error_message
+from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
 logger = structlog.get_logger(__name__)
 
@@ -10,23 +14,27 @@ logger = structlog.get_logger(__name__)
 class EmbeddingsService:
     """Service for generating and managing embeddings."""
 
-    def __init__(self, openai_client: AsyncOpenAI, model: str = "text-embedding-3-small"):
+    def __init__(self, openai_client: AsyncOpenAI, model: str = ""):
+        if not model:
+            model = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
         self.client = openai_client
         self.model = model
 
     async def embed_text(self, text: str) -> List[float]:
         """Generate embedding for a single text."""
+        _cb = get_circuit_breaker("openai")
         try:
-            response = await self.client.embeddings.create(
-                input=text,
-                model=self.model,
-            )
+            async with _cb:
+                response = await self.client.embeddings.create(
+                    input=text,
+                    model=self.model,
+                )
             embedding = response.data[0].embedding
             logger.info("Text embedded", text_length=len(text), model=self.model)
             return embedding
 
-        except Exception as e:
-            logger.error("Embedding generation failed", error=str(e))
+        except (OpenAIAPIError, APITimeoutError, APIConnectionError, CircuitBreakerError, Exception) as e:
+            logger.error("Embedding generation failed", error=sanitize_error_message(str(e)))
             raise
 
     async def embed_batch(self, texts: List[str]) -> List[List[float]]:
@@ -35,10 +43,12 @@ class EmbeddingsService:
             if not texts:
                 return []
 
-            response = await self.client.embeddings.create(
-                input=texts,
-                model=self.model,
-            )
+            _cb = get_circuit_breaker("openai")
+            async with _cb:
+                response = await self.client.embeddings.create(
+                    input=texts,
+                    model=self.model,
+                )
 
             embeddings = [item.embedding for item in response.data]
             logger.info(
@@ -48,8 +58,8 @@ class EmbeddingsService:
             )
             return embeddings
 
-        except Exception as e:
-            logger.error("Batch embedding failed", error=str(e), batch_size=len(texts))
+        except (OpenAIAPIError, APITimeoutError, APIConnectionError, CircuitBreakerError, Exception) as e:
+            logger.error("Batch embedding failed", error=sanitize_error_message(str(e)), batch_size=len(texts))
             raise
 
     async def embed_knowledge_base_article(
@@ -75,6 +85,6 @@ class EmbeddingsService:
 
             return title_embedding, content_embedding, combined_embedding
 
-        except Exception as e:
-            logger.error("KB article embedding failed", error=str(e), title=title)
+        except (OpenAIAPIError, APITimeoutError, APIConnectionError, Exception) as e:
+            logger.error("KB article embedding failed", error=sanitize_error_message(str(e)), title=title)
             raise

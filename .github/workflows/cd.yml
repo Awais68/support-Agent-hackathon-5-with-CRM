@@ -1,0 +1,111 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_TAG: ${{ github.sha }}
+  K8S_NAMESPACE: techflow
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Backend (API + Worker share the same Dockerfile) ──
+      - name: Build & Push Backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/api:${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY }}/${{ github.repository }}/api:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Frontend (Next.js web-form) ──
+      - name: Build & Push Frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: web-form
+          file: web-form/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository }}/web-form:${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY }}/${{ github.repository }}/web-form:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Update backend image
+        run: |
+          kubectl set image deployment/techflow-api \
+            api=${{ env.REGISTRY }}/${{ github.repository }}/api:${{ env.IMAGE_TAG }} \
+            --namespace=${{ env.K8S_NAMESPACE }} \
+            --record
+
+      - name: Update worker image
+        run: |
+          kubectl set image deployment/techflow-worker \
+            worker=${{ env.REGISTRY }}/${{ github.repository }}/api:${{ env.IMAGE_TAG }} \
+            --namespace=${{ env.K8S_NAMESPACE }} \
+            --record
+
+      - name: Update frontend image (if exists)
+        run: |
+          if kubectl get deployment techflow-web-form -n ${{ env.K8S_NAMESPACE }} &>/dev/null; then
+            kubectl set image deployment/techflow-web-form \
+              web-form=${{ env.REGISTRY }}/${{ github.repository }}/web-form:${{ env.IMAGE_TAG }} \
+              --namespace=${{ env.K8S_NAMESPACE }} \
+              --record
+          else
+            echo "Skipping frontend deployment — techflow-web-form not found in namespace ${{ env.K8S_NAMESPACE }}"
+          fi
+
+      - name: Verify rollout status
+        run: |
+          kubectl rollout status deployment/techflow-api -n ${{ env.K8S_NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment/techflow-worker -n ${{ env.K8S_NAMESPACE }} --timeout=300s
+          if kubectl get deployment techflow-web-form -n ${{ env.K8S_NAMESPACE }} &>/dev/null; then
+            kubectl rollout status deployment/techflow-web-form -n ${{ env.K8S_NAMESPACE }} --timeout=300s
+          fi

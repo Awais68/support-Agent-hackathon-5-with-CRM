@@ -4,6 +4,7 @@ import asyncio
 import json
 import structlog
 from typing import Dict, Set, Any
+from exceptions import sanitize_error_message
 from uuid import UUID
 
 from fastapi import WebSocket
@@ -48,7 +49,8 @@ class WebSocketManager:
         for ws in conns:
             try:
                 await ws.send_text(payload)
-            except Exception:
+            except Exception as e:
+                logger.warning("ws broadcast failed", ticket_id=ticket_id, error=sanitize_error_message(str(e)))
                 stale.add(ws)
         if stale:
             async with self._lock:

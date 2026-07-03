@@ -18,9 +18,10 @@ def event_loop():
 
 @pytest.fixture
 def mock_openai_client():
-    """Mock OpenAI client."""
+    """Mock OpenAI/OpenRouter client (handles both chat + embeddings)."""
     mock = MagicMock(spec=AsyncOpenAI)
     mock.chat.completions.create = AsyncMock()
+    mock.embeddings.create = AsyncMock()
     return mock
 
 

@@ -1,0 +1,119 @@
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-kafka-auth
+  namespace: techflow
+spec:
+  secretTargetRef:
+  - parameter: sasl
+    name: techflow-secrets
+    key: kafka-sasl-type
+  - parameter: saslUsername
+    name: techflow-secrets
+    key: kafka-sasl-username
+  - parameter: saslPassword
+    name: techflow-secrets
+    key: kafka-sasl-password
+  # For SASL_SSL with SCRAM-SHA-512 or PLAIN:
+  # - parameter: tls
+  #   name: techflow-secrets
+  #   key: kafka-tls-enabled
+  # - parameter: ca
+  #   name: techflow-secrets
+  #   key: kafka-ca-cert
+  # - parameter: cert
+  #   name: techflow-secrets
+  #   key: kafka-client-cert
+  # - parameter: key
+  #   name: techflow-secrets
+  #   key: kafka-client-key
+  # - parameter: passphrase
+  #   name: techflow-secrets
+  #   key: kafka-client-key-passphrase
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: techflow-worker-scaledobject
+  namespace: techflow
+  labels:
+    app: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: techflow-worker
+  minReplicaCount: 2
+  maxReplicaCount: 10
+  pollingInterval: 15
+  cooldownPeriod: 60
+  idleReplicaCount: 0
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+        scaleDown:
+          stabilizationWindowSeconds: 120
+          policies:
+          - type: Percent
+            value: 50
+            periodSeconds: 60
+          selectPolicy: Max
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-0.kafka-headless.techflow.svc.cluster.local:9092,kafka-1.kafka-headless.techflow.svc.cluster.local:9092,kafka-2.kafka-headless.techflow.svc.cluster.local:9092
+      consumerGroup: techflow-worker-group
+      topic: techflow-messages
+      lagThreshold: "100"
+      offsetResetPolicy: latest
+      partitionLimitation: "false"
+      # For multiple topics, comma-separate:
+      # topic: topic1,topic2
+      # For lag threshold per partition:
+      # lagThreshold: "50"
+      # Default: average lag across all partitions is compared
+      # allowIdleConsumers: "true"
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: cpu
+    metricType: Utilization
+    metadata:
+      value: "70"
+  # Uncomment below to also scale on memory:
+  # - type: memory
+  #   metricType: Utilization
+  #   metadata:
+  #     value: "80"
+---
+# NOTES:
+# 1. This ScaledObject REPLACES the old CPU-only HPA.
+#    The old HPA (in deployment-worker.yaml) should be removed/deleted.
+#
+# 2. KEDA creates an HPA under the hood with BOTH metrics:
+#    - CPU Utilization at 70%
+#    - Kafka consumer lag (external metric) at 100
+#    The HPA picks the MAX of all metrics for scale decisions.
+#
+# 3. minReplicaCount: 2 — prevents zero-scale for critical workers
+#    maxReplicaCount: 10 — upper limit
+#    idleReplicaCount: 0 — only active if separate idle mode is desired
+#
+# 4. For PLAINTEXT Kafka (no auth), remove `authenticationRef` entirely.
+#
+# 5. Verify consumer group & topic names match your application's config.
+#    Current configmap at k8s/configmap.yaml -> kafka-servers.
+#
+# 6. To test: produce messages to the topic and watch replica count increase:
+#    kubectl get hpa -n techflow -w
+#    kubectl get scaledobject -n techflow

@@ -1,21 +1,23 @@
 """Customer Success Agent orchestrator for TechFlow CRM Digital FTE."""
 
 import json
+import os
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from uuid import UUID
-from datetime import datetime
+from datetime import UTC, datetime
 
 import asyncpg
 import structlog
 from openai import AsyncOpenAI
+from openai import APIError as OpenAIAPIError, APITimeoutError, APIConnectionError
 
 from agent.prompts import SYSTEM_PROMPT, CHANNEL_ADDENDUMS, CLASSIFICATION_PROMPT
 from agent.tools import OPENAI_TOOL_SCHEMAS, ToolContext, execute_tool
 from agent.formatters import format_email_response, format_whatsapp_response, format_web_form_response
 from agent.pre_processing_gate import run_gate, GateAction
 from agent.sentiment_analyzer import detect_sentiment_drop
-from kafka_client import KafkaProducerClient, create_agent_processing_message
+from kafka_client import KafkaProducerClient
 from database import queries as db
 from metrics import (
     sentiment_score as metric_sentiment_score,
@@ -24,6 +26,8 @@ from metrics import (
     sentiment_below_threshold,
     sentiment_high_urgency,
 )
+from exceptions import sanitize_error_message
+from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
 logger = structlog.get_logger(__name__)
 
@@ -45,28 +49,35 @@ class AgentContext:
 class CustomerSuccessAgent:
     """Main agent orchestrator for customer support."""
 
-    def __init__(self, context: AgentContext, model: str = "gpt-4o"):
+    def __init__(self, context: AgentContext, model: str = ""):
+        if not model:
+            model = os.getenv("OPENAI_MODEL", "openai/gpt-4o")
         self.context = context
         self.model = model
 
     async def classify_message(self, message: str) -> str:
         """Classify customer message into category."""
         try:
-            response = await self.context.openai_client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": CLASSIFICATION_PROMPT},
-                    {"role": "user", "content": message},
-                ],
-                max_tokens=50,
-                temperature=0.3,
-            )
+            _cb = get_circuit_breaker("openai")
+            async with _cb:
+                response = await self.context.openai_client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": CLASSIFICATION_PROMPT},
+                        {"role": "user", "content": message},
+                    ],
+                    max_tokens=50,
+                    temperature=0.3,
+                )
 
             classification = response.choices[0].message.content.strip()
             return classification
 
+        except (OpenAIAPIError, APITimeoutError, APIConnectionError, CircuitBreakerError) as e:
+            self.context.logger.error("Classification failed (OpenAI)", error=sanitize_error_message(str(e)))
+            return "General Inquiry"
         except Exception as e:
-            self.context.logger.error("Classification failed", error=str(e))
+            self.context.logger.error("Classification failed", error=sanitize_error_message(str(e)))
             return "General Inquiry"
 
     async def process_customer_message(
@@ -101,7 +112,7 @@ class CustomerSuccessAgent:
                     "message": message,
                     "channel": channel,
                     "classification": classification,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 },
                 key=str(ticket_id),
             )
@@ -144,10 +155,10 @@ class CustomerSuccessAgent:
                         ticket_id,
                         gate_result.sentiment_score,
                     )
-                except Exception as e:
+                except (asyncpg.PostgresError, Exception) as e:
                     self.context.logger.warning(
                         "Failed to persist sentiment score to messages",
-                        error=str(e),
+                        error=sanitize_error_message(str(e)),
                     )
 
             # Step 5b: Sentiment trend detection across conversation turns
@@ -167,10 +178,10 @@ class CustomerSuccessAgent:
                         )
                         sentiment_drop_detected = drop_detected
                         sentiment_drop_amount = drop_amount
-            except Exception as e:
+            except (asyncpg.PostgresError, Exception) as e:
                 self.context.logger.warning(
                     "Sentiment trend detection failed",
-                    error=str(e),
+                    error=sanitize_error_message(str(e)),
                 )
 
             # Step 5c: Record Prometheus metrics
@@ -188,8 +199,8 @@ class CustomerSuccessAgent:
                     sentiment_below_threshold.labels(channel=channel).inc()
                 if gate_result.is_urgent:
                     sentiment_high_urgency.labels(channel=channel).inc()
-            except Exception as e:
-                self.context.logger.warning("Failed to record sentiment metrics", error=str(e))
+            except Exception:
+                self.context.logger.warning("Failed to record sentiment metrics")
 
             if gate_result.action == GateAction.ESCALATE:
                 self.context.logger.info(
@@ -216,7 +227,7 @@ class CustomerSuccessAgent:
                             f"Sentiment drop: {sentiment_drop_amount:.2f}" if sentiment_drop_detected else ""
                         ),
                         "source": "pre_processing_gate",
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": datetime.now(UTC).isoformat(),
                     },
                     key=str(ticket_id),
                 )
@@ -266,14 +277,28 @@ class CustomerSuccessAgent:
                 MAX_TURNS = 10
 
                 for turn in range(MAX_TURNS):
-                    response = await self.context.openai_client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        tools=OPENAI_TOOL_SCHEMAS,
-                        tool_choice="auto",
-                        temperature=0.7,
-                        max_tokens=2000,
-                    )
+                    _cb = get_circuit_breaker("openai")
+                    try:
+                        async with _cb:
+                            response = await self.context.openai_client.chat.completions.create(
+                                model=self.model,
+                                messages=messages,
+                                tools=OPENAI_TOOL_SCHEMAS,
+                                tool_choice="auto",
+                                temperature=0.7,
+                                max_tokens=2000,
+                            )
+                    except CircuitBreakerError:
+                        self.context.logger.error(
+                            "OpenAI circuit open, agent loop terminated",
+                            ticket_id=str(ticket_id),
+                            turn=turn,
+                        )
+                        output_message = (
+                            "I'm experiencing a temporary issue with our AI service. "
+                            "A support agent will follow up with you shortly."
+                        )
+                        break
 
                     if response.usage:
                         token_usage = response.usage.total_tokens
@@ -361,14 +386,14 @@ class CustomerSuccessAgent:
 
             # Step 9: Send response via Kafka
             await self.context.kafka_producer.send_message(
-                f"notifications.outbound",
+                "notifications.outbound",
                 {
                     "ticket_id": str(ticket_id),
                     "customer_email": customer_email,
                     "channel": channel,
                     "message": formatted_response,
                     "agent_run_id": str(agent_run_id),
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 },
                 key=str(ticket_id),
             )
@@ -392,7 +417,7 @@ class CustomerSuccessAgent:
                     "aspect_scores": gate_result.aspect_scores,
                     "sentiment_drop_detected": sentiment_drop_detected,
                     "sentiment_drop_amount": sentiment_drop_amount,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 },
                 key=str(ticket_id),
             )
@@ -424,7 +449,7 @@ class CustomerSuccessAgent:
         except Exception as e:
             self.context.logger.error(
                 "Message processing failed",
-                error=str(e),
+                error=sanitize_error_message(str(e)),
                 ticket_id=str(ticket_id),
             )
 
@@ -436,7 +461,7 @@ class CustomerSuccessAgent:
                     output_message=f"Error processing message: {str(e)}",
                     result={"status": "failed", "error": str(e)},
                 )
-            except:
+            except Exception:
                 pass
 
             # Send error event to Kafka
@@ -447,17 +472,17 @@ class CustomerSuccessAgent:
                         "original_topic": "agent.processing",
                         "ticket_id": str(ticket_id),
                         "error": str(e),
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": datetime.now(UTC).isoformat(),
                     },
                     key=str(ticket_id),
                 )
-            except:
+            except Exception:
                 pass
 
             raise
 
 
-async def build_agent(context: AgentContext, model: str = "gpt-4o") -> CustomerSuccessAgent:
+async def build_agent(context: AgentContext, model: str = "") -> CustomerSuccessAgent:
     """Factory function to build and initialize the customer success agent."""
     agent = CustomerSuccessAgent(context, model=model)
     context.logger.info("Agent initialized", model=model)
@@ -468,10 +493,18 @@ async def build_agent(context: AgentContext, model: str = "gpt-4o") -> CustomerS
 async def example_usage():
     """Example of how to use the agent."""
     # Initialize context (in real app, done in FastAPI lifespan)
-    pool = await asyncpg.create_pool("postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost/techflow")
+    pool = await asyncpg.create_pool(
+        "postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost/techflow",
+        min_size=1,
+        max_size=5,
+        ssl="require" if os.getenv("DATABASE_SSL", "disable") != "disable" else False,
+    )
     kafka_producer = KafkaProducerClient("localhost:9092")
     await kafka_producer.start()
-    client = AsyncOpenAI()
+    client = AsyncOpenAI(
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+    )
 
     context = AgentContext(
         db_pool=pool,

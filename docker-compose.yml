@@ -69,7 +69,8 @@ services:
     environment:
       DATABASE_URL: postgresql://***REDACTED_USER***:***REDACTED_PASS***@postgres:5432/${POSTGRES_DB:-techflow}
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       API_KEY: ${API_KEY:-test-key-12345}
       CORS_ORIGINS: http://localhost:3000,http://localhost:8000
     ports:
@@ -98,7 +99,8 @@ services:
     environment:
       DATABASE_URL: postgresql://***REDACTED_USER***:***REDACTED_PASS***@postgres:5432/${POSTGRES_DB:-techflow}
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
       TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER}
@@ -109,6 +111,25 @@ services:
       - .:/app
       - ./gmail_credentials.json:/app/gmail_credentials.json:ro
       - ./gmail_token.json:/app/gmail_token.json
+    networks:
+      - techflow
+
+  web-form:
+    build:
+      context: ./web-form
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://api:8000
+        NEXT_PUBLIC_COMPANY_NAME: ${COMPANY_NAME:-TechFlow Analytics}
+        NEXT_PUBLIC_SUPPORT_EMAIL: ${SUPPORT_EMAIL:-support@techflow-analytics.com}
+    container_name: techflow-web-form
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+    depends_on:
+      api:
+        condition: service_healthy
     networks:
       - techflow
 

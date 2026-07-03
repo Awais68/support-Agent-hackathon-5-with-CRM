@@ -1,0 +1,130 @@
+name: Chaos Engineering — Weekly Staging Run
+
+on:
+  schedule:
+    # Run every Monday at 03:00 UTC
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: "Experiment ID (01-06 or 'all')"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - "01"
+          - "02"
+          - "03"
+          - "04"
+          - "05"
+          - "06"
+      dry_run:
+        description: "Dry run (preview without injecting failures)"
+        required: false
+        default: false
+        type: boolean
+
+# SAFETY: This workflow ONLY runs on staging/deployment via environment protection rules.
+# Production environment is NEVER selected.
+env:
+  TECHFLOW_ENV: staging
+  TECHFLOW_CONFIRM_CHAOS: "yes"
+
+jobs:
+  safety-check:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Assert non-production environment
+        run: |
+          echo "Running chaos tests in: ${{ github.ref_name }} / ${{ github.environment }}"
+          if [ "${{ github.environment }}" = "production" ]; then
+            echo "FATAL: Chaos experiments cannot target production environment!"
+            exit 1
+          fi
+          echo "Environment safety check passed"
+
+  chaos-run:
+    needs: safety-check
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx
+          echo "Docker and docker compose should be pre-installed on the runner"
+
+      - name: Verify stack is healthy (pre-check)
+        run: |
+          echo "Checking system health before chaos injection..."
+          python -c "
+import httpx
+try:
+    r = httpx.get('http://localhost:8000/health', timeout=10)
+    data = r.json()
+    assert data.get('status') == 'healthy', f'System not healthy: {data}'
+    print(f'Pre-check passed: {data}')
+except Exception as e:
+    print(f'Pre-check failed: {e}')
+    exit(1)
+"
+
+      - name: Run chaos experiments
+        id: chaos
+        run: |
+          EXPERIMENT="${{ github.event.inputs.experiment || 'all' }}"
+          DRY_RUN_FLAG="${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}"
+
+          RESULTS_FILE="chaos-results-${{ github.run_id }}.json"
+          python -m chaos.runner \
+            --experiment "$EXPERIMENT" \
+            --yes \
+            $DRY_RUN_FLAG \
+            --output "$RESULTS_FILE"
+
+          echo "results_file=$RESULTS_FILE" >> $GITHUB_OUTPUT
+
+      - name: Upload chaos results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-results
+          path: chaos-results-${{ github.run_id }}.json
+          retention-days: 90
+
+      - name: Report summary
+        if: always()
+        run: |
+          RESULTS_FILE="${{ steps.chaos.outputs.results_file }}"
+          if [ -f "$RESULTS_FILE" ]; then
+            python -c "
+import json
+with open('$RESULTS_FILE') as f:
+    data = json.load(f)
+print(f'Total: {data[\"total\"]}')
+print(f'Passed: {data[\"passed\"]}')
+print(f'Failed: {data[\"failed\"]}')
+print(f'Errors: {data[\"errors\"]}')
+for r in data['results']:
+    status_icon = '✅' if r['status'] == 'passed' else '❌' if r['status'] == 'failed' else '⚠️'
+    rt = f\" ({r['recovery_time_seconds']}s)\" if r.get('recovery_time_seconds') else ''
+    print(f'{status_icon} {r[\"experiment_name\"]}: {r[\"status\"]}{rt}')
+"
+          else:
+            echo "No results file found"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::warning::Chaos experiments failed! Check uploaded artifacts for details."

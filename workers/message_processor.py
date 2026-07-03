@@ -2,11 +2,12 @@
 
 import asyncio
 import os
-from typing import Optional
+from pathlib import Path
 
 import asyncpg
 import structlog
-from openai import AsyncOpenAI
+from dotenv import load_dotenv
+from openai import AsyncOpenAI, APIError as OpenAIAPIError
 
 from channels.gmail_handler import run_gmail_polling_loop
 from workers.metrics_collector import run_metrics_collector
@@ -23,6 +24,7 @@ from agent.customer_success_agent import (
     AgentContext,
 )
 from database import queries as db
+from exceptions import sanitize_error_message
 
 logger = structlog.get_logger(__name__)
 
@@ -33,7 +35,10 @@ class MessageProcessor:
     def __init__(self, db_pool: asyncpg.Pool, kafka_producer: KafkaProducerClient):
         self.db_pool = db_pool
         self.kafka_producer = kafka_producer
-        self.openai_client = AsyncOpenAI()
+        self.openai_client = AsyncOpenAI(
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        )
 
     async def process_message(self, message: KafkaMessage) -> None:
         """Process an inbound message."""
@@ -69,10 +74,10 @@ class MessageProcessor:
             else:
                 logger.warning("Unknown topic", topic=topic)
 
-        except Exception as e:
+        except (asyncpg.PostgresError, OpenAIAPIError, ConnectionError, Exception) as e:
             logger.error(
                 "Error processing message",
-                error=str(e),
+                error=sanitize_error_message(str(e)),
                 topic=message.topic,
                 message_id=message.message_id,
             )
@@ -122,8 +127,8 @@ class MessageProcessor:
 
             logger.info("Email processed successfully", ticket_number=ticket["ticket_number"])
 
-        except Exception as e:
-            logger.error("Error processing email message", error=str(e))
+        except (asyncpg.PostgresError, Exception) as e:
+            logger.error("Error processing email message", error=sanitize_error_message(str(e)))
             raise
 
     async def _process_whatsapp_message(self, agent, payload: dict) -> None:
@@ -170,8 +175,8 @@ class MessageProcessor:
 
             logger.info("WhatsApp message processed successfully", ticket_number=ticket["ticket_number"])
 
-        except Exception as e:
-            logger.error("Error processing WhatsApp message", error=str(e))
+        except (asyncpg.PostgresError, Exception) as e:
+            logger.error("Error processing WhatsApp message", error=sanitize_error_message(str(e)))
             raise
 
     async def _process_webform_message(self, agent, payload: dict) -> None:
@@ -229,8 +234,8 @@ class MessageProcessor:
 
             logger.info("Web form processed successfully", ticket_number=ticket["ticket_number"])
 
-        except Exception as e:
-            logger.error("Error processing web form message", error=str(e))
+        except (asyncpg.PostgresError, Exception) as e:
+            logger.error("Error processing web form message", error=sanitize_error_message(str(e)))
             raise
 
 
@@ -264,6 +269,14 @@ async def run_kafka_consumer_loop(
 
 async def main():
     """Main entry point for worker."""
+    # Load environment-specific .env file
+    env = os.getenv("ENVIRONMENT", "development")
+    env_specific = Path(f".env.{env}")
+    if env_specific.exists():
+        load_dotenv(env_specific)
+    elif Path(".env").exists():
+        load_dotenv(".env")
+
     # Load configuration
     db_url = os.getenv("DATABASE_URL", "postgresql://localhost/techflow")
     kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -275,7 +288,15 @@ async def main():
     )
 
     # Create database pool
-    db_pool = await asyncpg.create_pool(db_url)
+    pool_min = int(os.getenv("DATABASE_POOL_MIN", "1"))
+    pool_max = int(os.getenv("DATABASE_POOL_MAX", "5"))
+    db_ssl = os.getenv("DATABASE_SSL", "disable")
+    db_pool = await asyncpg.create_pool(
+        db_url,
+        min_size=pool_min,
+        max_size=pool_max,
+        ssl=db_ssl,
+    )
     await db.register_pgvector_codec(db_pool)
 
     # Create Kafka producer

@@ -1,10 +1,8 @@
 """Gmail channel handler for TechFlow CRM Digital FTE."""
 
 import os
-import json
 import asyncio
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any
 from email.mime.text import MIMEText
 import base64
 
@@ -14,8 +12,10 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from exceptions import sanitize_error_message
 
 from kafka_client import KafkaProducerClient, create_inbound_email_message
+from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
 logger = structlog.get_logger(__name__)
 
@@ -57,7 +57,7 @@ class GmailHandler:
             logger.info("Gmail authentication successful")
 
         except Exception as e:
-            logger.error("Gmail authentication failed", error=str(e))
+            logger.error("Gmail authentication failed", error=sanitize_error_message(str(e)))
             raise
 
     async def poll_inbox(self, poll_interval_seconds: int = 60) -> None:
@@ -66,8 +66,9 @@ class GmailHandler:
             await self.authenticate()
 
         try:
-            # Query for unread messages
-            results = self.service.users().messages().list(userId="me", q="is:unread").execute()
+            _gmail_cb = get_circuit_breaker("gmail")
+            async with _gmail_cb:
+                results = self.service.users().messages().list(userId="me", q="is:unread").execute()
             messages = results.get("messages", [])
 
             if not messages:
@@ -79,15 +80,16 @@ class GmailHandler:
             for message in messages:
                 await self._process_message(message["id"])
 
-        except HttpError as error:
-            logger.error("Gmail polling error", error=str(error))
+        except (HttpError, CircuitBreakerError) as error:
+            logger.error("Gmail polling error", error=sanitize_error_message(str(error)))
             raise
 
     async def _process_message(self, message_id: str) -> None:
         """Process a single Gmail message."""
         try:
-            # Get full message
-            message = self.service.users().messages().get(userId="me", id=message_id).execute()
+            _gmail_cb = get_circuit_breaker("gmail")
+            async with _gmail_cb:
+                message = self.service.users().messages().get(userId="me", id=message_id).execute()
 
             # Extract headers
             headers = {h["name"]: h["value"] for h in message["payload"]["headers"]}
@@ -120,17 +122,18 @@ class GmailHandler:
                 key=from_email,
             )
 
-            # Mark as read
-            self.service.users().messages().modify(
-                userId="me",
-                id=message_id,
-                body={"removeLabelIds": ["UNREAD"]},
-            ).execute()
+            _gmail_modify_cb = get_circuit_breaker("gmail")
+            async with _gmail_modify_cb:
+                self.service.users().messages().modify(
+                    userId="me",
+                    id=message_id,
+                    body={"removeLabelIds": ["UNREAD"]},
+                ).execute()
 
             logger.info("Gmail message processed and marked as read", message_id=message_id)
 
         except Exception as e:
-            logger.error("Error processing Gmail message", error=str(e), message_id=message_id)
+            logger.error("Error processing Gmail message", error=sanitize_error_message(str(e)), message_id=message_id)
 
     def _get_message_body(self, message: Dict[str, Any]) -> str:
         """Extract body text from Gmail message."""
@@ -146,7 +149,7 @@ class GmailHandler:
                 if data:
                     return base64.urlsafe_b64decode(data).decode("utf-8")
         except Exception as e:
-            logger.error("Error extracting message body", error=str(e))
+            logger.error("Error extracting message body", error=sanitize_error_message(str(e)))
 
         return "Unable to extract message body"
 
@@ -162,15 +165,17 @@ class GmailHandler:
 
             raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
 
-            self.service.users().messages().send(
-                userId="me",
-                body={"raw": raw_message},
-            ).execute()
+            _gmail_send_cb = get_circuit_breaker("gmail")
+            async with _gmail_send_cb:
+                self.service.users().messages().send(
+                    userId="me",
+                    body={"raw": raw_message},
+                ).execute()
 
             logger.info("Reply sent", to_email=to_email, subject=subject)
 
-        except HttpError as error:
-            logger.error("Error sending Gmail reply", error=str(error))
+        except (HttpError, CircuitBreakerError) as error:
+            logger.error("Error sending Gmail reply", error=sanitize_error_message(str(error)))
             raise
 
     def extract_customer_info(self, message: Dict[str, Any]) -> Dict[str, str]:
@@ -185,7 +190,7 @@ class GmailHandler:
                 "timestamp": headers.get("Date", ""),
             }
         except Exception as e:
-            logger.error("Error extracting customer info", error=str(e))
+            logger.error("Error extracting customer info", error=sanitize_error_message(str(e)))
             return {}
 
 
@@ -198,13 +203,13 @@ async def run_gmail_polling_loop(
     try:
         await handler.authenticate()
     except Exception as e:
-        logger.warning("Gmail authentication failed, polling disabled", error=str(e))
+        logger.warning("Gmail authentication failed, polling disabled", error=sanitize_error_message(str(e)))
         return
 
     while True:
         try:
             await handler.poll_inbox(poll_interval_seconds)
         except Exception as e:
-            logger.error("Gmail polling loop error", error=str(e))
+            logger.error("Gmail polling loop error", error=sanitize_error_message(str(e)))
 
         await asyncio.sleep(poll_interval_seconds)

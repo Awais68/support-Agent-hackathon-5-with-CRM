@@ -1,0 +1,43 @@
+version: '3.9'
+
+# KRaft-mode Kafka (no Zookeeper) — lighter & faster for local dev.
+# Usage: docker compose -f docker-compose.kraft.yml up -d kafka
+# The main docker-compose.yml already has ZK-based Kafka; use this file
+# when you want a pure KRaft setup (single-process Kafka).
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: techflow-kafka-kraft
+    hostname: kafka
+    environment:
+      # KRaft mode — no Zookeeper
+      KAFKA_NODE_ID: 1
+      CLUSTER_ID: "techflow-kraft-cluster-01"
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+
+      # Listener config
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Topic & partition defaults
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - techflow-kraft
+
+networks:
+  techflow-kraft:
+    driver: bridge

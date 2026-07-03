@@ -31,6 +31,10 @@ mypy>=1.8.0
 # Sentiment analysis (no API cost)
 vaderSentiment>=3.3.2
 
+# Rate limiting & caching
+slowapi>=0.1.9
+redis[hiredis]>=5.0.0
+
 # Monitoring and testing
 prometheus-client>=0.19.0
 websockets>=12.0

@@ -10,5 +10,8 @@ data:
   postgres-db: "techflow"
   api-host: "0.0.0.0"
   api-port: "8000"
+  api-url: "http://techflow-api.techflow.svc.cluster.local:8000"
+  company-name: "TechFlow Analytics"
+  support-email: "support@techflow-analytics.com"
   cors-origins: "https://app.techflow.com,https://www.techflow.com"
   log-level: "info"

@@ -20,6 +20,20 @@ spec:
         pathType: Prefix
         backend:
           service:
+            name: techflow-web-form
+            port:
+              number: 80
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: techflow-api
+            port:
+              number: 80
+      - path: /health
+        pathType: Exact
+        backend:
+          service:
             name: techflow-api
             port:
               number: 80

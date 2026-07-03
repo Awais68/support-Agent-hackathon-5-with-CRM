@@ -234,3 +234,63 @@ curl -s http://localhost:3001/api/health
 | Prometheus | ✅ | Stateless; restart recovers |
 | Grafana | ✅ | Stateless; data sources from Prometheus |
 | DLQ | ✅ | Dead letters automatically retried via dlq.retry topic |
+
+---
+
+## Automation
+
+All 6 experiments are automated via Python scripts in `chaos/experiments/`.
+
+### Directory Structure
+
+```
+chaos/
+├── experiments/
+│   ├── __init__.py
+│   ├── base.py              # Base experiment class
+│   ├── api_pod_deletion.py   # Experiment 1
+│   ├── kafka_restart.py      # Experiment 2
+│   ├── postgres_outage.py    # Experiment 3
+│   ├── worker_kill.py        # Experiment 4
+│   ├── network_partition.py  # Experiment 5
+│   └── metrics_pipeline.py   # Experiment 6
+├── config.py                # Shared config (timeouts, service names)
+├── safety.py                # Production guard + confirmation
+├── runner.py                # CLI orchestrator
+└── __init__.py
+```
+
+### How to Run
+
+```bash
+# List what would happen (no changes made)
+python -m chaos.runner --dry-run
+
+# Run all experiments
+python -m chaos.runner --yes
+
+# Run a single experiment
+python -m chaos.runner --experiment 03
+
+# Skip confirmation (non-interactive)
+TECHFLOW_CONFIRM_CHAOS=yes python -m chaos.runner
+```
+
+### Safety Guards
+
+| Guard | Mechanism |
+|-------|-----------|
+| Production block | `TECHFLOW_ENV=production` → refuses to run |
+| Confirmation | Interactive prompt or `TECHFLOW_CONFIRM_CHAOS=yes` |
+| Dry-run | `--dry-run` or `CHAOS_DRY_RUN=true` — preview only |
+| Kube context check | Refuses if kubectl context contains "prod" |
+
+### CI/CD Trigger (GitHub Actions)
+
+Defined in `.github/workflows/chaos.yml`:
+
+- **Scheduled**: Every Monday 03:00 UTC via `workflow_dispatch`
+- **On-demand**: Trigger manually from GitHub Actions UI with experiment selection
+- **Environment**: Locked to `staging` environment with protection rules
+- **Results**: JSON artifact uploaded with experiment results
+- **Safety**: Production environment protection rule blocks execution

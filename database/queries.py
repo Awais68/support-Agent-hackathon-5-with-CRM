@@ -1,10 +1,22 @@
 """Async database queries for TechFlow CRM Digital FTE."""
 
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Optional, List, Dict, Any
 from uuid import UUID
 import asyncpg
 import structlog
+from exceptions import sanitize_error_message
+
+
+FUZZY_THRESHOLD_DEFAULT = 0.3
+
+
+@dataclass
+class FuzzyMatchResult:
+    customer: Optional[Dict[str, Any]] = None
+    match_field: Optional[str] = None  # 'email' or 'name'
+    similarity: float = 0.0
 
 logger = structlog.get_logger(__name__)
 
@@ -16,6 +28,41 @@ async def register_pgvector_codec(pool: asyncpg.Pool) -> None:
 
 
 # Customers queries
+async def fuzzy_search_customers(
+    pool: asyncpg.Pool,
+    search_term: str,
+    search_field: str = "email",
+    threshold: float = FUZZY_THRESHOLD_DEFAULT,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Fuzzy search customers by name or email using pg_trgm similarity().
+
+    Returns results above the threshold, sorted by descending similarity.
+    search_field must be 'email' or 'name'.
+    """
+    valid = {"email", "name"}
+    if search_field not in valid:
+        raise ValueError(f"search_field must be one of {valid}, got '{search_field}'")
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT id, email, name, company, tier, created_at, updated_at, metadata,
+                   similarity({search_field}, $1) AS similarity
+            FROM customers
+            WHERE {search_field} % $1
+              AND similarity({search_field}, $1) >= $2
+            ORDER BY similarity DESC
+            LIMIT $3
+            """,
+            search_term,
+            threshold,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+
 async def get_customer(pool: asyncpg.Pool, email: str) -> Optional[Dict[str, Any]]:
     """Get customer by email."""
     async with pool.acquire() as conn:
@@ -114,10 +161,12 @@ async def get_customer_or_create_by_identifier(
     identifier_value: str,
     name: str = "Customer",
     tier: str = "starter",
+    fuzzy_threshold: float = FUZZY_THRESHOLD_DEFAULT,
 ) -> Dict[str, Any]:
-    """Get a customer by identifier, or create a new customer + identifier."""
+    """Get a customer by identifier, with fuzzy fallback on email/name, or create new."""
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # ── Step 1: exact match via identifier table ──
             existing = await conn.fetchrow(
                 """
                 SELECT c.id, c.email, c.name, c.company, c.tier, c.created_at, c.updated_at, c.metadata
@@ -131,6 +180,66 @@ async def get_customer_or_create_by_identifier(
             if existing:
                 return dict(existing)
 
+            fuzzy_matched = False
+
+            # ── Step 2: fuzzy fallback on email ──
+            if identifier_type == "email":
+                fuzzy_row = await conn.fetchrow(
+                    """
+                    SELECT id, email, name, company, tier, created_at, updated_at, metadata,
+                           similarity(email, $1) AS sim
+                    FROM customers
+                    WHERE email % $1
+                    ORDER BY sim DESC
+                    LIMIT 1
+                    """,
+                    identifier_value,
+                )
+                if fuzzy_row and fuzzy_row["sim"] >= fuzzy_threshold:
+                    await conn.execute(
+                        """
+                        INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (identifier_type, identifier_value) DO NOTHING
+                        """,
+                        fuzzy_row["id"],
+                        identifier_type,
+                        identifier_value,
+                    )
+                    fuzzy_matched = True
+                    existing = fuzzy_row
+
+            # ── Step 3: fuzzy fallback on name ──
+            if not fuzzy_matched and name and name != "Customer":
+                fuzzy_name_row = await conn.fetchrow(
+                    """
+                    SELECT id, email, name, company, tier, created_at, updated_at, metadata,
+                           similarity(name, $1) AS sim
+                    FROM customers
+                    WHERE name % $1
+                    ORDER BY sim DESC
+                    LIMIT 1
+                    """,
+                    name,
+                )
+                if fuzzy_name_row and fuzzy_name_row["sim"] >= fuzzy_threshold:
+                    await conn.execute(
+                        """
+                        INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (identifier_type, identifier_value) DO NOTHING
+                        """,
+                        fuzzy_name_row["id"],
+                        identifier_type,
+                        identifier_value,
+                    )
+                    fuzzy_matched = True
+                    existing = fuzzy_name_row
+
+            if fuzzy_matched:
+                return dict(existing)
+
+            # ── Step 4: create new customer + identifier ──
             if identifier_type == "email":
                 customer_email = identifier_value
             else:
@@ -171,6 +280,59 @@ async def get_customer_or_create_by_identifier(
                 )
 
             return customer
+
+
+async def find_customer_by_name_email(
+    pool: asyncpg.Pool,
+    email: str,
+    name: Optional[str] = None,
+    fuzzy_threshold: float = FUZZY_THRESHOLD_DEFAULT,
+) -> Optional[Dict[str, Any]]:
+    """
+    Look up a customer by email (exact first, then fuzzy), optionally by name.
+    Returns the best match or None.
+    """
+    async with pool.acquire() as conn:
+        # Exact email match
+        row = await conn.fetchrow(
+            "SELECT id, email, name, company, tier, created_at, updated_at, metadata FROM customers WHERE email = $1",
+            email,
+        )
+        if row:
+            return dict(row)
+
+        # Fuzzy email match
+        fuzzy_row = await conn.fetchrow(
+            """
+            SELECT id, email, name, company, tier, created_at, updated_at, metadata,
+                   similarity(email, $1) AS sim
+            FROM customers
+            WHERE email % $1
+            ORDER BY sim DESC
+            LIMIT 1
+            """,
+            email,
+        )
+        if fuzzy_row and fuzzy_row["sim"] >= fuzzy_threshold:
+            return dict(fuzzy_row)
+
+        # Fuzzy name match if provided
+        if name:
+            name_row = await conn.fetchrow(
+                """
+                SELECT id, email, name, company, tier, created_at, updated_at, metadata,
+                       similarity(name, $1) AS sim
+                FROM customers
+                WHERE name % $1
+                ORDER BY sim DESC
+                LIMIT 1
+                """,
+                name,
+            )
+            if name_row and name_row["sim"] >= fuzzy_threshold:
+                return dict(name_row)
+
+        return None
 
 
 async def get_customer_history(
@@ -231,13 +393,26 @@ async def create_ticket(
                     "SELECT id FROM customers WHERE email = $1", customer_email
                 )
                 if not customer_row:
-                    customer_row = await conn.fetchrow(
-                        "INSERT INTO customers (email, name, tier) VALUES ($1, $2, $3) RETURNING id",
+                    fuzzy_row = await conn.fetchrow(
+                        """
+                        SELECT id, similarity(email, $1) AS sim
+                        FROM customers
+                        WHERE email % $1
+                        ORDER BY sim DESC
+                        LIMIT 1
+                        """,
                         customer_email,
-                        customer_email.split("@")[0],
-                        "starter",
                     )
-                customer_id = customer_row["id"]
+                    if fuzzy_row and fuzzy_row["sim"] >= FUZZY_THRESHOLD_DEFAULT:
+                        customer_id = fuzzy_row["id"]
+                    else:
+                        customer_row = await conn.fetchrow(
+                            "INSERT INTO customers (email, name, tier) VALUES ($1, $2, $3) RETURNING id",
+                            customer_email,
+                            customer_email.split("@")[0],
+                            "starter",
+                        )
+                        customer_id = customer_row["id"]
 
             # Create ticket
             ticket_row = await conn.fetchrow(
@@ -293,7 +468,7 @@ async def update_ticket_status(
     pool: asyncpg.Pool, ticket_id: UUID, status: str
 ) -> Optional[Dict[str, Any]]:
     """Update ticket status."""
-    resolved_at = datetime.utcnow() if status == "resolved" else None
+    resolved_at = datetime.now(UTC) if status == "resolved" else None
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -632,7 +807,7 @@ async def get_metrics_summary(
     pool: asyncpg.Pool, hours: int = 24, limit: int = 100
 ) -> List[Dict[str, Any]]:
     """Get metrics summary for the last N hours."""
-    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    cutoff = datetime.now(UTC) - timedelta(hours=hours)
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
