@@ -1,17 +1,49 @@
-"""Playwright end-to-end tests for web form and ticket flow."""
+"""Playwright end-to-end tests for web form and ticket flow.
 
-import pytest
+These tests require real infrastructure (started via scripts/setup_e2e.sh):
+
+- API server running on http://localhost:8000
+- PostgreSQL + Kafka initialized
+- Playwright + Chromium installed
+
+If any prerequisite is missing the suite is skipped with a clear message
+instead of failing collection.
+"""
+
 import json
-from playwright.async_api import async_playwright, Page
-from datetime import datetime
 
-# These tests require:
-# - Running API server on http://localhost:8000
-# - Database initialized
-# - API_KEY environment variable set
+import httpx
+import pytest
+
+try:
+    from playwright.async_api import Page, async_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on optional dependency
+    _PLAYWRIGHT_AVAILABLE = False
+
+if not _PLAYWRIGHT_AVAILABLE:
+    pytest.skip(
+        "Playwright is not installed. Run: pip install playwright && playwright install chromium",
+        allow_module_level=True,
+    )
 
 BASE_URL = "http://localhost:8000"
 API_KEY = "test-key-12345"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def server_available():
+    """Skip the whole suite if the API server is not reachable."""
+    try:
+        resp = httpx.get(f"{BASE_URL}/health", timeout=3.0)
+        if resp.status_code < 500:
+            return
+    except Exception:
+        pass
+    pytest.skip(
+        f"API server not reachable at {BASE_URL}. "
+        "Start it with: scripts/setup_e2e.sh (or: uvicorn api.main:app --port 8000)",
+    )
 
 
 @pytest.fixture
@@ -317,6 +349,41 @@ class TestErrorHandling:
             headers={"X-API-Key": API_KEY},
         )
         assert response.status == 404
+
+
+class TestVoiceChannel:
+    """Test voice endpoints (degrade gracefully without STT keys)."""
+
+    async def test_voice_transcribe_endpoint(self, page: Page):
+        """Transcribe endpoint returns a structured, safe response."""
+        response = await page.request.post(
+            f"{BASE_URL}/voice/transcribe",
+            data=json.dumps({"audio_base64": "ZmFrZWF1ZGlv", "filename": "voice.wav"}),
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": API_KEY,
+            },
+        )
+        assert response.status == 200
+        data = await response.json()
+        assert "needs_clarification" in data
+        assert "transcript" in data
+        assert "confidence" in data
+
+    async def test_voice_translate_endpoint(self, page: Page):
+        """Translate endpoint always responds (LLM failure falls back to raw)."""
+        response = await page.request.post(
+            f"{BASE_URL}/voice/translate",
+            data=json.dumps({"text": "Can you help me?"}),
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": API_KEY,
+            },
+        )
+        assert response.status == 200
+        data = await response.json()
+        assert "translated" in data
+        assert "language" in data
 
 
 if __name__ == "__main__":

@@ -94,4 +94,50 @@ export function connectTicketWebSocket(ticketId: string): WebSocket {
   return new WebSocket(wsUrl);
 }
 
+// --- Voice channel ---------------------------------------------------------
+
+export interface VoiceMessagePayload {
+  audio_base64: string;
+  filename: string;
+  content_type?: string;
+  language?: string;
+  name?: string;
+  email?: string;
+  phone?: string;
+}
+
+export interface VoiceResponse {
+  transcript: string;
+  language: string;
+  confidence: number;
+  needs_clarification: boolean;
+  translated_to_english: string | null;
+  agent_response: string;
+  response_language: string;
+  audio_base64: string | null;
+  audio_format: string;
+  ticket_id: string | null;
+  ticket_number: string | null;
+  clarification_message: string;
+}
+
+export async function submitVoiceMessage(
+  payload: VoiceMessagePayload
+): Promise<VoiceResponse> {
+  const response = await fetch(`${API_URL}/webhooks/voice/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const error = await response
+      .json()
+      .catch(() => ({ message: 'Voice submission failed' }));
+    throw new Error(error.message || 'Failed to submit voice message');
+  }
+
+  return response.json();
+}
+
 export { FormDataSchema };

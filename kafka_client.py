@@ -25,6 +25,7 @@ logger = structlog.get_logger(__name__)
 INBOUND_EMAIL_TOPIC = "inbound.email"
 INBOUND_WHATSAPP_TOPIC = "inbound.whatsapp"
 INBOUND_WEBFORM_TOPIC = "inbound.webform"
+INBOUND_VOICE_TOPIC = "inbound.voice"
 AGENT_PROCESSING_TOPIC = "agent.processing"
 AGENT_COMPLETED_TOPIC = "agent.completed"
 NOTIFICATIONS_OUTBOUND_TOPIC = "notifications.outbound"
@@ -36,6 +37,7 @@ ALL_TOPICS = [
     INBOUND_EMAIL_TOPIC,
     INBOUND_WHATSAPP_TOPIC,
     INBOUND_WEBFORM_TOPIC,
+    INBOUND_VOICE_TOPIC,
     AGENT_PROCESSING_TOPIC,
     AGENT_COMPLETED_TOPIC,
     NOTIFICATIONS_OUTBOUND_TOPIC,
@@ -369,6 +371,35 @@ def create_inbound_webform_message(
         payload=payload,
         message_id=message_id,
         headers={"content_type": "webform"},
+    )
+
+
+def create_inbound_voice_message(
+    customer_phone: str,
+    customer_name: str,
+    message_body: str,
+    language: str = "en",
+    confidence: float = 1.0,
+    audio_url: str | None = None,
+    message_id: str | None = None,
+) -> KafkaMessage:
+    """Create an inbound voice message (STT result)."""
+    payload: dict[str, Any] = {
+        "customer_phone": customer_phone,
+        "customer_name": customer_name,
+        "message_body": message_body,
+        "language": language,
+        "confidence": confidence,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    if audio_url:
+        payload["audio_url"] = audio_url
+
+    return KafkaMessage(
+        topic=INBOUND_VOICE_TOPIC,
+        payload=payload,
+        message_id=message_id,
+        headers={"content_type": "voice"},
     )
 
 

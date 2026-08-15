@@ -10,6 +10,7 @@ from exceptions import sanitize_error_message
 
 
 FUZZY_THRESHOLD_DEFAULT = 0.3
+EMBEDDING_DIM = 1536
 
 
 @dataclass
@@ -392,7 +393,9 @@ async def create_ticket(
                 customer_row = await conn.fetchrow(
                     "SELECT id FROM customers WHERE email = $1", customer_email
                 )
-                if not customer_row:
+                if customer_row:
+                    customer_id = customer_row["id"]
+                else:
                     fuzzy_row = await conn.fetchrow(
                         """
                         SELECT id, similarity(email, $1) AS sim
@@ -414,12 +417,24 @@ async def create_ticket(
                         )
                         customer_id = customer_row["id"]
 
+            # Register the email identifier so customer history resolves
+            # regardless of which channel created the ticket.
+            await conn.execute(
+                """
+                INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)
+                VALUES ($1, 'email', $2)
+                ON CONFLICT (identifier_type, identifier_value) DO NOTHING
+                """,
+                customer_id,
+                customer_email,
+            )
+
             # Create ticket
             ticket_row = await conn.fetchrow(
                 """
                 INSERT INTO tickets (ticket_number, customer_id, subject, category, priority, channel)
                 VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, ticket_number, status, created_at
+                RETURNING id, ticket_number, customer_id, status, created_at
                 """,
                 ticket_number,
                 customer_id,
@@ -468,7 +483,7 @@ async def update_ticket_status(
     pool: asyncpg.Pool, ticket_id: UUID, status: str
 ) -> Optional[Dict[str, Any]]:
     """Update ticket status."""
-    resolved_at = datetime.now(UTC) if status == "resolved" else None
+    resolved_at = datetime.now(UTC).replace(tzinfo=None) if status == "resolved" else None
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -658,6 +673,10 @@ async def add_knowledge_base_article(
     tier: str = "all",
 ) -> Dict[str, Any]:
     """Add a knowledge base article."""
+    # pgvector requires a non-empty vector; use a zero vector when no embedding
+    # was provided (e.g. embedding provider unavailable) so ingestion still works.
+    if not embedding:
+        embedding = [0.0] * EMBEDDING_DIM
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """

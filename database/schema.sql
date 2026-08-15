@@ -27,7 +27,7 @@ CREATE TABLE tickets (
     category VARCHAR(50),
     priority VARCHAR(20) CHECK (priority IN ('low', 'medium', 'high', 'critical')),
     status VARCHAR(50) DEFAULT 'open' CHECK (status IN ('open', 'in_progress', 'resolved', 'escalated', 'closed')),
-    channel VARCHAR(50) NOT NULL CHECK (channel IN ('email', 'whatsapp', 'webform')),
+    channel VARCHAR(50) NOT NULL CHECK (channel IN ('email', 'whatsapp', 'webform', 'voice', 'api')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     resolved_at TIMESTAMP,
@@ -44,7 +44,7 @@ CREATE TABLE messages (
     customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
     direction VARCHAR(20) NOT NULL CHECK (direction IN ('inbound', 'outbound')),
     content TEXT NOT NULL,
-    channel VARCHAR(50) NOT NULL CHECK (channel IN ('email', 'whatsapp', 'webform')),
+    channel VARCHAR(50) NOT NULL CHECK (channel IN ('email', 'whatsapp', 'webform', 'voice', 'api')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     metadata JSONB DEFAULT '{}'::jsonb,
     sentiment_score FLOAT

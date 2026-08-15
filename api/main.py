@@ -1,39 +1,45 @@
 """FastAPI application for TechFlow CRM Digital FTE."""
 
 import os
+import re
 import traceback as tb
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any
+from typing import Any
 from uuid import UUID
+from xml.sax.saxutils import escape as xml_escape
 
 import asyncpg
 import structlog
-from fastapi import FastAPI, Depends, HTTPException, Request, Header, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field, EmailStr
+from openai import APIError as OpenAIAPIError
+from openai import AsyncOpenAI
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel, EmailStr, Field
 from pydantic import ValidationError as PydanticValidationError
-from openai import AsyncOpenAI, APIError as OpenAIAPIError
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-
-from kafka_client import KafkaProducerClient
-from database import queries as db
-from api.websocket_manager import WebSocketManager
-from channels.web_form_handler import WebFormHandler, WebFormSubmission
-from channels.whatsapp_handler import WhatsAppHandler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit
 
+from agent.customer_success_agent import AgentContext, CustomerSuccessAgent
+from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit
+from api.websocket_manager import WebSocketManager
+from channels.voice_handler import VoiceHandler, twilio_language
+from channels.web_form_handler import WebFormHandler, WebFormSubmission
+from channels.whatsapp_handler import WhatsAppHandler
+from database import queries as db
 from exceptions import (
     AppError,
-    NotFoundError,
     ConfigurationError,
+    NotFoundError,
+    ValidationError,
     sanitize_error_message,
     to_error_response,
 )
-from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
+from kafka_client import KafkaProducerClient
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
 
@@ -98,16 +104,16 @@ class MetricsResponse(BaseModel):
 
 
 class DashboardMetricsResponse(BaseModel):
-    status_counts: Dict[str, int]
+    status_counts: dict[str, int]
     avg_resolution_hours: float
     escalation_rate_percent: float
-    channel_counts: Dict[str, int]
+    channel_counts: dict[str, int]
     total_tickets: int
 
 
 class KBSearchRequest(BaseModel):
     q: str
-    category: Optional[str] = None
+    category: str | None = None
     limit: int = 5
 
 
@@ -115,44 +121,72 @@ class KBArticleRequest(BaseModel):
     title: str
     content: str
     category: str = "general"
-    tags: List[str] = []
-    embedding: List[float] = []
+    tags: list[str] = []
+    embedding: list[float] = []
+
+
+class VoiceMessageRequest(BaseModel):
+    """Voice message payload: base64 audio OR a public audio URL."""
+
+    audio_base64: str | None = None
+    audio_url: str | None = None
+    filename: str = "voice.wav"
+    content_type: str | None = None
+    language: str | None = None
+    name: str | None = None
+    email: EmailStr | None = None
+    phone: str | None = None
+
+
+class TranslateRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    target_language: str | None = None
 
 
 # Global state
-db_pool: Optional[asyncpg.Pool] = None
-kafka_producer: Optional[KafkaProducerClient] = None
+db_pool: asyncpg.Pool | None = None
+kafka_producer: KafkaProducerClient | None = None
 ws_manager: WebSocketManager = WebSocketManager()
 
 
 # Dependency injection
 async def get_db(request: Request) -> asyncpg.Pool:
     """Get database pool from request state."""
-    if not request.app.state.db_pool:
+    pool = getattr(request.app.state, "db_pool", None)
+    if not pool:
         raise ConfigurationError(message="Database not initialized")
-    return request.app.state.db_pool
+    return pool
 
 
 async def get_kafka(request: Request) -> KafkaProducerClient:
     """Get Kafka producer from request state."""
-    if not request.app.state.kafka_producer:
+    producer = getattr(request.app.state, "kafka_producer", None)
+    if not producer:
         raise ConfigurationError(message="Kafka not initialized")
-    return request.app.state.kafka_producer
+    return producer
 
 
 async def get_openai(request: Request) -> AsyncOpenAI:
     """Get OpenRouter client from request state (handles chat + embeddings)."""
-    if not request.app.state.openai_client:
+    client = getattr(request.app.state, "openai_client", None)
+    if not client:
         raise ConfigurationError(message="OpenAI client not initialized")
-    return request.app.state.openai_client
+    return client
 
 
 async def verify_api_key(
-    request: Request, x_api_key: Optional[str] = Header(None)
+    request: Request, x_api_key: str | None = Header(None)
 ) -> bool:
     """Verify API key for non-webhook endpoints."""
     # Skip verification for webhook, health, and metrics endpoints
-    if request.url.path in ["/health", "/webhooks/whatsapp", "/webhooks/webform", "/metrics"]:
+    if request.url.path in [
+        "/health",
+        "/metrics",
+        "/webhooks/whatsapp",
+        "/webhooks/webform",
+        "/webhooks/voice/message",
+        "/webhooks/voice/call",
+    ]:
         return True
 
     api_key = os.getenv("API_KEY", "test-key-12345")
@@ -350,11 +384,11 @@ async def create_ticket(
 
 @app.get("/tickets")
 async def list_tickets(
-    status: Optional[str] = None,
+    status: str | None = None,
     limit: int = 20,
     offset: int = 0,
     pool: asyncpg.Pool = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """List all tickets with pagination."""
     tickets, total = await db.list_tickets(pool, status=status, limit=limit, offset=offset)
 
@@ -370,7 +404,7 @@ async def list_tickets(
 async def get_ticket(
     ticket_id: UUID,
     pool: asyncpg.Pool = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get full ticket details."""
     ticket = await db.get_ticket(pool, ticket_id)
     if not ticket:
@@ -391,7 +425,7 @@ async def update_ticket_status(
     ticket_id: UUID,
     request: UpdateStatusRequest,
     pool: asyncpg.Pool = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Update ticket status."""
     ticket = await db.update_ticket_status(pool, ticket_id, request.status)
     if not ticket:
@@ -407,7 +441,7 @@ async def get_ticket_messages(
     ticket_id: UUID,
     limit: int = 50,
     pool: asyncpg.Pool = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get messages for a ticket."""
     messages = await db.get_ticket_messages(pool, ticket_id, limit=limit)
 
@@ -425,7 +459,7 @@ async def reply_to_ticket(
     ticket_id: UUID,
     body: ReplyRequest,
     pool: asyncpg.Pool = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Send a reply to a ticket."""
     ticket = await db.get_ticket(pool, ticket_id)
     if not ticket:
@@ -434,7 +468,7 @@ async def reply_to_ticket(
     message = await db.add_message(
         pool,
         ticket_id=ticket_id,
-        customer_id=UUID(ticket["customer_id"]),
+        customer_id=ticket["customer_id"],
         direction="outbound",
         content=body.message,
         channel=ticket["channel"],
@@ -462,7 +496,7 @@ async def reply_to_ticket(
 async def webhook_whatsapp(
     request: Request,
     kafka_producer: KafkaProducerClient = Depends(get_kafka),
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """WhatsApp webhook from Twilio."""
     try:
         form_data = await request.form()
@@ -491,32 +525,273 @@ async def webhook_whatsapp(
         return {"status": "error"}
 
 
-@app.post("/webhooks/webform", response_model=Dict[str, Any], status_code=201)
+@app.post("/webhooks/webform", response_model=dict[str, Any], status_code=201)
 @limiter.limit(strict_limit)
 async def webhook_webform(
-    request: WebFormSubmission,
-    pool: asyncpg.Pool = Depends(get_db),
-    kafka_producer: KafkaProducerClient = Depends(get_kafka),
-) -> Dict[str, Any]:
-    """Web form submission endpoint."""
+    request: Request,
+    body: WebFormSubmission,
+) -> dict[str, Any]:
+    """Web form submission endpoint.
+
+    The request body is validated (Pydantic) BEFORE any infrastructure is touched,
+    so invalid submissions are rejected with 422 even if DB/Kafka are unavailable.
+    """
+    pool = getattr(request.app.state, "db_pool", None)
+    if not pool:
+        raise ConfigurationError(message="Database not initialized")
+    kafka_producer = getattr(request.app.state, "kafka_producer", None)
+    if not kafka_producer:
+        raise ConfigurationError(message="Kafka not initialized")
+
     handler = WebFormHandler(kafka_producer)
-    await handler.process_submission(request)
+    try:
+        await handler.process_submission(body)
+    except Exception as e:
+        # Kafka routing must not prevent ticket creation
+        logger.warning(
+            "Failed to route webform submission to Kafka",
+            error=sanitize_error_message(str(e)),
+            email=body.email,
+        )
 
     ticket = await db.create_ticket(
         pool,
-        customer_email=request.email,
-        subject=request.subject,
-        category=request.category,
-        priority=request.priority,
+        customer_email=body.email,
+        subject=body.subject,
+        category=body.category,
+        priority=body.priority,
         channel="webform",
-        initial_message=request.message,
+        initial_message=body.message,
     )
 
     return {
         "ticket_number": ticket["ticket_number"],
-        "message": f"Thank you for your submission. Your ticket number is {ticket['ticket_number']}",
-        "estimated_response": "24 hours for Starter tier, 8 hours for Growth tier, 2 hours for Enterprise tier",
+        "message": (
+            f"Thank you for your submission. Your ticket number is {ticket['ticket_number']}"
+        ),
+        "estimated_response": (
+            "24 hours for Starter tier, 8 hours for Growth tier, 2 hours for Enterprise tier"
+        ),
         "tracking_url": f"https://support.techflow.com/track/{ticket['ticket_number']}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Voice channel (voice messages + phone calls)
+# ---------------------------------------------------------------------------
+async def _run_voice_agent(
+    pool: asyncpg.Pool,
+    kafka_producer: KafkaProducerClient,
+    openai_client: AsyncOpenAI,
+    message: str,
+    customer_name: str = "",
+    customer_email: str = "",
+    customer_phone: str = "",
+) -> dict[str, Any]:
+    """Create a voice ticket and run the customer success agent synchronously.
+
+    Returns the agent's response plus ticket identifiers so the caller can
+    synthesize and reply over voice.
+    """
+    if not customer_email:
+        if customer_phone:
+            normalized = re.sub(r"[^\d]", "", customer_phone)
+            customer_email = f"voice{normalized}@voice.local"
+        else:
+            customer_email = "voice@customer.local"
+
+    subject = (message or "Voice message").strip()[:80]
+    ticket = await db.create_ticket(
+        pool,
+        customer_email=customer_email,
+        subject=subject,
+        category="general",
+        priority="medium",
+        channel="voice",
+        initial_message=message,
+    )
+
+    context = AgentContext(
+        db_pool=pool,
+        kafka_producer=kafka_producer,
+        openai_client=openai_client,
+    )
+    agent = CustomerSuccessAgent(context)
+    result = await agent.process_customer_message(
+        ticket_id=UUID(ticket["id"]),
+        customer_id=ticket["customer_id"],
+        customer_email=customer_email,
+        customer_name=customer_name or customer_email.split("@")[0],
+        message=message,
+        channel="voice",
+    )
+
+    return {
+        "response": result["response"],
+        "ticket_id": result["ticket_id"],
+        "ticket_number": ticket["ticket_number"],
+    }
+
+
+@app.post("/webhooks/voice/message", response_model=dict[str, Any])
+@limiter.limit(strict_limit)
+async def webhook_voice_message(
+    request: Request,
+    body: VoiceMessageRequest,
+) -> dict[str, Any]:
+    """Process a voice message: STT → translate → agent → TTS reply."""
+    pool = getattr(request.app.state, "db_pool", None)
+    kafka_producer = getattr(request.app.state, "kafka_producer", None)
+    openai_client = getattr(request.app.state, "openai_client", None)
+    if not (pool and kafka_producer and openai_client):
+        raise ConfigurationError(message="Infrastructure not initialized")
+
+    handler = VoiceHandler(kafka_producer, openai_client=openai_client)
+    audio_bytes = await handler.resolve_audio(body.audio_base64, body.audio_url)
+    if not audio_bytes:
+        raise ValidationError(message="Provide a valid audio_base64 or audio_url")
+
+    result = await handler.handle_voice_message(
+        audio_bytes=audio_bytes,
+        filename=body.filename or "voice.wav",
+        content_type=body.content_type,
+        language=body.language,
+        name=body.name,
+        email=str(body.email) if body.email else None,
+        phone=body.phone,
+        run_agent=lambda english: _run_voice_agent(
+            pool,
+            kafka_producer,
+            openai_client,
+            english,
+            customer_name=body.name or "",
+            customer_email=str(body.email) if body.email else "",
+            customer_phone=body.phone or "",
+        ),
+    )
+    return result.to_dict()
+
+
+@app.post("/webhooks/voice/call")
+@limiter.limit(strict_limit)
+async def webhook_voice_call(request: Request) -> Response:
+    """Twilio voice call webhook.
+
+    Returns TwiML: first a ``<Gather input="speech">`` to capture the customer's
+    request, then the agent's spoken reply in the customer's own language.
+    """
+    form = await request.form()
+    speech_result = str(form.get("SpeechResult") or "").strip()
+    try:
+        speech_confidence = float(str(form.get("Confidence") or 1.0))
+    except ValueError:
+        speech_confidence = 1.0
+    from_number = str(form.get("From") or "")
+
+    pool = getattr(request.app.state, "db_pool", None)
+    kafka_producer = getattr(request.app.state, "kafka_producer", None)
+    openai_client = getattr(request.app.state, "openai_client", None)
+    if not (pool and kafka_producer and openai_client):
+        raise ConfigurationError(message="Infrastructure not initialized")
+
+    if not speech_result:
+        # Greeting: ask the customer to state their issue in one sentence
+        twiml = (
+            '<Response><Gather input="speech" timeout="4" language="en-US">'
+            "<Say>Hello, thank you for calling TechFlow support. "
+            "Please tell me in one sentence how I can help you today.</Say>"
+            "</Gather><Say>We didn't receive your response. Goodbye.</Say></Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    handler = VoiceHandler(kafka_producer, openai_client=openai_client)
+
+    if speech_confidence < handler.confidence_threshold:
+        reply = (
+            "I'm sorry, I didn't catch that clearly. "
+            "Please call back and speak a little more clearly."
+        )
+        return Response(
+            content=f"<Response><Say>{xml_escape(reply)}</Say></Response>",
+            media_type="application/xml",
+        )
+
+    english, lang, was_translated = await handler.detect_and_translate(speech_result)
+    try:
+        agent_result = await _run_voice_agent(
+            pool,
+            kafka_producer,
+            openai_client,
+            english,
+            customer_name="",
+            customer_email="",
+            customer_phone=from_number,
+        )
+        reply = agent_result["response"]
+    except Exception as e:
+        logger.error("Voice call agent failed", error=sanitize_error_message(str(e)))
+        reply = (
+            "I'm sorry, I'm having trouble right now. "
+            "A human agent will call you back shortly."
+        )
+
+    if was_translated:
+        reply = await handler.translate_to_language(reply, lang)
+
+    twiml = (
+        f'<Response><Say language="{twilio_language(lang)}">'
+        f"{xml_escape(reply)}</Say></Response>"
+    )
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/voice/transcribe", response_model=dict[str, Any])
+@limiter.limit(strict_limit)
+async def voice_transcribe(
+    request: Request,
+    body: VoiceMessageRequest,
+) -> dict[str, Any]:
+    """STT-only endpoint: transcribe + translate, no agent run (for testing)."""
+    kafka_producer = getattr(request.app.state, "kafka_producer", None)
+    openai_client = getattr(request.app.state, "openai_client", None)
+    handler = VoiceHandler(kafka_producer, openai_client=openai_client)
+
+    audio_bytes = await handler.resolve_audio(body.audio_base64, body.audio_url)
+    if not audio_bytes:
+        raise ValidationError(message="Provide a valid audio_base64 or audio_url")
+
+    result = await handler.handle_voice_message(
+        audio_bytes=audio_bytes,
+        filename=body.filename or "voice.wav",
+        content_type=body.content_type,
+        language=body.language,
+        name=body.name,
+        email=str(body.email) if body.email else None,
+        phone=body.phone,
+        run_agent=None,
+    )
+    return result.to_dict()
+
+
+@app.post("/voice/translate", response_model=dict[str, Any])
+@limiter.limit(strict_limit)
+async def voice_translate(
+    request: Request,
+    body: TranslateRequest,
+) -> dict[str, Any]:
+    """Translate text. Without ``target_language``: detect + translate to English."""
+    openai_client = getattr(request.app.state, "openai_client", None)
+    handler = VoiceHandler(kafka_producer=None, openai_client=openai_client)
+
+    if body.target_language:
+        translated = await handler.translate_to_language(body.text, body.target_language)
+        return {"text": translated, "target_language": body.target_language}
+
+    english, language, was_translated = await handler.detect_and_translate(body.text)
+    return {
+        "translated": english,
+        "language": language,
+        "was_translated": was_translated,
     }
 
 
@@ -529,7 +804,7 @@ async def get_customer_history(
     limit: int = 10,
     include_resolved: bool = True,
     pool: asyncpg.Pool = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get customer history."""
     history = await db.get_customer_history(pool, email, limit=limit, include_resolved=include_resolved)
 
@@ -545,7 +820,7 @@ async def get_customer_history(
 async def get_metrics_summary(
     hours: int = 24,
     pool: asyncpg.Pool = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get metrics summary for the last N hours."""
     metrics = await db.get_metrics_summary(pool, hours=hours)
 
@@ -569,12 +844,12 @@ async def get_dashboard_metrics(
 @app.get("/knowledge-base")
 async def search_knowledge_base(
     q: str,
-    category: Optional[str] = None,
+    category: str | None = None,
     limit: int = 5,
     customer_tier: str = "starter",
     pool: asyncpg.Pool = Depends(get_db),
     openai_client: AsyncOpenAI = Depends(get_openai),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Search knowledge base using real pgvector cosine similarity."""
     embedding_model = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
     _cb = get_circuit_breaker("openai")
@@ -615,7 +890,7 @@ async def ingest_knowledge_base(
     request: Request,
     body: KBArticleRequest,
     pool: asyncpg.Pool = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Ingest a knowledge base article."""
     article = await db.add_knowledge_base_article(
         pool,
@@ -649,6 +924,20 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
+def _sanitize_validation_errors(errors: Sequence[Any]) -> list[dict[str, Any]]:
+    """Make Pydantic error contexts JSON-safe (exceptions aren't serializable)."""
+    cleaned: list[dict[str, Any]] = []
+    for err in errors:
+        item = dict(err)
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict):
+            item["ctx"] = {
+                k: (str(v) if isinstance(v, BaseException) else v) for k, v in ctx.items()
+            }
+        cleaned.append(item)
+    return cleaned
+
+
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
     """Handle structured application errors."""
@@ -668,7 +957,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     """Handle Pydantic/FastAPI validation errors."""
     logger.warning(
         "Validation error",
-        errors=exc.errors(),
+        errors=_sanitize_validation_errors(exc.errors()),
         path=request.url.path,
     )
     return JSONResponse(
@@ -676,7 +965,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
         content={
             "error": "VALIDATION_ERROR",
             "message": "Request validation failed",
-            "details": exc.errors(),
+            "details": _sanitize_validation_errors(exc.errors()),
         },
     )
 

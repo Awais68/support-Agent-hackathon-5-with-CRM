@@ -9,7 +9,7 @@ def client():
     """Create test client."""
     from api.main import app
 
-    return TestClient(app)
+    return TestClient(app, raise_server_exceptions=False)
 
 
 def test_health_check(client):

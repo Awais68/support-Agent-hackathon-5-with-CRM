@@ -4,7 +4,7 @@ A complete "Customer Success Digital FTE" (AI agent replacing a human support em
 
 ## 🎯 Overview
 
-Autonomous customer support system handling support inquiries across **3 channels** (Email, WhatsApp, Web Form) using GPT-4o agent with 5 specialized tools. Automatically creates tickets, searches knowledge bases, escalates complex issues, and maintains full conversation history.
+Autonomous customer support system handling support inquiries across **4 channels** (Email, WhatsApp, Web Form, **Voice**) using GPT-4o agent with 5 specialized tools. Automatically creates tickets, searches knowledge bases, escalates complex issues, and maintains full conversation history. The **voice channel** adds speech-to-text, text-to-speech, and automatic translation so customers can call or leave a voice message in any language and the agent understands them on the first utterance.
 
 ## 🚀 Quick Start
 
@@ -62,6 +62,10 @@ curl -X POST http://localhost:8000/webhooks/webform \
 | POST | `/tickets/{id}/reply` | Add message to ticket |
 | POST | `/webhooks/whatsapp` | Twilio WhatsApp webhook |
 | POST | `/webhooks/webform` | Web form submission |
+| POST | `/webhooks/voice/message` | Voice message (audio → STT → agent → TTS reply) |
+| POST | `/webhooks/voice/call` | Twilio voice call webhook (TwiML + speech gather) |
+| POST | `/voice/transcribe` | STT-only: transcribe + translate audio |
+| POST | `/voice/translate` | Detect language + translate (or translate to a target language) |
 | GET | `/customers/{email}/history` | Get customer's ticket history |
 | GET | `/metrics/summary` | Get metrics for last N hours |
 | GET | `/metrics/dashboard` | Get aggregated dashboard metrics |
@@ -78,14 +82,48 @@ curl -X POST http://localhost:8000/webhooks/webform \
 4. **escalate_to_human** — Route to human agent queue
 5. **send_response** — Send channel-specific response (email/WhatsApp/webform)
 
+## 🎙️ Voice Channel (calls + voice messages)
+
+The voice channel lets customers **call in** or **leave a voice message** and talk to
+the agent in any language — no typing required.
+
+Pipeline: `audio → STT → language detect → translate → agent → translate back → TTS`
+
+- **Speech-to-text** — Groq Whisper (`whisper-large-v3-turbo`, the most accurate
+  real-time model) with automatic fallback to OpenAI Whisper. Raw transcripts are
+  routed to the `inbound.voice` Kafka topic.
+- **First-time accuracy** — a confidence gate (`STT_CONFIDENCE_THRESHOLD`, default
+  `0.5`) guarantees the agent **never guesses**. If the transcript is unclear it
+  asks the customer to repeat, echoing back what it heard.
+- **NLP + translation** — language is detected and the request is translated to
+  English for the agent; the reply is translated back into the customer's language
+  and spoken via TTS (OpenAI TTS → gTTS offline fallback).
+- **Voice calls** — the `/webhooks/voice/call` webhook returns TwiML using
+  `<Gather input="speech">`; the agent's answer is spoken with `<Say>` in the
+  customer's language.
+- **Web form** — the frontend has a built-in recorder ("Talk to a Support Agent").
+  No STT keys? Everything degrades gracefully to a clarification prompt.
+
+```bash
+# Voice message (base64 audio)
+curl -X POST http://localhost:8000/webhooks/voice/message \
+  -H "Content-Type: application/json" \
+  -d '{"audio_base64":"<base64>","filename":"voice.webm","name":"Ali"}'
+
+# Test translation
+curl -X POST http://localhost:8000/voice/translate \
+  -H "Content-Type: application/json" -H "X-API-Key: test-key-12345" \
+  -d '{"text":"میں اپنا پاس ورڈ ری سیٹ کرنا چاہتا ہوں"}'
+```
+
 ## 📊 Architecture
 
 ```
-Customer Input (Email/WhatsApp/Web)
+Customer Input (Email/WhatsApp/Web/Voice Call/Voice Message)
         ↓
-  Channel Handlers
+  Channel Handlers  (+ VoiceHandler: STT → translate → TTS)
         ↓
-  Kafka (9 Topics)
+  Kafka (10 Topics, incl. inbound.voice)
         ↓
   Message Processor Worker
         ↓
@@ -116,6 +154,12 @@ TWILIO_AUTH_TOKEN=...
 TWILIO_WHATSAPP_NUMBER=+1234567890
 GMAIL_CREDENTIALS_FILE=gmail_credentials.json
 CORS_ORIGINS=http://localhost:3000,http://localhost:8000
+
+# Voice channel
+GROQ_API_KEY=gsk_...          # STT (Whisper via Groq — fastest + most accurate)
+OPENAI_API_KEY=sk-...         # TTS (and STT fallback)
+STT_CONFIDENCE_THRESHOLD=0.5  # below this the agent asks to repeat, never guesses
+TTS_PROVIDER=auto             # openai | gtts | none
 ```
 
 ## 📋 Project Structure
@@ -138,15 +182,23 @@ specifyplus/
 ## 🧪 Testing
 
 ```bash
-# Unit tests
-pytest tests/test_agent.py -v
+# Unit + integration tests (no infrastructure required)
+pytest tests/test_agent.py tests/test_voice.py -v
 
-# Integration tests
+# API e2e tests (validation/auth — no infrastructure required)
 pytest tests/test_e2e.py -v
+
+# Full end-to-end tests (real Postgres + Kafka + API server + Playwright)
+./scripts/setup_e2e.sh
 
 # Load test
 locust -f tests/load_test.py --headless -u 50 -r 5 --run-time 60s
 ```
+
+`tests/test_e2e_playwright.py` needs a live stack: PostgreSQL, Kafka, the API on
+`http://localhost:8000`, and Chromium. `scripts/setup_e2e.sh` brings it all up and
+runs the suite. If any prerequisite is missing the suite **skips gracefully**
+instead of failing collection.
 
 ## 🚀 Deployment
 
