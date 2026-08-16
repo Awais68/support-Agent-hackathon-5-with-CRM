@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import json
 from typing import Optional, List, Dict, Any
 from uuid import UUID
 import asyncpg
@@ -624,7 +625,7 @@ async def update_message_emotion_data(
             RETURNING id, ticket_id, sentiment_score
             """,
             sentiment_score,
-            metadata_update,
+            json.dumps(metadata_update),
             message_id,
         )
         return dict(row) if row else None
@@ -706,15 +707,16 @@ async def update_message_sentiment(
             """
             UPDATE messages
             SET sentiment_score = $1,
-                metadata = metadata || jsonb_build_object('sentiment_score', $1::text)
+                metadata = metadata || jsonb_build_object('sentiment_score', $2::text)
             WHERE id = (
                 SELECT id FROM messages
-                WHERE ticket_id = $2 AND direction = 'inbound'
+                WHERE ticket_id = $3 AND direction = 'inbound'
                 ORDER BY created_at DESC
                 LIMIT 1
             )
             RETURNING id, ticket_id, sentiment_score
             """,
+            sentiment_score,
             sentiment_score,
             ticket_id,
         )
@@ -774,7 +776,7 @@ async def complete_agent_run(
             """,
             output_message,
             tokens_used,
-            result,
+            json.dumps(result),
             agent_run_id,
         )
         return dict(row) if row else {}
@@ -809,6 +811,8 @@ async def record_metric(
     labels: Dict[str, str] = {},
 ) -> None:
     """Record a metric."""
+    if isinstance(labels, (dict, list)):
+        labels = json.dumps(labels)
     async with pool.acquire() as conn:
         await conn.execute(
             """

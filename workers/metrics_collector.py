@@ -1,9 +1,9 @@
 """Metrics collector worker for TechFlow CRM Digital FTE."""
-
 import asyncio
+import json
 import os
 from datetime import UTC, datetime, timedelta
-from typing import Dict, Any
+from typing import Any, Dict
 
 import asyncpg
 import structlog
@@ -13,6 +13,11 @@ from database import queries as db
 from exceptions import sanitize_error_message
 
 logger = structlog.get_logger(__name__)
+
+
+def _to_naive_utc(dt: datetime) -> datetime:
+    """Strip tzinfo for DB columns that are TIMESTAMP WITHOUT TIME ZONE."""
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
 
 
 class MetricsCollector:
@@ -28,19 +33,15 @@ class MetricsCollector:
         try:
             metrics = {}
 
-            # Ticket metrics
             ticket_metrics = await self._get_ticket_metrics()
             metrics.update(ticket_metrics)
 
-            # Resolution metrics
             resolution_metrics = await self._get_resolution_metrics()
             metrics.update(resolution_metrics)
 
-            # Agent metrics
             agent_metrics = await self._get_agent_metrics()
             metrics.update(agent_metrics)
 
-            # Channel metrics
             channel_metrics = await self._get_channel_metrics()
             metrics.update(channel_metrics)
 
@@ -49,9 +50,7 @@ class MetricsCollector:
                 metric_count=len(metrics),
                 metrics=list(metrics.keys()),
             )
-
             return metrics
-
         except Exception as e:
             logger.error("Error collecting metrics", error=sanitize_error_message(str(e)))
             return {}
@@ -60,30 +59,31 @@ class MetricsCollector:
         """Get ticket-related metrics."""
         try:
             async with self.db_pool.acquire() as conn:
-                # Total tickets
                 total = await conn.fetchval("SELECT COUNT(*) FROM tickets")
 
-                # Tickets by status
                 status_counts = await conn.fetch(
                     "SELECT status, COUNT(*) as count FROM tickets GROUP BY status"
                 )
 
-                # Tickets created in last hour
-                one_hour_ago = datetime.now(UTC) - timedelta(hours=1)
+                one_hour_ago = _to_naive_utc(datetime.now(UTC) - timedelta(hours=1))
                 created_last_hour = await conn.fetchval(
                     "SELECT COUNT(*) FROM tickets WHERE created_at >= $1",
                     one_hour_ago,
                 )
 
-                # Average tickets per hour (based on existing tickets)
+                start_of_today = _to_naive_utc(
+                    datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+                )
                 created_today = await conn.fetchval(
                     "SELECT COUNT(*) FROM tickets WHERE created_at >= $1",
-                    datetime.now(UTC).replace(hour=0, minute=0, second=0),
+                    start_of_today,
                 )
 
                 metrics = {
                     "tickets_total": float(total),
-                    "tickets_open": float(next((c["count"] for c in status_counts if c["status"] == "open"), 0)),
+                    "tickets_open": float(
+                        next((c["count"] for c in status_counts if c["status"] == "open"), 0)
+                    ),
                     "tickets_in_progress": float(
                         next((c["count"] for c in status_counts if c["status"] == "in_progress"), 0)
                     ),
@@ -96,9 +96,7 @@ class MetricsCollector:
                     "tickets_created_last_hour": float(created_last_hour),
                     "tickets_created_today": float(created_today),
                 }
-
                 return metrics
-
         except Exception as e:
             logger.error("Error getting ticket metrics", error=sanitize_error_message(str(e)))
             return {}
@@ -107,7 +105,6 @@ class MetricsCollector:
         """Get resolution-related metrics."""
         try:
             async with self.db_pool.acquire() as conn:
-                # Average resolution time
                 avg_resolution_hours = await conn.fetchval(
                     """
                     SELECT AVG(EXTRACT(EPOCH FROM (resolved_at - created_at))/3600)
@@ -115,17 +112,15 @@ class MetricsCollector:
                     WHERE resolved_at IS NOT NULL
                     """
                 )
-
-                # Median resolution time
                 median_resolution_hours = await conn.fetchval(
                     """
-                    SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (resolved_at - created_at))/3600)
+                    SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (
+                        ORDER BY EXTRACT(EPOCH FROM (resolved_at - created_at))/3600
+                    )
                     FROM tickets
                     WHERE resolved_at IS NOT NULL
                     """
                 )
-
-                # Escalation rate
                 total_tickets = await conn.fetchval("SELECT COUNT(*) FROM tickets")
                 escalated_tickets = await conn.fetchval(
                     "SELECT COUNT(*) FROM tickets WHERE status = 'escalated'"
@@ -141,9 +136,7 @@ class MetricsCollector:
                     else 0,
                     "escalation_rate_percent": float(escalation_rate),
                 }
-
                 return metrics
-
         except Exception as e:
             logger.error("Error getting resolution metrics", error=sanitize_error_message(str(e)))
             return {}
@@ -152,25 +145,16 @@ class MetricsCollector:
         """Get agent performance metrics."""
         try:
             async with self.db_pool.acquire() as conn:
-                # Total agent runs
                 total_runs = await conn.fetchval("SELECT COUNT(*) FROM agent_runs")
-
-                # Successful runs
                 successful_runs = await conn.fetchval(
                     "SELECT COUNT(*) FROM agent_runs WHERE status = 'completed'"
                 )
-
-                # Failed runs
                 failed_runs = await conn.fetchval(
                     "SELECT COUNT(*) FROM agent_runs WHERE status = 'failed'"
                 )
-
-                # Average tokens used
                 avg_tokens = await conn.fetchval(
                     "SELECT AVG(tokens_used) FROM agent_runs WHERE tokens_used > 0"
                 )
-
-                # Average duration
                 avg_duration_ms = await conn.fetchval(
                     "SELECT AVG(duration_ms) FROM agent_runs WHERE duration_ms > 0"
                 )
@@ -187,9 +171,7 @@ class MetricsCollector:
                     "agent_avg_tokens": float(avg_tokens) if avg_tokens else 0,
                     "agent_avg_duration_ms": float(avg_duration_ms) if avg_duration_ms else 0,
                 }
-
                 return metrics
-
         except Exception as e:
             logger.error("Error getting agent metrics", error=sanitize_error_message(str(e)))
             return {}
@@ -198,24 +180,20 @@ class MetricsCollector:
         """Get channel usage metrics."""
         try:
             async with self.db_pool.acquire() as conn:
-                # Tickets by channel
                 channel_counts = await conn.fetch(
                     "SELECT channel, COUNT(*) as count FROM tickets GROUP BY channel"
                 )
-
                 metrics = {
                     f"tickets_via_{channel['channel']}": float(channel["count"])
                     for channel in channel_counts
                 }
-
                 return metrics
-
         except Exception as e:
             logger.error("Error getting channel metrics", error=sanitize_error_message(str(e)))
             return {}
 
     async def report_metrics(self, metrics: Dict[str, Any]) -> None:
-        """Report metrics to Kafka."""
+        """Report metrics to Kafka and persist to DB."""
         try:
             for metric_name, metric_value in metrics.items():
                 await self.kafka_producer.send_message(
@@ -229,19 +207,28 @@ class MetricsCollector:
                     key=metric_name,
                 )
 
-                # Also store in database
-                await db.record_metric(
-                    self.db_pool,
-                    metric_name=metric_name,
-                    metric_value=metric_value,
-                    metric_type="gauge",
-                )
+                safe_value = metric_value
+                if isinstance(safe_value, (dict, list)):
+                    safe_value = json.dumps(safe_value)
+
+                try:
+                    await db.record_metric(
+                        self.db_pool,
+                        metric_name=metric_name,
+                        metric_value=safe_value,
+                        metric_type="gauge",
+                    )
+                except Exception as db_err:
+                    logger.error(
+                        "Error persisting metric to DB",
+                        metric_name=metric_name,
+                        error=sanitize_error_message(str(db_err)),
+                    )
 
             logger.info(
                 "Metrics reported",
                 metric_count=len(metrics),
             )
-
         except Exception as e:
             logger.error("Error reporting metrics", error=sanitize_error_message(str(e)))
 
@@ -253,7 +240,6 @@ async def run_metrics_collector(
 ) -> None:
     """Run metrics collection loop."""
     collector = MetricsCollector(db_pool, kafka_producer)
-
     logger.info(
         "Starting metrics collector",
         collection_interval=collection_interval,
@@ -265,5 +251,4 @@ async def run_metrics_collector(
             await collector.report_metrics(metrics)
         except Exception as e:
             logger.error("Error in metrics collection loop", error=sanitize_error_message(str(e)))
-
         await asyncio.sleep(collection_interval)
