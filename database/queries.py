@@ -1,14 +1,16 @@
 """Async database queries for TechFlow CRM Digital FTE."""
 
+import json
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import json
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
 from uuid import UUID
+
 import asyncpg
 import structlog
-from exceptions import sanitize_error_message
 
+from exceptions import sanitize_error_message
 
 FUZZY_THRESHOLD_DEFAULT = 0.3
 EMBEDDING_DIM = 1536
@@ -386,80 +388,89 @@ async def create_ticket(
     customer_id: Optional[UUID] = None,
 ) -> Dict[str, Any]:
     """Create a new ticket with auto-generated ticket number."""
-    ticket_number = f"TKT-{datetime.now().strftime('%Y%m%d')}-{int(datetime.now().timestamp() * 1000) % 10000:04d}"
+    max_attempts = 3
+    original_customer_id = customer_id
 
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            if not customer_id:
-                customer_row = await conn.fetchrow(
-                    "SELECT id FROM customers WHERE email = $1", customer_email
-                )
-                if customer_row:
-                    customer_id = customer_row["id"]
-                else:
-                    fuzzy_row = await conn.fetchrow(
+        for attempt in range(max_attempts):
+            customer_id = original_customer_id
+            try:
+                async with conn.transaction():
+                    ticket_number = f"TKT-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+
+                    if not customer_id:
+                        customer_row = await conn.fetchrow(
+                            "SELECT id FROM customers WHERE email = $1", customer_email
+                        )
+                        if customer_row:
+                            customer_id = customer_row["id"]
+                        else:
+                            fuzzy_row = await conn.fetchrow(
+                                """
+                                SELECT id, similarity(email, $1) AS sim
+                                FROM customers
+                                WHERE email % $1
+                                ORDER BY sim DESC
+                                LIMIT 1
+                                """,
+                                customer_email,
+                            )
+                            if fuzzy_row and fuzzy_row["sim"] >= FUZZY_THRESHOLD_DEFAULT:
+                                customer_id = fuzzy_row["id"]
+                            else:
+                                customer_row = await conn.fetchrow(
+                                    "INSERT INTO customers (email, name, tier) VALUES ($1, $2, $3) RETURNING id",
+                                    customer_email,
+                                    customer_email.split("@")[0],
+                                    "starter",
+                                )
+                                customer_id = customer_row["id"]
+
+                    # Register the email identifier so customer history resolves
+                    # regardless of which channel created the ticket.
+                    await conn.execute(
                         """
-                        SELECT id, similarity(email, $1) AS sim
-                        FROM customers
-                        WHERE email % $1
-                        ORDER BY sim DESC
-                        LIMIT 1
+                        INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)
+                        VALUES ($1, 'email', $2)
+                        ON CONFLICT (identifier_type, identifier_value) DO NOTHING
                         """,
+                        customer_id,
                         customer_email,
                     )
-                    if fuzzy_row and fuzzy_row["sim"] >= FUZZY_THRESHOLD_DEFAULT:
-                        customer_id = fuzzy_row["id"]
-                    else:
-                        customer_row = await conn.fetchrow(
-                            "INSERT INTO customers (email, name, tier) VALUES ($1, $2, $3) RETURNING id",
-                            customer_email,
-                            customer_email.split("@")[0],
-                            "starter",
+
+                    # Create ticket
+                    ticket_row = await conn.fetchrow(
+                        """
+                        INSERT INTO tickets (ticket_number, customer_id, subject, category, priority, channel)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        RETURNING id, ticket_number, customer_id, status, created_at
+                        """,
+                        ticket_number,
+                        customer_id,
+                        subject,
+                        category,
+                        priority,
+                        channel,
+                    )
+
+                    # Add initial message if provided
+                    if initial_message:
+                        await conn.execute(
+                            """
+                            INSERT INTO messages (ticket_id, customer_id, direction, content, channel)
+                            VALUES ($1, $2, $3, $4, $5)
+                            """,
+                            ticket_row["id"],
+                            customer_id,
+                            "inbound",
+                            initial_message,
+                            channel,
                         )
-                        customer_id = customer_row["id"]
 
-            # Register the email identifier so customer history resolves
-            # regardless of which channel created the ticket.
-            await conn.execute(
-                """
-                INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)
-                VALUES ($1, 'email', $2)
-                ON CONFLICT (identifier_type, identifier_value) DO NOTHING
-                """,
-                customer_id,
-                customer_email,
-            )
-
-            # Create ticket
-            ticket_row = await conn.fetchrow(
-                """
-                INSERT INTO tickets (ticket_number, customer_id, subject, category, priority, channel)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, ticket_number, customer_id, status, created_at
-                """,
-                ticket_number,
-                customer_id,
-                subject,
-                category,
-                priority,
-                channel,
-            )
-
-            # Add initial message if provided
-            if initial_message:
-                await conn.execute(
-                    """
-                    INSERT INTO messages (ticket_id, customer_id, direction, content, channel)
-                    VALUES ($1, $2, $3, $4, $5)
-                    """,
-                    ticket_row["id"],
-                    customer_id,
-                    "inbound",
-                    initial_message,
-                    channel,
-                )
-
-            return dict(ticket_row)
+                return dict(ticket_row)
+            except asyncpg.UniqueViolationError:
+                if attempt == max_attempts - 1:
+                    raise
 
 
 async def get_ticket(pool: asyncpg.Pool, ticket_id: UUID) -> Optional[Dict[str, Any]]:
