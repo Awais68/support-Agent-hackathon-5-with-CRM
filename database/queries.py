@@ -717,7 +717,7 @@ async def update_message_sentiment(
             RETURNING id, ticket_id, sentiment_score
             """,
             sentiment_score,
-            sentiment_score,
+            str(sentiment_score),
             ticket_id,
         )
         return dict(row) if row else None
