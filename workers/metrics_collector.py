@@ -1,7 +1,6 @@
 """Metrics collector worker for TechFlow CRM Digital FTE."""
 import asyncio
 import json
-import os
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict
 
@@ -196,16 +195,25 @@ class MetricsCollector:
         """Report metrics to Kafka and persist to DB."""
         try:
             for metric_name, metric_value in metrics.items():
-                await self.kafka_producer.send_message(
-                    "metrics.events",
-                    {
-                        "metric_name": metric_name,
-                        "metric_value": metric_value,
-                        "timestamp": datetime.now(UTC).isoformat(),
-                        "metric_type": "gauge",
-                    },
-                    key=metric_name,
-                )
+                # A Kafka failure for one metric must not abort the whole batch
+                # (and must not skip DB persistence for the remaining metrics).
+                try:
+                    await self.kafka_producer.send_message(
+                        "metrics.events",
+                        {
+                            "metric_name": metric_name,
+                            "metric_value": metric_value,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "metric_type": "gauge",
+                        },
+                        key=metric_name,
+                    )
+                except Exception as kafka_err:
+                    logger.error(
+                        "Error publishing metric to Kafka",
+                        metric_name=metric_name,
+                        error=sanitize_error_message(str(kafka_err)),
+                    )
 
                 safe_value = metric_value
                 if isinstance(safe_value, (dict, list)):

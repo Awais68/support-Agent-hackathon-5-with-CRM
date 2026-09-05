@@ -1,8 +1,8 @@
 """Agent tools for TechFlow CRM Digital FTE using OpenAI SDK with real DB/Kafka integration."""
 
 import json
-import os
 from dataclasses import dataclass
+from typing import List, Optional
 from uuid import UUID
 from datetime import UTC, datetime
 
@@ -13,6 +13,11 @@ from exceptions import sanitize_error_message
 from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
 from database import queries as db
+from embeddings_provider import (
+    EMBEDDING_CIRCUIT_BREAKER,
+    EmbeddingProvider,
+    resolve_embedding_provider,
+)
 from kafka_client import (
     KafkaProducerClient,
     create_escalation_message,
@@ -29,6 +34,9 @@ class ToolContext:
     db_pool: asyncpg.Pool
     kafka_producer: KafkaProducerClient
     openai_client: AsyncOpenAI
+    # Embeddings run on their own provider (see embeddings_provider). Left
+    # unset, embeddings fall back to openai_client.
+    embedding_provider: Optional[EmbeddingProvider] = None
 
 
 # OpenAI tool schemas (proper format for chat.completions.create)
@@ -212,32 +220,69 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             category=category,
         )
 
-        embedding_model = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
-        _cb = get_circuit_breaker("openai")
-        try:
-            async with _cb:
-                embedding_resp = await context.openai_client.embeddings.create(
-                    input=query,
-                    model=embedding_model,
-                )
-            embedding = embedding_resp.data[0].embedding
-        except CircuitBreakerError:
-            logger.error("Knowledge base search failed (OpenAI circuit open)", query=query)
-            return {
-                "found": False,
-                "results": [],
-                "message": "Unable to search knowledge base. Please escalate to human support.",
-                "error": "AI service temporarily unavailable",
-            }
-
-        # Search database using pgvector
-        results = await db.search_knowledge_base(
-            context.db_pool,
-            embedding=embedding,
-            customer_tier=customer_tier,
-            category=category,
-            max_results=max_results,
+        provider = resolve_embedding_provider(
+            context.embedding_provider, context.openai_client
         )
+        embedding: Optional[List[float]] = None
+        degraded_reason = None
+
+        if provider is None:
+            degraded_reason = "No embedding provider configured"
+            logger.warning("No embedding provider, using lexical KB search", query=query)
+        else:
+            _cb = get_circuit_breaker(EMBEDDING_CIRCUIT_BREAKER)
+            try:
+                async with _cb:
+                    embedding = await provider.embed(query)
+            except CircuitBreakerError:
+                degraded_reason = "AI service temporarily unavailable"
+                logger.warning("Embedding circuit open, using lexical KB search", query=query)
+            except Exception as e:
+                # An embedding outage (provider down, out of credits, bad model
+                # name) must not cost the agent its knowledge base — degrade to
+                # lexical search instead of escalating to a human.
+                degraded_reason = "AI service temporarily unavailable"
+                logger.warning(
+                    "Embedding failed, using lexical KB search",
+                    query=query,
+                    error=sanitize_error_message(str(e)),
+                )
+
+        if embedding is None:
+            results = await db.search_knowledge_base_text(
+                context.db_pool,
+                query=query,
+                customer_tier=customer_tier,
+                category=category,
+                max_results=max_results,
+            )
+            search_mode = "text"
+        else:
+            results = await db.search_knowledge_base(
+                context.db_pool,
+                embedding=embedding,
+                customer_tier=customer_tier,
+                category=category,
+                max_results=max_results,
+                embedding_model=provider.model,
+            )
+            search_mode = "semantic"
+            if not results:
+                # The vectors on disk came from a different model, so none are
+                # comparable. Fall back to lexical, and flag the answer as
+                # degraded even when lexical is empty too: "nothing indexed for
+                # this model" must not be reported as "no such article".
+                results = await db.search_knowledge_base_text(
+                    context.db_pool,
+                    query=query,
+                    customer_tier=customer_tier,
+                    category=category,
+                    max_results=max_results,
+                )
+                search_mode = "text"
+                degraded_reason = (
+                    "Knowledge base not indexed for the active embedding model"
+                )
 
         found = len(results) > 0
         logger.info(
@@ -245,15 +290,21 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             query=query,
             found=found,
             result_count=len(results),
+            search_mode=search_mode,
         )
 
-        return {
+        response = {
             "found": found,
             "results": [dict(r) for r in results] if results else [],
+            "search_mode": search_mode,
             "message": f"Found {len(results)} relevant articles about '{query}' for {customer_tier} tier."
             if found
             else f"No articles found for '{query}'. Please escalate to human support.",
         }
+        if degraded_reason:
+            response["degraded"] = True
+            response["error"] = degraded_reason
+        return response
 
     except (asyncpg.PostgresError, ConnectionError) as e:
         logger.error("Knowledge base search failed (DB)", error=sanitize_error_message(str(e)), query=args.get("query"))
@@ -440,6 +491,14 @@ async def escalate_to_human(args: dict, context: ToolContext) -> dict:
             UUID(ticket_id),
             "escalated",
         )
+        if not ticket:
+            logger.warning("Escalation target ticket not found", ticket_id=ticket_id)
+            return {
+                "escalated": False,
+                "escalation_id": None,
+                "message": f"Ticket {ticket_id} not found.",
+                "error": "Ticket not found",
+            }
 
         # Send escalation event to Kafka
         escalation_message = create_escalation_message(
@@ -466,6 +525,7 @@ async def escalate_to_human(args: dict, context: ToolContext) -> dict:
 
         return {
             "escalated": True,
+            "ticket_number": ticket["ticket_number"],
             "escalation_id": escalation_id,
             "message": f"Ticket {ticket_id} has been escalated to our {priority} priority queue. "
             f"A human agent will review and respond shortly.",
@@ -611,9 +671,11 @@ async def execute_tool(name: str, args: dict, context: ToolContext) -> str:
             result = await fn(args, context)
         else:
             result = {"error": f"Unknown tool: {name}"}
+        # Serialize inside the try: tool results carry UUID/datetime/Decimal
+        # values that json.dumps cannot encode natively.
+        return json.dumps(result, default=str)
     except Exception as e:
-        result = {"error": sanitize_error_message(str(e))}
-    return json.dumps(result)
+        return json.dumps({"error": sanitize_error_message(str(e))})
 
 
 # Legacy alias for backward compatibility

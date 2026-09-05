@@ -12,8 +12,10 @@ CREATE TABLE IF NOT EXISTS customer_identifiers (
     UNIQUE (identifier_type, identifier_value)
 );
 
-CREATE INDEX idx_customer_identifiers_lookup ON customer_identifiers(identifier_type, identifier_value);
-CREATE INDEX idx_customer_identifiers_customer ON customer_identifiers(customer_id);
+-- schema.sql creates these too, so a fresh database has them before migrations
+-- run; without IF NOT EXISTS this migration aborts every first-time seed.
+CREATE INDEX IF NOT EXISTS idx_customer_identifiers_lookup ON customer_identifiers(identifier_type, identifier_value);
+CREATE INDEX IF NOT EXISTS idx_customer_identifiers_customer ON customer_identifiers(customer_id);
 
 -- Migrate existing customer emails into customer_identifiers
 INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)

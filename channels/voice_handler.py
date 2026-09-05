@@ -46,7 +46,19 @@ STT_FALLBACK_MODEL = os.getenv("STT_FALLBACK_MODEL", "whisper-1")
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
 TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
 GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
-CONFIDENCE_THRESHOLD = float(os.getenv("STT_CONFIDENCE_THRESHOLD", "0.5"))
+DEFAULT_CONFIDENCE_THRESHOLD = 0.5
+
+
+def _confidence_threshold() -> float:
+    """Read the STT confidence threshold at call time.
+
+    Reading it at import time would freeze whatever value existed before
+    ``load_dotenv()`` ran in the process entrypoint.
+    """
+    try:
+        return float(os.getenv("STT_CONFIDENCE_THRESHOLD", str(DEFAULT_CONFIDENCE_THRESHOLD)))
+    except ValueError:
+        return DEFAULT_CONFIDENCE_THRESHOLD
 
 _VOICE_SUBJECT_RE = re.compile(r"^[+\d\s\-().ext]+$")
 
@@ -77,6 +89,7 @@ class VoiceResult:
     needs_clarification: bool = False
     translated_to_english: str | None = None
     agent_response: str = ""
+    agent_response_english: str = ""
     response_language: str = ""
     audio_base64: str | None = None
     audio_format: str = "mp3"
@@ -132,7 +145,7 @@ class VoiceHandler:
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         self.stt_provider = os.getenv("STT_PROVIDER", "auto").lower()
         self.tts_provider = os.getenv("TTS_PROVIDER", "auto").lower()
-        self.confidence_threshold = CONFIDENCE_THRESHOLD
+        self.confidence_threshold = _confidence_threshold()
 
     # ------------------------------------------------------------------
     # Speech-to-text
@@ -546,10 +559,14 @@ class VoiceHandler:
         result.ticket_number = agent_result.get("ticket_number")
         result.response_language = detected_lang
 
-        # Translate the reply back into the customer's language
+        # Translate the reply back into the customer's language. agent_response
+        # must match response_language and the synthesized audio; the English
+        # original is kept separately for logs/analytics.
+        result.agent_response_english = result.agent_response
         spoken = result.agent_response
         if was_translated and detected_lang and detected_lang != "en":
             spoken = await self.translate_to_language(spoken, detected_lang)
+            result.agent_response = spoken
 
         audio_b64, fmt = await self.synthesize(spoken, detected_lang)
         result.audio_base64 = audio_b64

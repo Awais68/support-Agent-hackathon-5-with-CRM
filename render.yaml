@@ -1,0 +1,116 @@
+# Render Blueprint — TechFlow CRM Digital FTE
+#
+# Deploys:
+#   - techflow-db       Render PostgreSQL (free, pgvector supported)
+#   - techflow-api      FastAPI (Docker, free tier)
+#   - techflow-worker   Background worker (metrics collector; Kafka optional)
+#   - techflow-webform  Next.js support form (Docker, free tier)
+#
+# With ENABLE_KAFKA=false (default here) everything runs WITHOUT a Kafka broker:
+# the API answers requests, the webform runs the AI agent synchronously and
+# stores the reply, and the worker collects dashboard metrics into Postgres.
+#
+# To enable the full Kafka pipeline, set ENABLE_KAFKA=true on api + worker and
+# point KAFKA_BOOTSTRAP_SERVERS/KAFKA_SASL_* at a free managed Kafka
+# (e.g. Aiven Free — up to 5 topics — or Confluent trial).
+
+databases:
+  - name: techflow-db
+    plan: free
+    databaseName: techflow
+    user: techflow
+    ipAllowList: []
+
+services:
+  - type: web
+    name: techflow-api
+    runtime: docker
+    plan: free
+    rootDir: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    preDeployCommand: bash scripts/render_migrate.sh
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: RUN_MODE
+        value: api
+      - key: ENABLE_KAFKA
+        value: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: techflow-db
+          property: connectionString
+      - key: DATABASE_SSL
+        value: require
+      - key: DATABASE_POOL_MIN
+        value: "1"
+      - key: DATABASE_POOL_MAX
+        value: "5"
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: OPENAI_MODEL
+        value: openai/gpt-4o
+      - key: EMBEDDING_MODEL
+        value: openai/text-embedding-3-small
+      - key: API_KEY
+        generateValue: true
+      - key: REDIS_URL
+        value: ""
+      - key: ENABLE_GMAIL_POLLING
+        value: "false"
+      - key: ENABLE_WHATSAPP_WEBHOOK
+        value: "false"
+      - key: ENABLE_WEB_FORM
+        value: "true"
+      - key: ENABLE_VOICE
+        value: "false"
+
+  - type: worker
+    name: techflow-worker
+    runtime: docker
+    plan: free
+    rootDir: .
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python main.py
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: RUN_MODE
+        value: worker
+      - key: ENABLE_KAFKA
+        value: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: techflow-db
+          property: connectionString
+      - key: DATABASE_SSL
+        value: require
+      - key: DATABASE_POOL_MIN
+        value: "1"
+      - key: DATABASE_POOL_MAX
+        value: "5"
+      - key: OPENROUTER_API_KEY
+        sync: false
+
+  - type: web
+    name: techflow-webform
+    runtime: docker
+    plan: free
+    rootDir: web-form
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        fromService:
+          type: web
+          name: techflow-api
+          property: url
+      - key: NEXT_PUBLIC_COMPANY_NAME
+        value: TechFlow Analytics
+      - key: NEXT_PUBLIC_SUPPORT_EMAIL
+        value: support@techflow-analytics.com

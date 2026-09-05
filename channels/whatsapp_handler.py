@@ -1,13 +1,11 @@
 """WhatsApp channel handler for TechFlow CRM Digital FTE using Twilio."""
 
 import os
-import base64
-import hmac
-import hashlib
 from typing import Optional, Dict, Any
 
 import asyncio
 import structlog
+from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 from exceptions import sanitize_error_message
 
@@ -35,37 +33,42 @@ class WhatsAppHandler:
         else:
             self.client = Client(self.account_sid, self.auth_token)
 
-    def validate_webhook(self, request_body: str, signature: str) -> bool:
-        """Validate Twilio webhook signature."""
+    @property
+    def signature_validation_enabled(self) -> bool:
+        """Signature checking is only possible when an auth token is configured."""
+        return bool(self.auth_token)
+
+    def _webhook_url(self) -> str:
+        """Absolute URL Twilio signed, as configured for this deployment."""
+        url = self.webhook_url
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+        return f"https://{url}"
+
+    def validate_webhook(
+        self,
+        signature: str,
+        params: Optional[Dict[str, Any]] = None,
+        url: Optional[str] = None,
+    ) -> bool:
+        """Validate a Twilio webhook signature.
+
+        Uses Twilio's official RequestValidator: for form-encoded POSTs the
+        signature is computed over the URL plus the sorted form parameters, not
+        over the raw request body.
+        """
+        if not self.signature_validation_enabled:
+            logger.warning("Cannot validate Twilio signature: TWILIO_AUTH_TOKEN not configured")
+            return False
+        if not signature:
+            return False
+
         try:
-            # Reconstruct the Twilio request URL
-            url = self.webhook_url
-            if self.webhook_url.startswith("http://"):
-                url = self.webhook_url
-            else:
-                # In production, use HTTPS
-                url = f"https://{self.webhook_url}"
-
-            # Compute the hash
-            expected_hash = hmac.new(
-                self.auth_token.encode(),
-                (url + request_body).encode(),
-                hashlib.sha1,
-            ).digest()
-
-            expected_signature = f"twilio {base64.b64encode(expected_hash).decode()}"
-
-            # Normalize and compare
-            is_valid = hmac.compare_digest(
-                expected_signature.lower(),
-                signature.lower(),
-            )
-
+            validator = RequestValidator(self.auth_token)
+            is_valid = validator.validate(url or self._webhook_url(), params or {}, signature)
             if not is_valid:
                 logger.warning("Invalid Twilio webhook signature", signature=signature[:20])
-
             return is_valid
-
         except Exception as e:
             logger.error("Webhook validation error", error=sanitize_error_message(str(e)))
             return False
@@ -117,10 +120,8 @@ class WhatsAppHandler:
     ) -> None:
         """Handle incoming WhatsApp message."""
         try:
-            # For the CRM, we use phone number as primary identifier
-            # In production, map to customer email via a lookup table
-            customer_identifier = from_number
-
+            # Phone number is the primary identifier on this channel; the
+            # consumer resolves it to a customer via customer_identifiers.
             # Send to Kafka
             kafka_message = create_inbound_whatsapp_message(
                 customer_phone=from_number,

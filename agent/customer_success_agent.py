@@ -3,7 +3,7 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 from uuid import UUID
 from datetime import UTC, datetime
 
@@ -19,6 +19,7 @@ from agent.pre_processing_gate import run_gate, GateAction
 from agent.sentiment_analyzer import detect_sentiment_drop
 from kafka_client import KafkaProducerClient
 from database import queries as db
+from embeddings_provider import EmbeddingProvider, build_embedding_provider
 from metrics import (
     sentiment_score as metric_sentiment_score,
     sentiment_emotion,
@@ -39,6 +40,9 @@ class AgentContext:
     db_pool: asyncpg.Pool
     kafka_producer: KafkaProducerClient
     openai_client: AsyncOpenAI
+    # Embeddings run on their own provider (see embeddings_provider). Left
+    # unset, embeddings fall back to openai_client.
+    embedding_provider: Optional[EmbeddingProvider] = None
     logger: Any = None
 
     def __post_init__(self):
@@ -70,8 +74,8 @@ class CustomerSuccessAgent:
                     temperature=0.3,
                 )
 
-            classification = response.choices[0].message.content.strip()
-            return classification
+            content = response.choices[0].message.content
+            return content.strip() if content else "General Inquiry"
 
         except (OpenAIAPIError, APITimeoutError, APIConnectionError, CircuitBreakerError) as e:
             self.context.logger.error("Classification failed (OpenAI)", error=sanitize_error_message(str(e)))
@@ -88,8 +92,14 @@ class CustomerSuccessAgent:
         customer_name: str,
         message: str,
         channel: str = "email",
+        ticket_number: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Process a customer message with agent orchestration."""
+        """Process a customer message with agent orchestration.
+
+        ``ticket_number`` is the customer-facing TKT-... string. Callers that
+        already have it should pass it in; otherwise it is looked up.
+        """
+        agent_run_id = None
 
         try:
             # Step 1: Classify message
@@ -102,6 +112,19 @@ class CustomerSuccessAgent:
 
             # Step 2: Get system prompt for channel
             system_prompt = SYSTEM_PROMPT + "\n\n" + CHANNEL_ADDENDUMS.get(channel, "")
+
+            # The channel handler already created the ticket the customer is
+            # tracking. Without telling the model that, it satisfies the
+            # "ensure a ticket exists" rule by calling create_ticket, then
+            # sends the reply to that duplicate — so the tracking page for the
+            # customer's own ticket_number stayed empty.
+            system_prompt += (
+                "\n\n## Current ticket\n"
+                f"A ticket for this message already exists: ticket_id={ticket_id}"
+                + (f", ticket_number={ticket_number}" if ticket_number else "")
+                + ".\nDo NOT call create_ticket. Pass this exact ticket_id to "
+                "send_response and escalate_to_human."
+            )
 
             # Step 3: Create agent processing event
             await self.context.kafka_producer.send_message(
@@ -224,7 +247,11 @@ class CustomerSuccessAgent:
                             f"Emotion: {gate_result.emotion}\n"
                             f"Urgency: {gate_result.urgency_score:.2f}\n"
                             f"Aspects: {aspects_str}\n"
-                            f"Sentiment drop: {sentiment_drop_amount:.2f}" if sentiment_drop_detected else ""
+                            + (
+                                f"Sentiment drop: {sentiment_drop_amount:.2f}"
+                                if sentiment_drop_detected
+                                else "Sentiment drop: none"
+                            )
                         ),
                         "source": "pre_processing_gate",
                         "timestamp": datetime.now(UTC).isoformat(),
@@ -263,6 +290,7 @@ class CustomerSuccessAgent:
                     db_pool=self.context.db_pool,
                     kafka_producer=self.context.kafka_producer,
                     openai_client=self.context.openai_client,
+                    embedding_provider=self.context.embedding_provider,
                 )
 
                 messages = [
@@ -347,19 +375,32 @@ class CustomerSuccessAgent:
                     )
 
             # Step 7: Format response for channel
+            # Customers see TKT-YYYYMMDD-XXXXXX, not the internal UUID.
+            if not ticket_number:
+                try:
+                    ticket_row = await db.get_ticket(self.context.db_pool, ticket_id)
+                    ticket_number = (ticket_row or {}).get("ticket_number")
+                except Exception as e:
+                    self.context.logger.warning(
+                        "Could not resolve ticket_number for response formatting",
+                        ticket_id=str(ticket_id),
+                        error=sanitize_error_message(str(e)),
+                    )
+            ticket_number = ticket_number or str(ticket_id)
+
             if channel == "email":
                 formatted_response = format_email_response(
                     output_message,
                     customer_name=customer_name,
-                    ticket_number=str(ticket_id),
+                    ticket_number=ticket_number,
                 )
             elif channel == "whatsapp":
                 formatted_response = format_whatsapp_response(output_message)
             elif channel == "webform":
                 formatted_response = format_web_form_response(
                     output_message,
-                    ticket_number=str(ticket_id),
-                    tracking_url=f"https://support.techflow.com/track/{ticket_id}",
+                    ticket_number=ticket_number,
+                    tracking_url=f"https://support.techflow.com/track/{ticket_number}",
                 )
             else:
                 formatted_response = output_message
@@ -455,12 +496,13 @@ class CustomerSuccessAgent:
 
             # Try to mark agent run as failed
             try:
-                await db.complete_agent_run(
-                    self.context.db_pool,
-                    agent_run_id=agent_run_id if "agent_run_id" in locals() else None,
-                    output_message=f"Error processing message: {str(e)}",
-                    result={"status": "failed", "error": str(e)},
-                )
+                if agent_run_id:
+                    await db.complete_agent_run(
+                        self.context.db_pool,
+                        agent_run_id=agent_run_id,
+                        output_message=f"Error processing message: {str(e)}",
+                        result={"status": "failed", "error": str(e)},
+                    )
             except Exception:
                 pass
 
@@ -510,6 +552,7 @@ async def example_usage():
         db_pool=pool,
         kafka_producer=kafka_producer,
         openai_client=client,
+        embedding_provider=build_embedding_provider(client),
     )
 
     # Create agent

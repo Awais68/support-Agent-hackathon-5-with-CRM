@@ -11,6 +11,7 @@ Applies migrations in filename order, tracked in schema_migrations table.
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -18,8 +19,13 @@ from pathlib import Path
 import asyncpg
 import structlog
 from exceptions import sanitize_error_message
+from embeddings_provider import build_embedding_provider
+from env_config import load_environment
 
 logger = structlog.get_logger(__name__)
+
+# Knowledge bases are small, but chunk anyway so one request stays bounded.
+EMBED_BATCH_SIZE = 50
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 SCHEMA_FILE = Path(__file__).resolve().parent / "schema.sql"
@@ -232,11 +238,68 @@ async def seed_baseline_data(pool: asyncpg.Pool) -> dict[str, int]:
                 ('Exporting Data',
                  'Export data to CSV, Parquet, or directly to cloud storage via SFTP/S3 integration.',
                  'product', ARRAY['export', 'integration'], 'internal-wiki', 'all')
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (title) DO NOTHING
         """)
         counts["knowledge_base"] = parse_insert_count(kb_result)
 
     return counts
+
+
+async def backfill_knowledge_base_embeddings(pool: asyncpg.Pool) -> int:
+    """Embed knowledge base rows that have no vector yet.
+
+    The articles above are inserted as plain SQL with no embedding column, so
+    ``knowledge_base.embedding`` was NULL for every seeded row. Semantic search
+    orders by ``embedding <=> $1``, which is NULL for those rows — the ranking
+    was meaningless until this backfill ran. Returns the number of rows embedded.
+    """
+    provider = build_embedding_provider(None)
+    if provider is None:
+        logger.warning(
+            "No embedding provider configured — knowledge base left unembedded, "
+            "semantic search will degrade to lexical"
+        )
+        return 0
+
+    async with pool.acquire() as conn:
+        # Re-embed rows whose vector came from a different model too: those
+        # vectors are unusable against queries from the current provider, and
+        # leaving them tagged with the old model would silently shrink the
+        # searchable knowledge base to nothing.
+        rows = await conn.fetch(
+            """
+            SELECT id, title, content
+            FROM knowledge_base
+            WHERE embedding IS NULL
+               OR embedding_model IS DISTINCT FROM $1
+            """,
+            provider.model,
+        )
+        if not rows:
+            return 0
+
+        embedded = 0
+        # Chunked so a large knowledge base does not go out in one request.
+        for start in range(0, len(rows), EMBED_BATCH_SIZE):
+            chunk = rows[start : start + EMBED_BATCH_SIZE]
+            vectors = await provider.embed_many(
+                [f"{r['title']}\n\n{r['content']}" for r in chunk]
+            )
+            # Cast explicitly rather than relying on the pgvector codec, which is
+            # registered on a single pooled connection and may not be this one.
+            # Store the model alongside the vector: a later provider switch must
+            # be able to tell that these rows are no longer comparable.
+            await conn.executemany(
+                "UPDATE knowledge_base SET embedding = $2::vector, "
+                "embedding_model = $3 WHERE id = $1",
+                [
+                    (r["id"], json.dumps(v), provider.model)
+                    for r, v in zip(chunk, vectors)
+                ],
+            )
+            embedded += len(chunk)
+
+    return embedded
 
 
 def parse_insert_count(result: str) -> int:
@@ -277,6 +340,17 @@ async def seed(pool: asyncpg.Pool) -> dict[str, any]:
     counts = await seed_baseline_data(pool)
     results["data_counts"] = counts
 
+    # 6. Embed any knowledge base articles that still have no vector. A provider
+    # outage must not fail the seed — the KB stays searchable lexically.
+    try:
+        results["kb_embedded"] = await backfill_knowledge_base_embeddings(pool)
+    except Exception as e:
+        results["kb_embedded"] = 0
+        logger.warning(
+            "Knowledge base embedding backfill failed",
+            error=sanitize_error_message(str(e)),
+        )
+
     return results
 
 
@@ -286,6 +360,8 @@ async def main() -> None:
     parser.add_argument("--migrations-only", action="store_true",
                         help="Only run pending migrations, skip data seeding")
     args = parser.parse_args()
+
+    load_environment()
 
     db_url = os.getenv(
         "DATABASE_URL",
@@ -323,6 +399,9 @@ async def main() -> None:
                             counts=counts)
         else:
             logger.info("Migrations-only mode, skipping data seed")
+
+        if results.get("kb_embedded"):
+            logger.info("Knowledge base embedded", articles=results["kb_embedded"])
 
         logger.info("Seed complete", results_summary={
             k: v for k, v in results.items() if k != "data_counts"

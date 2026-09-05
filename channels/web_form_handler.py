@@ -1,7 +1,7 @@
 """Web form channel handler for TechFlow CRM Digital FTE."""
 
 from typing import Optional, Dict, Any
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from exceptions import sanitize_error_message
 import structlog
@@ -23,39 +23,47 @@ class WebFormSubmission(BaseModel):
     company: Optional[str] = None
     phone: Optional[str] = None
 
-    @validator("name")
-    def validate_name(cls, v):
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
         if not v or len(v) < 2:
             raise ValueError("Name must be at least 2 characters")
         return v.strip()
 
-    @validator("subject")
-    def validate_subject(cls, v):
+    @field_validator("subject")
+    @classmethod
+    def validate_subject(cls, v: str) -> str:
         if not v or len(v) < 5:
             raise ValueError("Subject must be at least 5 characters")
         return v.strip()
 
-    @validator("message")
-    def validate_message(cls, v):
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, v: str) -> str:
         if not v or len(v) < 10:
             raise ValueError("Message must be at least 10 characters")
         if len(v) > 1000:
             raise ValueError("Message cannot exceed 1000 characters")
         return v.strip()
 
-    @validator("category")
-    def validate_category(cls, v):
+    @field_validator("category")
+    @classmethod
+    def validate_category(cls, v: str) -> str:
         valid_categories = ["general", "technical", "billing", "onboarding", "bug", "feedback"]
         if v not in valid_categories:
             raise ValueError(f"Category must be one of {valid_categories}")
         return v
 
-    @validator("priority")
-    def validate_priority(cls, v):
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, v: str) -> str:
         valid_priorities = ["low", "medium", "high", "urgent", "critical"]
         if v not in valid_priorities:
             raise ValueError(f"Priority must be one of {valid_priorities}")
-        return v
+        # The form labels its top priority "Urgent", but tickets_priority_check
+        # only allows low/medium/high/critical — an Urgent submission used to
+        # fail with a 500 at insert time.
+        return "critical" if v == "urgent" else v
 
 
 class WebFormHandler:
@@ -74,7 +82,7 @@ class WebFormHandler:
             return False, None, sanitize_error_message(str(e))
 
     async def process_submission(
-        self, submission: WebFormSubmission
+        self, submission: WebFormSubmission, ticket_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Process a web form submission."""
         try:
@@ -94,6 +102,7 @@ class WebFormHandler:
                 category=submission.category,
                 priority=submission.priority,
                 customer_phone=submission.phone,
+                ticket_id=ticket_id,
             )
 
             # Send to Kafka

@@ -132,7 +132,7 @@ async def send_webform(session: aiohttp.ClientSession, base_url: str, scenario: 
                 latency_ms=latency,
                 success=200 <= resp.status < 500,
             )
-    except Exception as e:
+    except Exception:
         latency = (time.monotonic() - start) * 1000
         return TestResult(channel="webform", status_code=0, latency_ms=latency, success=False)
 
@@ -158,7 +158,7 @@ async def send_gmail(session: aiohttp.ClientSession, base_url: str, scenario: di
                 latency_ms=latency,
                 success=200 <= resp.status < 500,
             )
-    except Exception as e:
+    except Exception:
         latency = (time.monotonic() - start) * 1000
         return TestResult(channel="gmail", status_code=0, latency_ms=latency, success=False)
 
@@ -179,7 +179,7 @@ async def send_whatsapp(session: aiohttp.ClientSession, base_url: str, body: str
                 latency_ms=latency,
                 success=200 <= resp.status < 500,
             )
-    except Exception as e:
+    except Exception:
         latency = (time.monotonic() - start) * 1000
         return TestResult(channel="whatsapp", status_code=0, latency_ms=latency, success=False)
 

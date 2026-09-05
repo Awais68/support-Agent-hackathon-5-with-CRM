@@ -10,7 +10,6 @@ Must run BEFORE any agent processing. Checks:
 
 import re
 from typing import Optional, Dict
-from uuid import UUID
 from enum import Enum
 
 import structlog

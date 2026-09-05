@@ -4,8 +4,9 @@ import json
 import os
 from datetime import UTC, datetime
 from typing import Any, Callable, Dict, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 import asyncio
+import inspect
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 import structlog
@@ -65,15 +66,17 @@ class KafkaMessage:
         self,
         topic: str,
         payload: Dict[str, Any],
-        message_id: str = None,
+        message_id: Optional[str] = None,
         timestamp: Optional[datetime] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
     ):
         self.topic = topic
         self.payload = payload
-        self.message_id = message_id or str(UUID(int=int(datetime.now().timestamp() * 1000000)))
+        # uuid4, not a timestamp-derived UUID: two messages produced within the
+        # same microsecond would otherwise share an id.
+        self.message_id = message_id or str(uuid4())
         self.timestamp = timestamp or datetime.now(UTC)
-        self.headers = headers
+        self.headers = headers if headers is not None else {}
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -210,6 +213,27 @@ class KafkaProducerClient:
             raise
 
 
+class NoOpKafkaProducer:
+    """No-op Kafka producer for deployments without a broker.
+
+    Mirrors ``KafkaProducerClient``'s async interface so callers (agent,
+    handlers) don't need to branch on whether Kafka is available. Used when
+    ``ENABLE_KAFKA=false`` or when the broker is unreachable at startup.
+    """
+
+    async def start(self) -> None:
+        """No-op start."""
+
+    async def stop(self) -> None:
+        """No-op stop."""
+
+    async def send_message(
+        self, topic: str, payload: dict[str, Any], key: str | None = None
+    ) -> str:
+        """Return a fake message id without sending anything."""
+        return "noop-" + str(UUID(int=int(datetime.now().timestamp() * 1000000)))
+
+
 class KafkaConsumerClient:
     """Async Kafka consumer with error handling."""
 
@@ -266,6 +290,7 @@ class KafkaConsumerClient:
 
         try:
             async for raw_message in self.consumer:
+                message = None
                 try:
                     message = KafkaMessage.from_json(raw_message.value)
                     logger.info(
@@ -276,7 +301,7 @@ class KafkaConsumerClient:
 
                     # Call handler
                     result = on_message(message)
-                    if isinstance(result, (asyncio.coroutine, asyncio.Task)):
+                    if inspect.iscoroutine(result) or isinstance(result, asyncio.Task):
                         await result
 
                 except json.JSONDecodeError as e:
@@ -289,7 +314,7 @@ class KafkaConsumerClient:
                     logger.error(
                         "Handler error",
                         error=sanitize_error_message(str(e)),
-                        message_topic=getattr(message, "topic", "unknown"),
+                        message_topic=getattr(message, "topic", None) or "unknown",
                     )
 
         except asyncio.CancelledError:
@@ -304,7 +329,7 @@ def create_inbound_email_message(
     sender_name: str,
     subject: str,
     body: str,
-    message_id: str = None,
+    message_id: Optional[str] = None,
 ) -> KafkaMessage:
     """Create an inbound email message."""
     return KafkaMessage(
@@ -326,7 +351,7 @@ def create_inbound_whatsapp_message(
     customer_name: str,
     message_body: str,
     media_url: Optional[str] = None,
-    message_id: str = None,
+    message_id: Optional[str] = None,
 ) -> KafkaMessage:
     """Create an inbound WhatsApp message."""
     return KafkaMessage(
@@ -351,9 +376,14 @@ def create_inbound_webform_message(
     category: str = "general",
     priority: str = "medium",
     customer_phone: Optional[str] = None,
-    message_id: str = None,
+    message_id: Optional[str] = None,
+    ticket_id: Optional[str] = None,
 ) -> KafkaMessage:
-    """Create an inbound web form message."""
+    """Create an inbound web form message.
+
+    ``ticket_id`` carries a ticket the API already created so the consumer
+    reuses it instead of creating a duplicate.
+    """
     payload = {
         "customer_email": customer_email,
         "customer_name": customer_name,
@@ -365,6 +395,8 @@ def create_inbound_webform_message(
     }
     if customer_phone:
         payload["customer_phone"] = customer_phone
+    if ticket_id:
+        payload["ticket_id"] = str(ticket_id)
 
     return KafkaMessage(
         topic=INBOUND_WEBFORM_TOPIC,
@@ -408,7 +440,7 @@ def create_agent_processing_message(
     customer_id: str,
     input_message: str,
     channel: str,
-    message_id: str = None,
+    message_id: Optional[str] = None,
 ) -> KafkaMessage:
     """Create an agent processing event."""
     return KafkaMessage(
@@ -431,7 +463,7 @@ def create_escalation_message(
     reason: str,
     priority: str = "high",
     context: Optional[Dict[str, Any]] = None,
-    message_id: str = None,
+    message_id: Optional[str] = None,
 ) -> KafkaMessage:
     """Create an escalation event."""
     return KafkaMessage(

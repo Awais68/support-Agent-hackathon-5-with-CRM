@@ -68,6 +68,7 @@ done
 echo "==> Ensuring DB extensions + migrations"
 docker compose exec -T postgres psql -U techflow -d techflow -v ON_ERROR_STOP=1 \
   -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" \
+  -c "CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;" \
   -f /dev/stdin <<'SQL'
 ALTER TABLE tickets DROP CONSTRAINT IF EXISTS tickets_channel_check;
 ALTER TABLE tickets ADD CONSTRAINT tickets_channel_check CHECK (channel IN ('email','whatsapp','webform','voice','api'));
@@ -87,13 +88,16 @@ echo "==> Starting API server on $BASE_URL"
 export DATABASE_URL="postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost:5433/techflow"
 export KAFKA_BOOTSTRAP_SERVERS="localhost:9092"
 export API_KEY="test-key-12345"
-export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
-export GROQ_API_KEY="${GROQ_API_KEY:-}"
-
-if [[ -n "${OPENROUTER_API_KEY}" ]]; then
+# Only export these when actually set: exporting an empty value would shadow
+# the key that api/main.py loads from .env.
+if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+  export OPENROUTER_API_KEY
   echo "==> OPENROUTER_API_KEY detected from environment"
 else
-  echo "==> WARNING: OPENROUTER_API_KEY not set — AI-powered flows may fail"
+  echo "==> OPENROUTER_API_KEY not set in shell — falling back to .env"
+fi
+if [[ -n "${GROQ_API_KEY:-}" ]]; then
+  export GROQ_API_KEY
 fi
 
 nohup "$PYTHON" -m uvicorn api.main:app --host 0.0.0.0 --port 8000 \

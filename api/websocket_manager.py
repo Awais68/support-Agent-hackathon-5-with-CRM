@@ -5,7 +5,6 @@ import json
 import structlog
 from typing import Dict, Set, Any
 from exceptions import sanitize_error_message
-from uuid import UUID
 
 from fastapi import WebSocket
 

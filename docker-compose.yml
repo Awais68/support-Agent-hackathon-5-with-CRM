@@ -1,4 +1,3 @@
-version: '3.9'
 
 services:
   postgres:
@@ -111,6 +110,12 @@ services:
       - .:/app
       - ./gmail_credentials.json:/app/gmail_credentials.json:ro
       - ./gmail_token.json:/app/gmail_token.json
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - techflow
 
@@ -129,6 +134,19 @@ services:
       NODE_ENV: production
     depends_on:
       api:
+        condition: service_healthy
+    networks:
+      - techflow
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: techflow-postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://***REDACTED_USER***:***REDACTED_PASS***@postgres:5432/${POSTGRES_DB:-techflow}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
         condition: service_healthy
     networks:
       - techflow

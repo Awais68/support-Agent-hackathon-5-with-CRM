@@ -11,26 +11,38 @@ from xml.sax.saxutils import escape as xml_escape
 
 import asyncpg
 import structlog
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from env_config import load_environment
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from openai import APIError as OpenAIAPIError
 from openai import AsyncOpenAI
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-from agent.customer_success_agent import AgentContext, CustomerSuccessAgent
-from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit
-from api.websocket_manager import WebSocketManager
-from channels.voice_handler import VoiceHandler, twilio_language
-from channels.web_form_handler import WebFormHandler, WebFormSubmission
-from channels.whatsapp_handler import WhatsAppHandler
-from database import queries as db
-from exceptions import (
+# Load .env BEFORE the first-party imports below: `uvicorn api.main:app` bypasses
+# main.py's entrypoint, and modules like api.rate_limiter read os.getenv() at
+# import time. Uses the shared loader so uvicorn sees the same layering
+# (.env.<ENVIRONMENT> over .env) that main.py and the worker do.
+load_environment()
+
+from agent.customer_success_agent import AgentContext, CustomerSuccessAgent  # noqa: E402
+from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit  # noqa: E402
+from api.websocket_manager import WebSocketManager  # noqa: E402
+from channels.voice_handler import VoiceHandler, twilio_language  # noqa: E402
+from channels.web_form_handler import WebFormHandler, WebFormSubmission  # noqa: E402
+from channels.whatsapp_handler import WhatsAppHandler  # noqa: E402
+from database import queries as db  # noqa: E402
+from embeddings_provider import (  # noqa: E402
+    EMBEDDING_CIRCUIT_BREAKER,
+    EmbeddingProvider,
+    build_embedding_provider,
+)
+from exceptions import (  # noqa: E402
     AppError,
     ConfigurationError,
     NotFoundError,
@@ -38,10 +50,23 @@ from exceptions import (
     sanitize_error_message,
     to_error_response,
 )
-from kafka_client import KafkaProducerClient
-from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
+from kafka_client import KafkaProducerClient, NoOpKafkaProducer  # noqa: E402
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker  # noqa: E402
 
 logger = structlog.get_logger(__name__)
+
+
+# Fail closed on unsigned Twilio webhooks in production deployments.
+REQUIRE_TWILIO_SIGNATURE = os.getenv("REQUIRE_TWILIO_SIGNATURE", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _kafka_requested() -> bool:
+    """Whether the operator asked for a Kafka broker at all."""
+    return os.getenv("ENABLE_KAFKA", "true").lower() in ("1", "true", "yes")
 
 
 # Pydantic models
@@ -89,12 +114,34 @@ class MessageResponse(BaseModel):
     created_at: str
 
 
+# Mirrors the tickets.status CHECK constraint in database/schema.sql
+VALID_TICKET_STATUSES = frozenset(
+    {"open", "in_progress", "resolved", "escalated", "closed"}
+)
+
+
 class UpdateStatusRequest(BaseModel):
     status: str = Field(..., description="New status: open, in_progress, resolved, escalated, closed")
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v: str) -> str:
+        if v not in VALID_TICKET_STATUSES:
+            raise ValueError(
+                f"status must be one of: {', '.join(sorted(VALID_TICKET_STATUSES))}"
+            )
+        return v
 
 
 class ReplyRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=5000)
+
+
+class MergeCustomerRequest(BaseModel):
+    source_customer_id: UUID = Field(
+        ..., description="Customer to absorb; its tickets move to the path customer and it is deleted"
+    )
+    reason: str | None = Field(None, max_length=500, description="Why the two records are the same person")
 
 
 class MetricsResponse(BaseModel):
@@ -167,11 +214,16 @@ async def get_kafka(request: Request) -> KafkaProducerClient:
 
 
 async def get_openai(request: Request) -> AsyncOpenAI:
-    """Get OpenRouter client from request state (handles chat + embeddings)."""
+    """Get the OpenRouter chat client from request state."""
     client = getattr(request.app.state, "openai_client", None)
     if not client:
         raise ConfigurationError(message="OpenAI client not initialized")
     return client
+
+
+async def get_embedding_provider(request: Request) -> EmbeddingProvider | None:
+    """Get the embedding provider from request state (may be None if unconfigured)."""
+    return getattr(request.app.state, "embedding_provider", None)
 
 
 async def verify_api_key(
@@ -189,7 +241,9 @@ async def verify_api_key(
     ]:
         return True
 
-    api_key = os.getenv("API_KEY", "test-key-12345")
+    # Deploy configs (docker-compose, render.yaml, k8s) set API_KEY; the .env
+    # files set API_KEY_SECRET. Accept both so the key is never silently ignored.
+    api_key = os.getenv("API_KEY") or os.getenv("API_KEY_SECRET") or "test-key-12345"
     key = request.headers.get("X-API-Key")
     if not key or key != api_key:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
@@ -217,21 +271,49 @@ async def lifespan(app: FastAPI):
         min_size=pool_min,
         max_size=pool_max,
         ssl=db_ssl,
+        init=db.init_pgvector_connection,
     )
-    await db.register_pgvector_codec(app.state.db_pool)
     logger.info("Database pool initialized")
 
-    # Initialize Kafka
+    # Initialize Kafka (optional — free-tier deploys can run without a broker)
     kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    app.state.kafka_producer = KafkaProducerClient(kafka_bootstrap)
-    await app.state.kafka_producer.start()
-    logger.info("Kafka producer initialized")
+    enable_kafka = _kafka_requested()
+    app.state.kafka_enabled = False
+    if enable_kafka:
+        try:
+            app.state.kafka_producer = KafkaProducerClient(kafka_bootstrap)
+            await app.state.kafka_producer.start()
+            app.state.kafka_enabled = True
+            logger.info("Kafka producer initialized", servers=kafka_bootstrap)
+        except Exception as e:
+            logger.warning(
+                "Kafka unavailable at startup — running in degraded mode (no broker)",
+                error=sanitize_error_message(str(e)),
+            )
+            app.state.kafka_producer = NoOpKafkaProducer()
+    else:
+        logger.info("Kafka disabled via ENABLE_KAFKA=false — running in degraded mode")
+        app.state.kafka_producer = NoOpKafkaProducer()
 
     # Initialize OpenRouter client (handles both chat completions and embeddings)
+    # An empty string counts as "unset": exported-but-empty vars are common in
+    # shell wrappers and would otherwise shadow the value from .env.
+    openrouter_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not openrouter_key:
+        raise ConfigurationError(
+            message=(
+                "OPENROUTER_API_KEY is not set. The agent cannot run without an "
+                "AI provider key — set it in .env or the environment."
+            )
+        )
     app.state.openai_client = AsyncOpenAI(
-        api_key=os.getenv("OPENROUTER_API_KEY"),
+        api_key=openrouter_key,
         base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
     )
+
+    # Embeddings go to their own provider: OpenRouter serves chat here but has
+    # no embedding credits, so knowledge base search runs on Gemini.
+    app.state.embedding_provider = build_embedding_provider(app.state.openai_client)
 
     # Initialize WebSocket manager
     app.state.ws_manager = ws_manager
@@ -309,10 +391,15 @@ async def health_check(request: Request, pool: asyncpg.Pool = Depends(get_db)) -
         logger.error("Unexpected health check error", error=sanitize_error_message(str(e)))
         db_status = "error"
 
+    if getattr(request.app.state, "kafka_enabled", False):
+        kafka_status = "ok"
+    else:
+        kafka_status = "disabled" if not _kafka_requested() else "error"
+
     return HealthResponse(
         status="healthy" if db_status == "ok" else "degraded",
         db=db_status,
-        kafka="ok",
+        kafka=kafka_status,
     )
 
 
@@ -385,11 +472,16 @@ async def create_ticket(
 @app.get("/tickets")
 async def list_tickets(
     status: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     pool: asyncpg.Pool = Depends(get_db),
 ) -> dict[str, Any]:
     """List all tickets with pagination."""
+    if status is not None and status not in VALID_TICKET_STATUSES:
+        raise ValidationError(
+            message=f"Invalid status. Must be one of: {', '.join(sorted(VALID_TICKET_STATUSES))}"
+        )
+
     tickets, total = await db.list_tickets(pool, status=status, limit=limit, offset=offset)
 
     return {
@@ -402,16 +494,31 @@ async def list_tickets(
 
 @app.get("/tickets/{ticket_id}")
 async def get_ticket(
-    ticket_id: UUID,
+    ticket_id: str,
     pool: asyncpg.Pool = Depends(get_db),
 ) -> dict[str, Any]:
-    """Get full ticket details."""
-    ticket = await db.get_ticket(pool, ticket_id)
+    """Get full ticket details by internal UUID or by TKT-… ticket number.
+
+    The web form hands the customer a ticket_number, and the tracking page
+    resolves that same value, so a UUID-only path param rejected every
+    customer-facing lookup with a 422.
+    """
+    try:
+        ticket_uuid: UUID | None = UUID(ticket_id)
+    except ValueError:
+        ticket_uuid = None
+
+    if ticket_uuid is not None:
+        ticket = await db.get_ticket(pool, ticket_uuid)
+    else:
+        ticket = await db.get_ticket_by_number(pool, ticket_id)
+
     if not ticket:
         raise NotFoundError(message=f"Ticket {ticket_id} not found")
 
-    messages = await db.get_ticket_messages(pool, ticket_id)
-    agent_runs = await db.get_agent_runs(pool, ticket_id)
+    resolved_id = ticket["id"]
+    messages = await db.get_ticket_messages(pool, resolved_id)
+    agent_runs = await db.get_agent_runs(pool, resolved_id)
 
     return {
         **dict(ticket),
@@ -439,7 +546,7 @@ async def update_ticket_status(
 @app.get("/tickets/{ticket_id}/messages")
 async def get_ticket_messages(
     ticket_id: UUID,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=200),
     pool: asyncpg.Pool = Depends(get_db),
 ) -> dict[str, Any]:
     """Get messages for a ticket."""
@@ -502,12 +609,21 @@ async def webhook_whatsapp(
         form_data = await request.form()
         handler = WhatsAppHandler(kafka_producer)
 
-        body = await request.body()
         signature = request.headers.get("X-Twilio-Signature", "")
-        if not handler.validate_webhook(body.decode(), signature):
-            logger.warning("Invalid WhatsApp webhook signature")
+        params = {k: str(v) for k, v in form_data.items()}
+        if handler.signature_validation_enabled:
+            if not handler.validate_webhook(signature, params=params, url=str(request.url)):
+                logger.warning("Rejected WhatsApp webhook: invalid Twilio signature")
+                raise HTTPException(status_code=403, detail="Invalid webhook signature")
+        elif REQUIRE_TWILIO_SIGNATURE:
+            logger.error("Rejected WhatsApp webhook: TWILIO_AUTH_TOKEN not configured")
+            raise HTTPException(status_code=403, detail="Webhook signature validation unavailable")
+        else:
+            logger.warning(
+                "Skipping WhatsApp signature validation (no TWILIO_AUTH_TOKEN configured)"
+            )
 
-        message_data = await handler.parse_webhook(dict(form_data))
+        message_data = await handler.parse_webhook(params)
         if message_data:
             await handler.handle_incoming_message(
                 from_number=message_data["from_number"],
@@ -517,6 +633,8 @@ async def webhook_whatsapp(
             )
 
         return {"status": "received"}
+    except HTTPException:
+        raise
     except (asyncpg.PostgresError, ConnectionError) as e:
         logger.error("WhatsApp webhook DB/connection error", error=sanitize_error_message(str(e)))
         return {"status": "error"}
@@ -540,19 +658,8 @@ async def webhook_webform(
     if not pool:
         raise ConfigurationError(message="Database not initialized")
     kafka_producer = getattr(request.app.state, "kafka_producer", None)
-    if not kafka_producer:
-        raise ConfigurationError(message="Kafka not initialized")
-
-    handler = WebFormHandler(kafka_producer)
-    try:
-        await handler.process_submission(body)
-    except Exception as e:
-        # Kafka routing must not prevent ticket creation
-        logger.warning(
-            "Failed to route webform submission to Kafka",
-            error=sanitize_error_message(str(e)),
-            email=body.email,
-        )
+    kafka_enabled = getattr(request.app.state, "kafka_enabled", False)
+    openai_client = getattr(request.app.state, "openai_client", None)
 
     ticket = await db.create_ticket(
         pool,
@@ -563,6 +670,55 @@ async def webhook_webform(
         channel="webform",
         initial_message=body.message,
     )
+
+    # Publish AFTER the ticket exists and carry its id, so the worker enriches
+    # this ticket instead of creating a duplicate one.
+    if kafka_producer is not None:
+        handler = WebFormHandler(kafka_producer)
+        try:
+            await handler.process_submission(body, ticket_id=str(ticket["id"]))
+        except Exception as e:
+            # Kafka routing must not prevent ticket creation
+            logger.warning(
+                "Failed to route webform submission to Kafka",
+                error=sanitize_error_message(str(e)),
+                email=body.email,
+            )
+
+    # Without a Kafka broker/worker, run the agent synchronously so the
+    # submission still gets an AI reply and the demo stays fully functional.
+    if not kafka_enabled and openai_client is not None:
+        try:
+            agent_context = AgentContext(
+                db_pool=pool,
+                kafka_producer=kafka_producer or NoOpKafkaProducer(),
+                openai_client=openai_client,
+                embedding_provider=getattr(app.state, "embedding_provider", None),
+            )
+            agent = CustomerSuccessAgent(agent_context)
+            result = await agent.process_customer_message(
+                ticket_id=ticket["id"],
+                customer_id=ticket["customer_id"],
+                customer_email=body.email,
+                customer_name=body.name,
+                message=body.message,
+                channel="webform",
+                ticket_number=ticket["ticket_number"],
+            )
+            await db.add_message(
+                pool,
+                ticket_id=ticket["id"],
+                customer_id=ticket["customer_id"],
+                direction="outbound",
+                content=result["response"],
+                channel="webform",
+            )
+        except Exception as e:
+            logger.warning(
+                "Synchronous agent reply failed",
+                error=sanitize_error_message(str(e)),
+                email=body.email,
+            )
 
     return {
         "ticket_number": ticket["ticket_number"],
@@ -615,10 +771,11 @@ async def _run_voice_agent(
         db_pool=pool,
         kafka_producer=kafka_producer,
         openai_client=openai_client,
+        embedding_provider=getattr(app.state, "embedding_provider", None),
     )
     agent = CustomerSuccessAgent(context)
     result = await agent.process_customer_message(
-        ticket_id=UUID(ticket["id"]),
+        ticket_id=ticket["id"],
         customer_id=ticket["customer_id"],
         customer_email=customer_email,
         customer_name=customer_name or customer_email.split("@")[0],
@@ -815,6 +972,64 @@ async def get_customer_history(
     }
 
 
+# Identity review queue — name similarity flags duplicates but never merges
+# automatically (see database.queries.NAME_FUZZY_THRESHOLD); a human decides here.
+@app.get("/customers/review-queue")
+@limiter.limit("30/minute")
+async def list_identity_review_queue(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    pool: asyncpg.Pool = Depends(get_db),
+) -> dict[str, Any]:
+    """List customers flagged as possible duplicates, with their candidate match."""
+    rows = await db.list_identity_review_queue(pool, limit=limit, offset=offset)
+    return {"queue": rows, "count": len(rows), "limit": limit, "offset": offset}
+
+
+@app.post("/customers/{customer_id}/merge")
+@limiter.limit(strict_limit)
+async def merge_customer(
+    request: Request,
+    customer_id: UUID,
+    body: MergeCustomerRequest,
+    pool: asyncpg.Pool = Depends(get_db),
+) -> dict[str, Any]:
+    """Merge ``source_customer_id`` into ``customer_id``. The path customer survives."""
+    try:
+        result = await db.merge_customers(
+            pool,
+            target_customer_id=customer_id,
+            source_customer_id=body.source_customer_id,
+            reason=body.reason,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "merged": True,
+        "target_customer_id": str(customer_id),
+        "source_customer_id": str(body.source_customer_id),
+        "source_email_kept_as_identifier": result["source_email"],
+        "moved": result["moved"],
+        "customer": result["target"],
+    }
+
+
+@app.post("/customers/{customer_id}/review/dismiss")
+@limiter.limit("30/minute")
+async def dismiss_identity_review(
+    request: Request,
+    customer_id: UUID,
+    pool: asyncpg.Pool = Depends(get_db),
+) -> dict[str, Any]:
+    """Mark a flagged customer as a distinct person; clears the review flag."""
+    customer = await db.dismiss_identity_review(pool, customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return {"dismissed": True, "customer": customer}
+
+
 # Metrics endpoints
 @app.get("/metrics/summary")
 async def get_metrics_summary(
@@ -843,44 +1058,97 @@ async def get_dashboard_metrics(
 # Knowledge base endpoints
 @app.get("/knowledge-base")
 async def search_knowledge_base(
-    q: str,
+    q: str = Query(..., min_length=1, max_length=500),
     category: str | None = None,
-    limit: int = 5,
+    limit: int = Query(5, ge=1, le=50),
     customer_tier: str = "starter",
     pool: asyncpg.Pool = Depends(get_db),
-    openai_client: AsyncOpenAI = Depends(get_openai),
+    provider: EmbeddingProvider | None = Depends(get_embedding_provider),
 ) -> dict[str, Any]:
     """Search knowledge base using real pgvector cosine similarity."""
-    embedding_model = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
-    _cb = get_circuit_breaker("openai")
-    try:
-        async with _cb:
-            embedding_resp = await openai_client.embeddings.create(
-                input=q,
-                model=embedding_model,
+    _cb = get_circuit_breaker(EMBEDDING_CIRCUIT_BREAKER)
+    embedding = None
+    degraded_reason = None
+
+    if provider is None:
+        degraded_reason = "No embedding provider configured"
+        logger.warning("No embedding provider, falling back to text KB search", query=q)
+    else:
+        try:
+            async with _cb:
+                embedding = await provider.embed(q)
+        except CircuitBreakerError:
+            degraded_reason = "AI service temporarily unavailable"
+            logger.warning("Embedding circuit open, falling back to text KB search", query=q)
+        except OpenAIAPIError as e:
+            degraded_reason = "AI service temporarily unavailable"
+            logger.warning(
+                "Embedding failed, falling back to text KB search",
+                query=q,
+                error=sanitize_error_message(str(e)),
             )
-    except CircuitBreakerError:
-        logger.warning("OpenAI circuit open, KB search unavailable", query=q)
+
+    # Degrade to lexical search rather than failing the request outright.
+    if embedding is None:
+        results = await db.search_knowledge_base_text(
+            pool,
+            query=q,
+            customer_tier=customer_tier,
+            category=category,
+            max_results=limit,
+        )
         return {
             "query": q,
-            "results": [],
-            "count": 0,
-            "error": "AI service temporarily unavailable",
+            "results": [dict(r) for r in results] if results else [],
+            "count": len(results) if results else 0,
+            "search_mode": "text",
+            "degraded": True,
+            "error": degraded_reason,
         }
-    embedding = embedding_resp.data[0].embedding
 
+    # Restricted to rows indexed by this same model; a provider switch leaves
+    # the old vectors in place but incomparable, and this returns nothing.
     results = await db.search_knowledge_base(
         pool,
         embedding=embedding,
         customer_tier=customer_tier,
         category=category,
         max_results=limit,
+        embedding_model=provider.model,
     )
+
+    if not results:
+        # Empty here means no row carries a vector from this model, so the
+        # result must be reported as degraded whether or not lexical finds
+        # anything — an unqualified empty "vector" result reads as "no such
+        # article", which is a different and wrong answer.
+        text_results = await db.search_knowledge_base_text(
+            pool,
+            query=q,
+            customer_tier=customer_tier,
+            category=category,
+            max_results=limit,
+        )
+        logger.warning(
+            "No comparable vectors for embedding model, using text search",
+            query=q,
+            embedding_model=provider.model,
+            text_results=len(text_results) if text_results else 0,
+        )
+        return {
+            "query": q,
+            "results": [dict(r) for r in text_results] if text_results else [],
+            "count": len(text_results) if text_results else 0,
+            "search_mode": "text",
+            "degraded": True,
+            "error": "Knowledge base not indexed for the active embedding model",
+        }
 
     return {
         "query": q,
         "results": [dict(r) for r in results] if results else [],
         "count": len(results) if results else 0,
+        "search_mode": "vector",
     }
 
 

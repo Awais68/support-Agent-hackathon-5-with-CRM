@@ -293,13 +293,16 @@ def detect_sentiment_drop(
             f"(from {last_score:.2f} to {first_score:.2f})",
         )
 
+    # A steady decline over 3+ turns matters even when the total drop is below
+    # the single-step threshold, so it gets a relaxed (half) threshold. Using the
+    # full threshold here would be dead code: that case already returned above.
     if len(scores) >= 3:
-        monotonic_drop = all(scores[i] <= scores[i + 1] for i in range(len(scores) - 1))
-        if monotonic_drop and last_score - first_score >= drop_threshold:
+        monotonic_drop = all(scores[i] < scores[i + 1] for i in range(len(scores) - 1))
+        if monotonic_drop and total_drop >= drop_threshold / 2:
             return (
                 True,
-                last_score - first_score,
-                f"Monotonic sentiment drop of {last_score - first_score:.2f} over {len(scores)} turns",
+                total_drop,
+                f"Monotonic sentiment drop of {total_drop:.2f} over {len(scores)} turns",
             )
 
     return False, max(0.0, total_drop), "No significant drop detected"

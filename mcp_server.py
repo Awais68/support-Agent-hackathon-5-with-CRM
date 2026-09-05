@@ -36,7 +36,12 @@ class MCPTool:
                 "description": self.description,
                 "parameters": {
                     "type": "object",
-                    "properties": self.parameters,
+                    # "required" is our own marker; strip it from the emitted
+                    # JSON Schema and hoist it into the schema-level list.
+                    "properties": {
+                        name: {k: v for k, v in prop.items() if k != "required"}
+                        for name, prop in self.parameters.items()
+                    },
                     "required": [
                         name
                         for name, prop in self.parameters.items()
@@ -88,12 +93,19 @@ class MCPServer:
             category=category,
         )
 
+        # Re-registration replaces the old tool; drop its stale category entry.
+        previous = self.tools.get(name)
+        if previous and previous.category in self.categories:
+            if name in self.categories[previous.category]:
+                self.categories[previous.category].remove(name)
+
         self.tools[name] = tool
 
         # Track by category
         if category not in self.categories:
             self.categories[category] = []
-        self.categories[category].append(name)
+        if name not in self.categories[category]:
+            self.categories[category].append(name)
 
         logger.info(
             "Tool registered",
@@ -208,7 +220,7 @@ async def initialize_default_tools(
                 "description": "Optional category filter (onboarding, technical, billing, etc.)",
                 "required": False,
             },
-            "limit": {
+            "max_results": {
                 "type": "integer",
                 "description": "Maximum number of results to return (default: 5)",
                 "required": False,

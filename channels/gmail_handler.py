@@ -43,9 +43,12 @@ class GmailHandler:
             # Refresh token if expired
             if credentials and credentials.expired and credentials.refresh_token:
                 credentials.refresh(Request())
+                with open(self.token_file, "w") as token:
+                    token.write(credentials.to_json())
 
-            # If no credentials, run OAuth flow
-            if not credentials:
+            # Run the OAuth flow when there are no credentials, or when the ones
+            # we have are still not usable after a refresh attempt.
+            if not credentials or not credentials.valid:
                 flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, SCOPES)
                 credentials = flow.run_local_server(port=0)
 

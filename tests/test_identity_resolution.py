@@ -2,7 +2,7 @@
 """Tests for pg_trgm fuzzy matching identity resolution."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 from datetime import UTC, datetime
 
@@ -138,16 +138,20 @@ class TestFindCustomerByNameEmail:
 
         assert result is None
 
-    async def test_fuzzy_name_fallback(self, mock_db_pool):
+    async def test_fuzzy_name_requires_corroboration(self, mock_db_pool):
+        """A name-only match across unrelated domains must NOT resolve to a customer."""
         mock_conn = AsyncMock()
         mock_conn.fetchrow.side_effect = [
             None,  # exact email → not found
             None,  # fuzzy email → not found
-            {  # fuzzy name → found
+        ]
+        mock_conn.fetch.return_value = [
+            {
                 "id": UUID("11111111-1111-1111-1111-111111111111"),
                 "email": "jsmith@other.com",
                 "name": "Jon Smith",
-                "sim": 0.5,
+                "company": "Other Inc",
+                "sim": 0.75,
             },
         ]
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
@@ -156,8 +160,57 @@ class TestFindCustomerByNameEmail:
             mock_db_pool, "new-email@test.com", name="John Smith"
         )
 
+        assert result is None
+
+    async def test_fuzzy_name_accepted_when_domain_matches(self, mock_db_pool):
+        """Same email domain corroborates the name, so the match is returned."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.side_effect = [None, None]
+        mock_conn.fetch.return_value = [
+            {
+                "id": UUID("11111111-1111-1111-1111-111111111111"),
+                "email": "jsmith@acme.com",
+                "name": "Jon Smith",
+                "company": "Acme Corp",
+                "sim": 0.75,
+            },
+        ]
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        result = await db.find_customer_by_name_email(
+            mock_db_pool, "john.smith@acme.com", name="John Smith"
+        )
+
         assert result is not None
-        assert result["name"] == "Jon Smith"
+        assert result["match_type"] == "fuzzy_name"
+
+    async def test_fuzzy_name_rejected_when_ambiguous(self, mock_db_pool):
+        """Two near-equal name candidates mean the person cannot be identified."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.side_effect = [None, None]
+        mock_conn.fetch.return_value = [
+            {
+                "id": UUID("11111111-1111-1111-1111-111111111111"),
+                "email": "jsmith@acme.com",
+                "name": "Jon Smith",
+                "company": "Acme Corp",
+                "sim": 0.78,
+            },
+            {
+                "id": UUID("22222222-2222-2222-2222-222222222222"),
+                "email": "j.smyth@acme.com",
+                "name": "John Smyth",
+                "company": "Acme Corp",
+                "sim": 0.76,
+            },
+        ]
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        result = await db.find_customer_by_name_email(
+            mock_db_pool, "john.smith@acme.com", name="John Smith"
+        )
+
+        assert result is None
 
 
 class TestGetCustomerByIdentifier:
@@ -356,26 +409,31 @@ class TestGetCustomerOrCreateByIdentifier:
         # Should have linked the new identifier to existing customer
         mock_conn.execute.assert_called_once()
 
-    async def test_fuzzy_name_fallback(self, mock_db_pool):
-        """Email fuzzy fails, but name fuzzy matches → links identifier."""
+    async def test_name_match_never_links_identifier(self, mock_db_pool):
+        """A similar name must create a NEW customer flagged for review, not link."""
         mock_conn = AsyncMock()
         self._setup_conn_with_transaction(mock_conn)
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        matched_id = UUID("77777777-7777-7777-7777-777777777777")
+        candidate_id = UUID("77777777-7777-7777-7777-777777777777")
+        new_id = UUID("aaaaaaaa-7777-7777-7777-777777777777")
         mock_conn.fetchrow.side_effect = [
             None,  # Step 1: exact match → not found
             None,  # Step 2: fuzzy email → not found
-            {  # Step 3: fuzzy name → FOUND
-                "id": matched_id,
-                "email": "jdoe@other.com",
+            {  # Step 3: similar name found → review flag only
+                "id": candidate_id,
                 "name": "Jon Doe",
-                "company": "Acme Corp",
+                "sim": 0.75,
+            },
+            {  # Step 4: INSERT new customer
+                "id": new_id,
+                "email": "new-email@test.com",
+                "name": "John Doe",
+                "company": None,
                 "tier": "starter",
                 "created_at": datetime.now(UTC),
                 "updated_at": datetime.now(UTC),
                 "metadata": {},
-                "sim": 0.55,
             },
         ]
 
@@ -383,7 +441,13 @@ class TestGetCustomerOrCreateByIdentifier:
             mock_db_pool, "email", "new-email@test.com", name="John Doe"
         )
 
-        assert result["id"] == matched_id
+        # New customer, NOT the similarly-named existing one
+        assert result["id"] == new_id
+        # The duplicate hint was persisted on the INSERT
+        insert_call = mock_conn.fetchrow.await_args_list[-1]
+        metadata_json = insert_call.args[-1]
+        assert str(candidate_id) in metadata_json
+        assert "needs_identity_review" in metadata_json
 
     async def test_low_similarity_does_not_match(self, mock_db_pool):
         """Fuzzy result below threshold → creates new customer."""
@@ -618,3 +682,112 @@ class TestCrossChannelResolution:
         )
         assert phone_customer is not None
         assert phone_customer["id"] == customer_id
+
+
+class TestCustomerMerge:
+    """Test the human-resolution path for flagged duplicate customers."""
+
+    TARGET = UUID("aaaaaaaa-0000-0000-0000-000000000001")
+    SOURCE = UUID("bbbbbbbb-0000-0000-0000-000000000002")
+
+    def _setup_conn_with_transaction(self, mock_conn):
+        mock_conn.__aenter__.return_value = mock_conn
+        mock_transaction = MagicMock()
+        mock_transaction.__aenter__ = AsyncMock(return_value=mock_transaction)
+        mock_transaction.__aexit__ = AsyncMock(return_value=None)
+        mock_conn.transaction = MagicMock(return_value=mock_transaction)
+
+    def _merge_conn(self, mock_db_pool, locked_rows):
+        mock_conn = AsyncMock()
+        self._setup_conn_with_transaction(mock_conn)
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+        mock_conn.fetch.return_value = locked_rows
+        mock_conn.execute.return_value = "UPDATE 3"
+        mock_conn.fetchrow.return_value = {
+            "id": self.TARGET,
+            "email": "zayn.malik@corpa.com",
+            "name": "Zayn Malik",
+            "company": None,
+            "tier": "starter",
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+            "metadata": {},
+        }
+        return mock_conn
+
+    async def test_merge_moves_rows_and_deletes_source(self, mock_db_pool):
+        mock_conn = self._merge_conn(
+            mock_db_pool,
+            [
+                {"id": self.TARGET, "email": "zayn.malik@corpa.com", "name": "Zayn Malik"},
+                {"id": self.SOURCE, "email": "zayn.malick@corpb.com", "name": "Zayn Malick"},
+            ],
+        )
+
+        result = await db.merge_customers(
+            mock_db_pool, self.TARGET, self.SOURCE, reason="same person"
+        )
+
+        assert result["source_deleted"] is True
+        assert result["source_email"] == "zayn.malick@corpb.com"
+        # Every table that references customers must be repointed
+        assert set(result["moved"]) == {
+            "tickets",
+            "messages",
+            "agent_runs",
+            "customer_identifiers",
+        }
+        statements = " ".join(str(c.args[0]) for c in mock_conn.execute.await_args_list)
+        assert "DELETE FROM customers WHERE id = $1" in statements
+        # The source email stays reachable after the merge
+        assert "INSERT INTO customer_identifiers" in statements
+
+    async def test_merge_rejects_same_id(self, mock_db_pool):
+        with pytest.raises(ValueError, match="must differ"):
+            await db.merge_customers(mock_db_pool, self.TARGET, self.TARGET)
+
+    async def test_merge_rejects_missing_source(self, mock_db_pool):
+        self._merge_conn(
+            mock_db_pool,
+            [{"id": self.TARGET, "email": "zayn.malik@corpa.com", "name": "Zayn Malik"}],
+        )
+
+        with pytest.raises(ValueError, match="source customer"):
+            await db.merge_customers(mock_db_pool, self.TARGET, self.SOURCE)
+
+    async def test_merge_rejects_missing_target(self, mock_db_pool):
+        self._merge_conn(
+            mock_db_pool,
+            [{"id": self.SOURCE, "email": "zayn.malick@corpb.com", "name": "Zayn Malick"}],
+        )
+
+        with pytest.raises(ValueError, match="target customer"):
+            await db.merge_customers(mock_db_pool, self.TARGET, self.SOURCE)
+
+    async def test_dismiss_review_returns_none_for_unknown_customer(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.return_value = None
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        assert await db.dismiss_identity_review(mock_db_pool, self.TARGET) is None
+
+    async def test_review_queue_returns_candidates(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = [
+            {
+                "id": self.SOURCE,
+                "email": "zayn.malick@corpb.com",
+                "name": "Zayn Malick",
+                "candidate_id": self.TARGET,
+                "candidate_name": "Zayn Malik",
+                "similarity": 0.77,
+                "ticket_count": 1,
+                "candidate_ticket_count": 4,
+            }
+        ]
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        queue = await db.list_identity_review_queue(mock_db_pool)
+
+        assert len(queue) == 1
+        assert queue[0]["candidate_id"] == self.TARGET

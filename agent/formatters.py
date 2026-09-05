@@ -1,6 +1,5 @@
 """Response formatters for different channels."""
 
-import textwrap
 from typing import Optional, Dict, Any
 
 

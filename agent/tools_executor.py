@@ -1,7 +1,6 @@
 """Tool executor for customer success agent - executes tools called by LLM."""
 
 import json
-import os
 from typing import Any, Dict, Optional
 from uuid import UUID
 
@@ -13,6 +12,11 @@ from exceptions import sanitize_error_message
 from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
 from database import queries as db
+from embeddings_provider import (
+    EMBEDDING_CIRCUIT_BREAKER,
+    EmbeddingProvider,
+    resolve_embedding_provider,
+)
 from kafka_client import KafkaProducerClient
 
 logger = structlog.get_logger(__name__)
@@ -26,46 +30,90 @@ class ToolExecutor:
         db_pool: asyncpg.Pool,
         kafka_producer: KafkaProducerClient,
         openai_client: AsyncOpenAI,
+        embedding_provider: Optional[EmbeddingProvider] = None,
     ):
         self.db_pool = db_pool
         self.kafka_producer = kafka_producer
         self.openai_client = openai_client
+        # Embeddings run on their own provider (see embeddings_provider). Left
+        # unset, embeddings fall back to openai_client.
+        self.embedding_provider = embedding_provider
 
     async def search_knowledge_base(
         self, query: str, category: Optional[str] = None, max_results: int = 5
     ) -> Dict[str, Any]:
         """Search knowledge base by semantic similarity."""
         try:
-            embedding_model = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
-            _cb = get_circuit_breaker("openai")
-            try:
-                async with _cb:
-                    embedding_response = await self.openai_client.embeddings.create(
-                        input=query,
-                        model=embedding_model,
-                    )
-            except CircuitBreakerError:
-                logger.error("KB search failed (OpenAI circuit open)", query=query)
-                return {"error": "AI service temporarily unavailable", "query": query, "results": []}
-            query_embedding = embedding_response.data[0].embedding
-
-            # Search using pgvector similarity
-            results = await db.search_knowledge_base(
-                self.db_pool,
-                embedding=query_embedding,
-                category=category,
-                max_results=max_results,
+            provider = resolve_embedding_provider(
+                self.embedding_provider, self.openai_client
             )
+            query_embedding = None
+            degraded_reason = None
+
+            if provider is None:
+                degraded_reason = "No embedding provider configured"
+                logger.warning("No embedding provider, using lexical KB search", query=query)
+            else:
+                _cb = get_circuit_breaker(EMBEDDING_CIRCUIT_BREAKER)
+                try:
+                    async with _cb:
+                        query_embedding = await provider.embed(query)
+                except CircuitBreakerError:
+                    degraded_reason = "AI service temporarily unavailable"
+                    logger.warning("Embedding circuit open, using lexical KB search", query=query)
+                except (OpenAIAPIError, APITimeoutError, APIConnectionError) as e:
+                    # Provider down or out of credits: degrade to lexical search
+                    # rather than returning an empty knowledge base.
+                    degraded_reason = "AI service temporarily unavailable"
+                    logger.warning(
+                        "Embedding failed, using lexical KB search",
+                        query=query,
+                        error=sanitize_error_message(str(e)),
+                    )
+
+            if query_embedding is None:
+                results = await db.search_knowledge_base_text(
+                    self.db_pool,
+                    query=query,
+                    category=category,
+                    max_results=max_results,
+                )
+                search_mode = "text"
+            else:
+                results = await db.search_knowledge_base(
+                    self.db_pool,
+                    embedding=query_embedding,
+                    category=category,
+                    max_results=max_results,
+                    embedding_model=provider.model,
+                )
+                search_mode = "semantic"
+                if not results:
+                    # Vectors on disk belong to a different model's space, so
+                    # report degraded even if lexical also comes back empty.
+                    results = await db.search_knowledge_base_text(
+                        self.db_pool,
+                        query=query,
+                        category=category,
+                        max_results=max_results,
+                    )
+                    search_mode = "text"
+                    degraded_reason = (
+                        "Knowledge base not indexed for the active "
+                        "embedding model"
+                    )
 
             logger.info(
                 "KB search completed",
                 query=query,
                 results_count=len(results),
                 category=category,
+                search_mode=search_mode,
             )
 
-            return {
+            response = {
                 "query": query,
+                "search_mode": search_mode,
                 "results": [
                     {
                         "id": str(r["id"]),
@@ -79,6 +127,10 @@ class ToolExecutor:
                 ],
                 "count": len(results),
             }
+            if degraded_reason:
+                response["degraded"] = True
+                response["error"] = degraded_reason
+            return response
 
         except (OpenAIAPIError, APITimeoutError, APIConnectionError) as e:
             logger.error("KB search failed (OpenAI)", error=sanitize_error_message(str(e)), query=query)
@@ -178,6 +230,8 @@ class ToolExecutor:
         try:
             # Update ticket status to escalated
             ticket = await db.update_ticket_status(self.db_pool, ticket_id, "escalated")
+            if not ticket:
+                return {"error": "Ticket not found", "status": "escalation_failed"}
 
             # Send to human queue via Kafka
             await self.kafka_producer.send_message(
@@ -227,7 +281,7 @@ class ToolExecutor:
             msg = await db.add_message(
                 self.db_pool,
                 ticket_id=ticket_id,
-                customer_id=UUID(ticket["customer_id"]),
+                customer_id=ticket["customer_id"],
                 direction="outbound",
                 content=message,
                 channel=channel,
@@ -278,7 +332,7 @@ class ToolExecutor:
                 return await self.search_knowledge_base(
                     query=tool_input.get("query", ""),
                     category=tool_input.get("category"),
-                    limit=tool_input.get("limit", 5),
+                    max_results=tool_input.get("max_results", tool_input.get("limit", 5)),
                 )
 
             elif tool_name == "create_ticket":

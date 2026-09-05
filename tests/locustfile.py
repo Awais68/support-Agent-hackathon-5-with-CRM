@@ -270,7 +270,6 @@ class CRMChannelUser(HttpUser):
                 )
             elif resp.status_code == 200:
                 resp.success()
-                body = resp.json()
                 # WhatsApp returns {"status": "received"} — track escalations
                 # by checking the message body for escalation keywords
                 if any(kw in msg.lower() for kw in ("escalat", "legal", "sue", "lawyer", "attorney")):
