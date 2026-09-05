@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# pre-commit: block commits that would add secrets to the repo.
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$hook_dir/../scripts/check-secrets.sh" pre-commit
+status=$?
+case $status in
+  0) exit 0 ;;
+  1) echo "pre-commit: secret scan failed — commit blocked." >&2; exit 1 ;;
+  *) exit $status ;;
+esac

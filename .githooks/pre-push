@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# pre-push: block pushes that would leak secrets to the remote.
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$hook_dir/../scripts/check-secrets.sh" pre-push
+status=$?
+case $status in
+  0) exit 0 ;;
+  1) echo "pre-push: secret scan failed — push blocked." >&2; exit 1 ;;
+  *) exit $status ;;
+esac
