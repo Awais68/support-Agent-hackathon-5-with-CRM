@@ -1,0 +1,9 @@
+# gitleaks configuration — extend defaults, allowlist only known FAKE doc examples.
+[extend]
+useDefault = true
+
+[[allowlist]]
+description = "documentation example curl commands using the fake test API key"
+regexes = [
+  '''(?i)test-key-1234''',
+]
