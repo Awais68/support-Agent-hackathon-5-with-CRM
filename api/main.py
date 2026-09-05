@@ -261,7 +261,7 @@ async def lifespan(app: FastAPI):
     # Initialize database
     db_url = os.getenv(
         "DATABASE_URL",
-        "postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost/techflow",
+        "postgresql://techflow:techflow@localhost/techflow",
     )
     pool_min = int(os.getenv("DATABASE_POOL_MIN", "1"))
     pool_max = int(os.getenv("DATABASE_POOL_MAX", "5"))

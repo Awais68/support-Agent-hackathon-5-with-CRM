@@ -365,7 +365,7 @@ async def main() -> None:
 
     db_url = os.getenv(
         "DATABASE_URL",
-        "postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost:5432/techflow",
+        "postgresql://techflow:techflow@localhost:5432/techflow",
     )
 
     logger.info("Connecting to database", db_url=db_url)

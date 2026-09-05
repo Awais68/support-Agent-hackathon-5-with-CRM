@@ -85,7 +85,7 @@ fi
 
 # 3. Start the API server (local Postgres is exposed on host port 5433)
 echo "==> Starting API server on $BASE_URL"
-export DATABASE_URL="postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost:5433/techflow"
+export DATABASE_URL="postgresql://techflow:techflow@localhost:5433/techflow"
 export KAFKA_BOOTSTRAP_SERVERS="localhost:9092"
 export API_KEY="test-key-12345"
 # Only export these when actually set: exporting an empty value would shadow

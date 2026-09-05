@@ -139,7 +139,7 @@ Customer Input (Email/WhatsApp/Web/Voice Call/Voice Message)
 ### Database URL
 
 ```
-postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost/techflow
+postgresql://techflow:techflow@localhost/techflow
 ```
 
 ### Environment Variables

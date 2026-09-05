@@ -536,7 +536,7 @@ async def example_usage():
     """Example of how to use the agent."""
     # Initialize context (in real app, done in FastAPI lifespan)
     pool = await asyncpg.create_pool(
-        "postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost/techflow",
+        "postgresql://user:pass@localhost/techflow",
         min_size=1,
         max_size=5,
         ssl="require" if os.getenv("DATABASE_SSL", "disable") != "disable" else False,

@@ -79,7 +79,7 @@ Ya seedha `./scripts/setup_e2e.sh` chala do — wo ye khud kar deta hai.
 ## Step 1.3 — API server start karo
 
 ```bash
-export DATABASE_URL="postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost:5433/techflow"
+export DATABASE_URL="postgresql://techflow:techflow@localhost:5433/techflow"
 export API_KEY="test-key-12345"
 .venv/bin/python -m uvicorn api.main:app --host 127.0.0.1 --port 8010
 ```
@@ -100,7 +100,7 @@ Ye webform se nahi hota (webform sirf email se match karta hai). Review flag
 use karte hain. Isliye seedha wahi function chalao:
 
 ```bash
-DATABASE_URL="postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost:5433/techflow" \
+DATABASE_URL="postgresql://techflow:techflow@localhost:5433/techflow" \
 .venv/bin/python - <<'PY'
 import asyncio, os, random, asyncpg
 from database import queries as db
@@ -288,7 +288,7 @@ Yehi wo raasta hai jahan duplicate flag lagta hai.
 Asli e-commerce scenario: checkout par kaam ka email diya, support par personal email:
 
 ```bash
-DATABASE_URL="postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost:5433/techflow" \
+DATABASE_URL="postgresql://techflow:techflow@localhost:5433/techflow" \
 .venv/bin/python - <<'PY'
 import asyncio, os, asyncpg
 from database import queries as db
@@ -380,7 +380,7 @@ buniyaad hai.
 ## Step 2.6 — Store se ulta test: alag log merge na hon
 
 ```bash
-DATABASE_URL="postgresql://***REDACTED_USER***:***REDACTED_PASS***@localhost:5433/techflow" \
+DATABASE_URL="postgresql://techflow:techflow@localhost:5433/techflow" \
 .venv/bin/python - <<'PY'
 import asyncio, os, asyncpg
 from database import queries as db

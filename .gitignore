@@ -11,10 +11,18 @@ wheels/
 venv/
 env/
 
-# Environment variables
+# Environment variables — NEVER commit real values
+# (real creds only in local, gitignored files; .env.example is the safe template)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+*.env
+*.env.*
+*.env*.bak
+
+# Kubernetes secrets manifests
+k8s/*secret*
+k8s/*Secret*
 
 # Credentials & Secrets
 gmail_credentials.json
@@ -24,6 +32,12 @@ gmail_token.pickle
 *.key
 *.crt
 private_key.txt
+*.service-account.json
+service_account*.json
+*_token.json
+
+# IaC secrets
+*.tfvars
 
 # IDE
 .vscode/
