@@ -70,3 +70,4 @@ locustfile.log
 # Logs
 *.log
 logs/
+credentials.json
