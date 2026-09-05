@@ -2,7 +2,7 @@
 [extend]
 useDefault = true
 
-[[allowlist]]
+[allowlist]
 description = "documentation example curl commands using the fake test API key"
 regexes = [
   '''(?i)test-key-1234''',
