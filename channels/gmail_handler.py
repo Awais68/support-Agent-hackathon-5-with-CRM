@@ -8,6 +8,7 @@ import base64
 
 import structlog
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -40,11 +41,20 @@ class GmailHandler:
             if os.path.exists(self.token_file):
                 credentials = Credentials.from_authorized_user_file(self.token_file, SCOPES)
 
-            # Refresh token if expired
+            # Refresh token if expired. A revoked or expired refresh token
+            # raises RefreshError ("invalid_grant") — that is recoverable by
+            # re-running the OAuth flow below, so it must not abort startup.
             if credentials and credentials.expired and credentials.refresh_token:
-                credentials.refresh(Request())
-                with open(self.token_file, "w") as token:
-                    token.write(credentials.to_json())
+                try:
+                    credentials.refresh(Request())
+                    with open(self.token_file, "w") as token:
+                        token.write(credentials.to_json())
+                except RefreshError as e:
+                    logger.warning(
+                        "Gmail refresh token rejected — re-running OAuth flow",
+                        error=sanitize_error_message(str(e)),
+                    )
+                    credentials = None
 
             # Run the OAuth flow when there are no credentials, or when the ones
             # we have are still not usable after a refresh attempt.

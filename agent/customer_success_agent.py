@@ -405,6 +405,28 @@ class CustomerSuccessAgent:
             else:
                 formatted_response = output_message
 
+            # The ALLOW path records the outbound message through the
+            # send_response tool. ESCALATE and DEFLECT never reach that tool, so
+            # persist their reply here — otherwise the human agent picking up an
+            # escalation cannot see what the customer was already told.
+            if gate_result.action in (GateAction.ESCALATE, GateAction.DEFLECT):
+                try:
+                    await db.add_message(
+                        self.context.db_pool,
+                        ticket_id=ticket_id,
+                        customer_id=customer_id,
+                        direction="outbound",
+                        content=formatted_response,
+                        channel=channel,
+                    )
+                except Exception as e:
+                    self.context.logger.warning(
+                        "Could not persist gate response to conversation history",
+                        ticket_id=str(ticket_id),
+                        gate_action=gate_result.action.value,
+                        error=sanitize_error_message(str(e)),
+                    )
+
             # Step 8: Update agent run with completion
             await db.complete_agent_run(
                 self.context.db_pool,

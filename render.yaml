@@ -66,8 +66,25 @@ services:
         value: "false"
       - key: ENABLE_WEB_FORM
         value: "true"
+      # Voice channel: STT runs on Groq Whisper, TTS falls back to gTTS when
+      # OPENAI_API_KEY is unset. Without GROQ_API_KEY the channel degrades to
+      # asking every caller to repeat themselves, so set it in the dashboard.
       - key: ENABLE_VOICE
-        value: "false"
+        value: "true"
+      - key: GROQ_API_KEY
+        sync: false
+      - key: STT_PROVIDER
+        value: auto
+      - key: TTS_PROVIDER
+        value: auto
+      # Knowledge base search embeds through Gemini — the OpenRouter account
+      # has no embedding credits and returns HTTP 402 on /embeddings.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_BASE_URL
+        value: https://generativelanguage.googleapis.com/v1beta/openai/
+      - key: GEMINI_EMBEDDING_MODEL
+        value: gemini-embedding-001
 
   - type: worker
     name: techflow-worker
@@ -95,6 +112,12 @@ services:
         value: "5"
       - key: OPENROUTER_API_KEY
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_BASE_URL
+        value: https://generativelanguage.googleapis.com/v1beta/openai/
+      - key: GEMINI_EMBEDDING_MODEL
+        value: gemini-embedding-001
 
   - type: web
     name: techflow-webform
