@@ -31,6 +31,7 @@ from slowapi.middleware import SlowAPIMiddleware
 load_environment()
 
 from agent.customer_success_agent import AgentContext, CustomerSuccessAgent  # noqa: E402
+from chat_provider import build_chat_client, chat_model, chat_provider_config  # noqa: E402
 from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit  # noqa: E402
 from api.websocket_manager import WebSocketManager  # noqa: E402
 from channels.voice_handler import VoiceHandler, twilio_language  # noqa: E402
@@ -295,21 +296,15 @@ async def lifespan(app: FastAPI):
         logger.info("Kafka disabled via ENABLE_KAFKA=false — running in degraded mode")
         app.state.kafka_producer = NoOpKafkaProducer()
 
-    # Initialize OpenRouter client (handles both chat completions and embeddings)
-    # An empty string counts as "unset": exported-but-empty vars are common in
-    # shell wrappers and would otherwise shadow the value from .env.
-    openrouter_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-    if not openrouter_key:
+    # Initialize the chat client: DeepSeek when DEEPSEEK_API_KEY is set,
+    # otherwise OpenRouter. Empty strings count as unset.
+    try:
+        app.state.openai_client = build_chat_client()
+    except ValueError as e:
         raise ConfigurationError(
-            message=(
-                "OPENROUTER_API_KEY is not set. The agent cannot run without an "
-                "AI provider key — set it in .env or the environment."
-            )
-        )
-    app.state.openai_client = AsyncOpenAI(
-        api_key=openrouter_key,
-        base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-    )
+            message=f"{e}. The agent cannot run without an AI provider key."
+        ) from e
+    logger.info("Chat provider initialized", provider=chat_provider_config().name, model=chat_model())
 
     # Embeddings go to their own provider: OpenRouter serves chat here but has
     # no embedding credits, so knowledge base search runs on Gemini.

@@ -6,7 +6,7 @@ from uuid import UUID
 
 import asyncpg
 import structlog
-from openai import AsyncOpenAI, APIError as OpenAIAPIError
+from openai import APIError as OpenAIAPIError
 
 from channels.gmail_handler import run_gmail_polling_loop
 from workers.metrics_collector import run_metrics_collector
@@ -24,6 +24,7 @@ from agent.customer_success_agent import (
     AgentContext,
 )
 from database import queries as db
+from chat_provider import build_chat_client
 from embeddings_provider import build_embedding_provider
 from env_config import load_environment
 from exceptions import sanitize_error_message
@@ -37,10 +38,8 @@ class MessageProcessor:
     def __init__(self, db_pool: asyncpg.Pool, kafka_producer: KafkaProducerClient):
         self.db_pool = db_pool
         self.kafka_producer = kafka_producer
-        self.openai_client = AsyncOpenAI(
-            api_key=os.getenv("OPENROUTER_API_KEY"),
-            base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-        )
+        # DeepSeek when DEEPSEEK_API_KEY is set, otherwise OpenRouter.
+        self.openai_client = build_chat_client()
         # Embeddings go to their own provider: OpenRouter serves chat here but
         # has no embedding credits, so knowledge base search runs on Gemini.
         self.embedding_provider = build_embedding_provider(self.openai_client)

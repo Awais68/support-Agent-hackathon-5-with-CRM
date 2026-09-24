@@ -12,6 +12,7 @@ import structlog
 from openai import AsyncOpenAI
 from openai import APIError as OpenAIAPIError, APITimeoutError, APIConnectionError
 
+from chat_provider import chat_model
 from agent.prompts import SYSTEM_PROMPT, CHANNEL_ADDENDUMS, CLASSIFICATION_PROMPT
 from agent.tools import OPENAI_TOOL_SCHEMAS, ToolContext, execute_tool
 from agent.formatters import format_email_response, format_whatsapp_response, format_web_form_response
@@ -55,7 +56,7 @@ class CustomerSuccessAgent:
 
     def __init__(self, context: AgentContext, model: str = ""):
         if not model:
-            model = os.getenv("OPENAI_MODEL", "openai/gpt-4o")
+            model = chat_model()
         self.context = context
         self.model = model
 

@@ -1,10 +1,42 @@
-# TechFlow Analytics — CRM Digital FTE Factory
+# Customer Support Agent — Working 24/7
 
-A complete "Customer Success Digital FTE" (AI agent replacing a human support employee) built with **OpenAI Agents SDK**, **FastAPI**, **Kafka**, **PostgreSQL + pgvector**, and **Kubernetes**.
+![Status](https://img.shields.io/badge/status-completed-brightgreen)
+![Running](https://img.shields.io/badge/agent-running%2024%2F7-success)
+![LLM](https://img.shields.io/badge/LLM-DeepSeek-blue)
+![Tests](https://img.shields.io/badge/tests-136%20passing-brightgreen)
+![Python](https://img.shields.io/badge/python-3.13-blue)
 
-## 🎯 Overview
+An AI **Customer Success Digital FTE** — a support agent that never sleeps. It answers
+customers around the clock on **Email, WhatsApp, Web Form and Voice**, searches the
+knowledge base, creates and tracks tickets, and escalates to a human when it should.
 
-Autonomous customer support system handling support inquiries across **4 channels** (Email, WhatsApp, Web Form, **Voice**) using GPT-4o agent with 5 specialized tools. Automatically creates tickets, searches knowledge bases, escalates complex issues, and maintains full conversation history. The **voice channel** adds speech-to-text, text-to-speech, and automatic translation so customers can call or leave a voice message in any language and the agent understands them on the first utterance.
+## ✅ Project Status
+
+| Area | Status |
+|------|--------|
+| Overall project | ✅ **Completed** |
+| Agent runtime | 🟢 **Running 24/7** (API + background worker) |
+| LLM provider | ✅ DeepSeek (`deepseek-chat`), OpenRouter as automatic fallback |
+| Embeddings / KB search | ✅ Gemini `gemini-embedding-001` + pgvector |
+| Channels | ✅ Email (Gmail) · ✅ WhatsApp (Twilio) · ✅ Web Form (Next.js) · ✅ Voice |
+| Ticketing + escalation | ✅ Done |
+| Metrics & monitoring | ✅ Prometheus + Grafana dashboard |
+| Deployment | ✅ Docker Compose · Kubernetes (HPA + KEDA) · Render |
+| Tests | ✅ 136 unit/integration tests passing |
+
+## 🔄 What happens in this project (24/7 flow)
+
+1. A customer writes in on any channel — email, WhatsApp, the web form, or a phone call / voice note.
+2. The channel handler normalises the message and publishes it to **Kafka**.
+3. The **message processor worker** (always running) picks it up and identifies the customer across channels.
+4. A pre-processing gate checks sentiment and escalation rules (angry customer, legal, refund, etc.).
+5. The **DeepSeek-powered agent** decides what to do and calls its tools:
+   search the knowledge base, look up customer history, create a ticket, or escalate to a human.
+6. The reply is formatted for the channel (email / WhatsApp / web / speech) and sent back.
+7. Every conversation, ticket and metric is stored in **PostgreSQL**, visible on the metrics dashboard.
+
+Because the API and worker run as separate always-on services (with Kubernetes
+autoscaling and restart policies), the agent keeps answering customers day and night.
 
 ## 🚀 Quick Start
 
@@ -127,7 +159,7 @@ Customer Input (Email/WhatsApp/Web/Voice Call/Voice Message)
         ↓
   Message Processor Worker
         ↓
-  OpenAI Agent (gpt-4o) + 5 Tools
+  DeepSeek Agent (deepseek-chat) + 5 Tools
         ↓
   PostgreSQL (6 Tables + pgvector)
         ↓
@@ -147,7 +179,10 @@ postgresql://techflow:techflow@localhost/techflow
 ```bash
 DATABASE_URL=postgresql://...
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-OPENAI_API_KEY=sk-...
+DEEPSEEK_API_KEY=sk-...        # chat LLM (preferred)
+DEEPSEEK_MODEL=deepseek-chat
+OPENROUTER_API_KEY=sk-or-...   # optional fallback if DeepSeek key is empty
+GEMINI_API_KEY=...             # embeddings for knowledge-base search
 API_KEY=test-key-12345
 TWILIO_ACCOUNT_SID=AC...
 TWILIO_AUTH_TOKEN=...
@@ -166,6 +201,7 @@ TTS_PROVIDER=auto             # openai | gtts | none
 
 ```
 specifyplus/
+├── chat_provider.py        # DeepSeek / OpenRouter selection
 ├── api/                    # FastAPI application
 ├── agent/                  # Agent orchestration
 ├── channels/               # Email/WhatsApp/Web handlers
@@ -273,16 +309,17 @@ docker compose ps postgres  # Should be "healthy"
 docker compose exec kafka kafka-broker-api-versions.sh --bootstrap-server localhost:9092
 ```
 
-**OpenAI API error**:
+**LLM API error**:
 ```bash
-# Check API key is set
-echo $OPENAI_API_KEY
+# Check the DeepSeek key is set (startup log shows: Chat provider initialized provider=deepseek)
+echo $DEEPSEEK_API_KEY
 ```
 
 ## ✨ Tech Stack
 
 - **Framework**: FastAPI (Python)
-- **Agent**: OpenAI Agents SDK (gpt-4o)
+- **Agent LLM**: DeepSeek `deepseek-chat` via OpenAI-compatible API (OpenRouter fallback)
+- **Embeddings**: Gemini `gemini-embedding-001`
 - **Database**: PostgreSQL + pgvector (vector similarity)
 - **Message Queue**: Kafka (9 topics)
 - **Async**: asyncpg, aiokafka, httpx
@@ -292,4 +329,4 @@ echo $OPENAI_API_KEY
 
 ---
 
-**Built for the TechFlow Analytics Customer Success team** 🚀
+**Customer Support Agent — working 24/7** 🚀

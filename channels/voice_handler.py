@@ -30,6 +30,7 @@ from typing import Any
 import httpx
 import structlog
 
+from chat_provider import chat_model
 from exceptions import sanitize_error_message
 from kafka_client import KafkaProducerClient, create_inbound_voice_message
 from utils.circuit_breaker import get_circuit_breaker
@@ -274,7 +275,7 @@ class VoiceHandler:
         if self.openai_client is not None:
             try:
                 kwargs: dict[str, Any] = {
-                    "model": os.getenv("OPENAI_MODEL", "openai/gpt-4o"),
+                    "model": chat_model(),
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_text},
