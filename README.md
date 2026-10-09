@@ -498,6 +498,8 @@ All endpoints are in `api/main.py`. Every route needs the `X-API-Key` header **e
 `/metrics`, `/webhooks/whatsapp`, `/webhooks/webform`, `/webhooks/voice/message`,
 `/webhooks/voice/call`, and the WebSocket. The default rate limit is 100/min per IP. *Strict* means
 10/min.
+Limits are per process unless `REDIS_URL` is set, and behind the web-form proxy or an ingress
+every user shares one bucket: see [docs/RATE_LIMITING.md](docs/RATE_LIMITING.md).
 
 Error responses use the shape `{"error": "<CODE>", "message": "...", "details"?}`, with status 401,
 404, 422, 429, 500, 502, or 503.
