@@ -3,6 +3,7 @@ services:
   postgres:
     image: pgvector/pgvector:0.8.0-pg16
     container_name: techflow-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-techflow}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-techflow}
@@ -22,6 +23,7 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: techflow-zookeeper
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -33,6 +35,7 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: techflow-kafka
+    restart: unless-stopped
     depends_on:
       - zookeeper
     environment:
@@ -99,6 +102,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: techflow-api
+    restart: unless-stopped
     depends_on:
       kb-embed:
         condition: service_completed_successfully
@@ -133,6 +137,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: techflow-worker
+    restart: unless-stopped
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -176,6 +181,7 @@ services:
         NEXT_PUBLIC_COMPANY_NAME: ${COMPANY_NAME:-TechFlow Analytics}
         NEXT_PUBLIC_SUPPORT_EMAIL: ${SUPPORT_EMAIL:-support@techflow-analytics.com}
     container_name: techflow-web-form
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
@@ -193,6 +199,7 @@ services:
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: techflow-postgres-exporter
+    restart: unless-stopped
     environment:
       DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}?sslmode=disable"
     ports:
@@ -206,6 +213,7 @@ services:
   prometheus:
     image: prom/prometheus:v2.50.1
     container_name: techflow-prometheus
+    restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
@@ -222,6 +230,7 @@ services:
   grafana:
     image: grafana/grafana:10.3.3
     container_name: techflow-grafana
+    restart: unless-stopped
     ports:
       - "3001:3000"
     environment:

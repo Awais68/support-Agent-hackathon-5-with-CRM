@@ -111,6 +111,7 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 | X2 | Low | (found in P0 gate) when the agent falls back without `send_response` (circuit open, model answered in text) on webform/voice, the reply is published but never stored, so the tracking page shows nothing | Open |
 | X3 | Medium | (found by chaos 04) the worker ignores SIGTERM as PID 1, so `docker stop` / pod termination SIGKILLs it after the grace period (10.3s, exit 137); consumers never leave their groups | Fixed: SIGTERM/SIGINT cancel the worker tasks and the normal cleanup runs. Live: `docker stop` 0.6s, exit 0, "Worker shutdown complete" logged. Test: `tests/test_worker_shutdown.py` |
 | X4 | Medium | API image `CMD ["sh","-c","uvicorn …"]` left `sh` as PID 1, which ignores SIGTERM: k8s/`docker stop` SIGKILLed the API after the grace period (10.3s, exit 137) with requests in flight | Fixed: `exec uvicorn …` so uvicorn is PID 1. Rebuilt image, same env: PID 1 uvicorn, stop 1.3s, exit 0, "Shutting down application" logged |
+| X5 | Medium | (found by chaos 01) no compose service had a restart policy (`RestartPolicy=no`): a crashed API or worker stayed down until someone ran compose again; the baseline chaos run went 0/6 because the API never came back | Fixed: `restart: unless-stopped` on the long-running services (not the one-shot `migrate` / `kb-embed`). Live: API PID 1 SIGTERM → restart count +1, `/readyz` 200 again within seconds |
 | R2-5 | Low | Emotion stems in `sentiment_analyzer.py` end in `\b` | Open |
 
 ## Data clean-up (you)
