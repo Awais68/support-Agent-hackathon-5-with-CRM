@@ -757,6 +757,27 @@ async def update_message_emotion_data(
 
 
 # Knowledge base queries
+# Ticket categories (web form: general/technical/billing/bug/feedback) are not
+# the same vocabulary as knowledge_base.category (onboarding/billing/product/
+# technical). Filtering on a ticket category with no articles, e.g. "general",
+# silently returned nothing. Only categories that exist in the KB filter;
+# anything else searches the whole KB.
+KB_CATEGORY_ALIASES: dict[str, str] = {
+    "technical": "technical",
+    "bug": "technical",
+    "billing": "billing",
+    "onboarding": "onboarding",
+    "product": "product",
+}
+
+
+def kb_category_filter(category: str | None) -> str | None:
+    """Map a ticket/agent category to a KB category, or None for no filter."""
+    if not category:
+        return None
+    return KB_CATEGORY_ALIASES.get(category.strip().lower())
+
+
 async def search_knowledge_base(
     pool: asyncpg.Pool,
     embedding: list[float],
@@ -773,7 +794,29 @@ async def search_knowledge_base(
     a provider switch silently returns near-random articles at plausible-looking
     ranks. Callers should treat an empty result as "degrade to lexical search"
     rather than "no such article".
+
+    ``category`` is mapped with :func:`kb_category_filter`; if the filtered
+    search finds nothing, the search is repeated without the category.
     """
+    category = kb_category_filter(category)
+    rows = await _search_knowledge_base_vector(
+        pool, embedding, customer_tier, category, max_results, embedding_model
+    )
+    if not rows and category:
+        rows = await _search_knowledge_base_vector(
+            pool, embedding, customer_tier, None, max_results, embedding_model
+        )
+    return rows
+
+
+async def _search_knowledge_base_vector(
+    pool: asyncpg.Pool,
+    embedding: list[float],
+    customer_tier: str,
+    category: str | None,
+    max_results: int,
+    embedding_model: str | None,
+) -> list[dict[str, Any]]:
     async with pool.acquire() as conn:
         # Build query with tier filtering
         where_clause = "(kb.tier = $3 OR kb.tier = 'all')"
@@ -823,7 +866,24 @@ async def search_knowledge_base_text(
     from AND to OR semantics, which keeps stemming and stopword removal while
     letting any single meaningful term hit; ILIKE and trigram matching stay as
     extra recall for short queries and misspellings.
+
+    ``category`` is mapped with :func:`kb_category_filter`; if the filtered
+    search finds nothing, the search is repeated without the category.
     """
+    category = kb_category_filter(category)
+    rows = await _search_knowledge_base_lexical(pool, query, customer_tier, category, max_results)
+    if not rows and category:
+        rows = await _search_knowledge_base_lexical(pool, query, customer_tier, None, max_results)
+    return rows
+
+
+async def _search_knowledge_base_lexical(
+    pool: asyncpg.Pool,
+    query: str,
+    customer_tier: str,
+    category: str | None,
+    max_results: int,
+) -> list[dict[str, Any]]:
     async with pool.acquire() as conn:
         where_clause = "(kb.tier = $2 OR kb.tier = 'all')"
         params = [query, customer_tier, max_results]

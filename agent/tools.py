@@ -60,7 +60,10 @@ OPENAI_TOOL_SCHEMAS = [
                     },
                     "category": {
                         "type": "string",
-                        "description": "Optional category filter: 'technical', 'billing', 'onboarding', 'general'",
+                        "description": (
+                            "Optional KB category filter: 'technical', 'billing', "
+                            "'onboarding' or 'product'. Omit it for general questions."
+                        ),
                     },
                     "max_results": {
                         "type": "integer",
