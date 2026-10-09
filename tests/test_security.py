@@ -75,3 +75,73 @@ class TestApiKey:
         with pytest.raises(ConfigurationError):
             async with lifespan(app):
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Voice webhooks: Twilio signature on /voice/call, API key on /voice/message
+# ---------------------------------------------------------------------------
+TWILIO_TOKEN = "test-twilio-auth-token"
+VOICE_CALL_URL = "http://testserver/webhooks/voice/call"
+CALL_PARAMS = {"From": "+15550001111", "SpeechResult": "", "CallSid": "CA123"}
+
+
+@pytest.fixture
+def infra_client(monkeypatch):
+    """Client with mocked app.state infra so handlers get past their checks."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    for name in ("db_pool", "openai_client"):
+        monkeypatch.setattr(app.state, name, MagicMock(), raising=False)
+    producer = MagicMock()
+    producer.send_message = AsyncMock(return_value="msg")
+    monkeypatch.setattr(app.state, "kafka_producer", producer, raising=False)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+class TestVoiceCallSignature:
+    def test_missing_signature_is_403(self, infra_client, monkeypatch):
+        monkeypatch.setenv("TWILIO_AUTH_TOKEN", TWILIO_TOKEN)
+        resp = infra_client.post("/webhooks/voice/call", data=CALL_PARAMS)
+        assert resp.status_code == 403
+
+    def test_bad_signature_is_403(self, infra_client, monkeypatch):
+        monkeypatch.setenv("TWILIO_AUTH_TOKEN", TWILIO_TOKEN)
+        resp = infra_client.post(
+            "/webhooks/voice/call",
+            data=CALL_PARAMS,
+            headers={"X-Twilio-Signature": "forged"},
+        )
+        assert resp.status_code == 403
+
+    def test_no_auth_token_configured_fails_closed(self, infra_client, monkeypatch):
+        monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
+        resp = infra_client.post(
+            "/webhooks/voice/call",
+            data=CALL_PARAMS,
+            headers={"X-Twilio-Signature": "anything"},
+        )
+        assert resp.status_code == 403
+
+    def test_valid_signature_is_accepted(self, infra_client, monkeypatch):
+        from twilio.request_validator import RequestValidator
+
+        monkeypatch.setenv("TWILIO_AUTH_TOKEN", TWILIO_TOKEN)
+        signature = RequestValidator(TWILIO_TOKEN).compute_signature(
+            VOICE_CALL_URL, CALL_PARAMS
+        )
+        resp = infra_client.post(
+            "/webhooks/voice/call",
+            data=CALL_PARAMS,
+            headers={"X-Twilio-Signature": signature},
+        )
+        # Empty SpeechResult -> greeting TwiML.
+        assert resp.status_code == 200
+        assert "<Gather" in resp.text
+
+
+class TestVoiceMessageAuth:
+    def test_requires_api_key(self, infra_client):
+        resp = infra_client.post(
+            "/webhooks/voice/message", json={"audio_base64": "AAAA"}
+        )
+        assert resp.status_code == 401

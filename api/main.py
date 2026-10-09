@@ -24,6 +24,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from twilio.request_validator import RequestValidator
 
 # Load .env BEFORE the first-party imports below: `uvicorn api.main:app` bypasses
 # main.py's entrypoint, and modules like api.rate_limiter read os.getenv() at
@@ -252,7 +253,7 @@ async def verify_api_key(
         "/metrics",
         "/webhooks/whatsapp",
         "/webhooks/webform",
-        "/webhooks/voice/message",
+        # Authenticated by Twilio signature inside the handler, not by API key.
         "/webhooks/voice/call",
     ]:
         return True
@@ -863,6 +864,25 @@ async def webhook_voice_message(
     return result.to_dict()
 
 
+def _require_twilio_signature(request: Request, params: dict[str, str]) -> None:
+    """Reject a Twilio webhook unless its X-Twilio-Signature is valid.
+
+    Fails closed: without TWILIO_AUTH_TOKEN nothing can be verified, so the
+    request is refused. TWILIO_VOICE_WEBHOOK_URL overrides the URL used for
+    the check when a proxy terminates TLS and request.url would differ from
+    the public URL Twilio signed.
+    """
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not auth_token:
+        logger.error("Rejected Twilio voice webhook: TWILIO_AUTH_TOKEN not configured")
+        raise HTTPException(status_code=403, detail="Webhook signature validation unavailable")
+    url = os.getenv("TWILIO_VOICE_WEBHOOK_URL") or str(request.url)
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature or not RequestValidator(auth_token).validate(url, params, signature):
+        logger.warning("Rejected Twilio voice webhook: invalid signature")
+        raise HTTPException(status_code=403, detail="Invalid webhook signature")
+
+
 @app.post("/webhooks/voice/call")
 @limiter.limit(strict_limit)
 async def webhook_voice_call(request: Request) -> Response:
@@ -872,6 +892,7 @@ async def webhook_voice_call(request: Request) -> Response:
     request, then the agent's spoken reply in the customer's own language.
     """
     form = await request.form()
+    _require_twilio_signature(request, {k: str(v) for k, v in form.items()})
     speech_result = str(form.get("SpeechResult") or "").strip()
     try:
         speech_confidence = float(str(form.get("Confidence") or 1.0))
