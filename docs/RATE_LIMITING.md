@@ -13,14 +13,28 @@ it behind a proxy. Code: `api/rate_limiter.py` (slowapi), decorators in
 | Strict | 10/min | `STRICT_RATE_LIMIT_PER_MINUTE` | `POST /tickets/{id}/reply`, `/webhooks/whatsapp`, `/webhooks/webform`, `/webhooks/voice/message`, `/webhooks/voice/call`, `/voice/transcribe`, `/voice/translate`, `POST /customers/{id}/merge`, `/knowledge-base/ingest` |
 | Fixed | 20/min | — | `POST /tickets` |
 | Fixed | 30/min | — | `GET /public/tickets/{number}`, `/customers/{email}/history`, `/customers/review-queue`, `POST /customers/{id}/review/dismiss` |
+| Global budget | 300/hour, all clients together | `PUBLIC_LLM_BUDGET_PER_HOUR` | `/webhooks/webform`, `/webhooks/voice/message` (one shared bucket) |
 | Exempt | — | — | `/health`, `/livez`, `/readyz` (metrics are on the internal port 9100, outside the app) |
 
 The WebSocket is not rate limited. Over the limit the API answers
 `429 {"error":"RATE_LIMIT_EXCEEDED"}` with `Retry-After`.
 
-Limits apply per key, and the key is the TCP peer address
-(`slowapi.util.get_remote_address`). There is no per-account, per-email or
-global limit.
+Limits apply per key. The key is `client_ip()` in `api/rate_limiter.py`: the
+TCP peer address, or, when the peer is listed in `TRUSTED_PROXIES`, the
+right-most `X-Forwarded-For` hop that is not itself a trusted proxy. The
+global budget uses one key for everyone, so it is a spend circuit breaker:
+rotating IPs does not get around it. When it is used up, the form answers
+429 for every visitor until the hour window moves on. Size it to the LLM
+spend you accept per hour. There is no per-account or per-email limit.
+
+## Body size and error echo
+
+Requests without a valid API key may not send a body over
+`PUBLIC_MAX_BODY_BYTES` (default 64 KB): 413 from the key middleware before
+the body is read, 411 for a chunked body without `Content-Length`. The voice
+message route keeps its own larger cap (`VOICE_MAX_AUDIO_BYTES`). Validation
+errors (422) list the field and the reason but no longer echo the submitted
+`input`.
 
 ## Storage: one bucket per process unless `REDIS_URL` is set
 
@@ -42,7 +56,7 @@ If Redis is unreachable, slowapi raises on the request rather than silently
 skipping the limit. Treat Redis as a hard dependency of the API once it is
 configured.
 
-## Key: behind a proxy every user shares one bucket
+## Key: behind a proxy every user shares one bucket (unless trusted)
 
 The key is whoever opened the TCP connection to uvicorn. That is the end user
 only when nothing sits in front of the API. In this repo something always
@@ -68,17 +82,25 @@ counted against one 30/min bucket. Two effects:
 Do not "fix" this by keying on `X-Forwarded-For` as sent. A client can set
 that header to any value and get a fresh bucket on every request.
 
-### What a correct setup needs (not implemented; tracked as G2/S8)
+### Trusted proxies (`TRUSTED_PROXIES`)
 
-1. Make the proxies append the real client address. The Next.js route
-   handlers (`/api/tickets/[id]`, `/api/voice`) build a new request and
-   forward no client headers today. Check that the `/webhooks` rewrite sets
-   `X-Forwarded-For`, and make the ingress or edge in front add its own.
-2. Trust that header only from known proxies. Run uvicorn with
-   `--proxy-headers --forwarded-allow-ips=<web-form / ingress CIDRs>`. Never
-   use `*` on a port that is reachable from the internet. Uvicorn then sets
-   the client address from the right-most untrusted hop, and
-   `get_remote_address` returns the real client.
+`TRUSTED_PROXIES` is a comma-separated list of IPs or CIDRs, empty by
+default. Only from those peers is `X-Forwarded-For` read; from anyone else it
+is ignored, so a direct caller cannot rotate it for a fresh bucket
+(`tests/test_public_abuse_limits.py`).
+
+1. List a proxy only if it **appends** the address it saw to
+   `X-Forwarded-For` (nginx ingress, Render's edge, a load balancer). The
+   web-form container does not qualify: Next.js only sets
+   `X-Forwarded-For` when the header is missing (`??=` in `base-server.js`)
+   and passes a client-sent value through unchanged, and the route handlers
+   (`/api/tickets/[id]`, `/api/voice`) forward no client headers at all.
+   Trusting it would let any browser pick its own bucket. So in compose
+   `TRUSTED_PROXIES` stays empty and customers behind the web form still
+   share one per-IP bucket; the global budget is what caps spend there.
+2. The value depends on the deployment (ingress pod CIDR, Render's edge
+   ranges); compose gives the web-form container a dynamic address, which is
+   another reason not to set it there.
 3. Keep the API port unreachable except through those proxies (k8s
    NetworkPolicy, no public port mapping), otherwise a client can bypass the
    proxy and send its own header.
@@ -88,4 +110,4 @@ that header to any value and get a fresh bucket on every request.
    get their own budget, so a global spend circuit breaker and a CAPTCHA /
    Turnstile on the form are still needed (AUDIT S8).
 
-Until 1–3 are done, treat the limits as a coarse global throttle per proxy.
+CAPTCHA / Turnstile on the public form is still not done (AUDIT S8).

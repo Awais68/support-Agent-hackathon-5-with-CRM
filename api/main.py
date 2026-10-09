@@ -46,7 +46,12 @@ load_environment()
 
 from agent.customer_success_agent import AgentContext, CustomerSuccessAgent  # noqa: E402
 from api import tracking  # noqa: E402
-from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit  # noqa: E402
+from api.rate_limiter import (  # noqa: E402
+    limiter,
+    public_llm_limit,
+    rate_limit_exceeded_handler,
+    strict_limit,
+)
 from api.websocket_manager import WebSocketManager  # noqa: E402
 from channels.voice_handler import VoiceHandler, twilio_language  # noqa: E402
 from channels.web_form_handler import WebFormHandler, WebFormSubmission  # noqa: E402
@@ -309,6 +314,30 @@ def _voice_body_rejection(request: Request) -> JSONResponse | None:
     return None
 
 
+def public_max_body_bytes() -> int:
+    return int(os.getenv("PUBLIC_MAX_BODY_BYTES", str(64 * 1024)))
+
+
+def _public_body_rejection(request: Request) -> JSONResponse | None:
+    """413/411 for keyless bodies over PUBLIC_MAX_BODY_BYTES (S8).
+
+    Without a key, a body is never read past the cap: the web form, WhatsApp
+    and public routes need a few KB. Voice has its own, larger cap.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS", "DELETE"):
+        return None
+    if request.url.path == VOICE_MESSAGE_PATH or has_valid_api_key(request.headers):
+        return None
+    length = request.headers.get("content-length")
+    if length is None:
+        if request.headers.get("transfer-encoding"):
+            return JSONResponse(status_code=411, content={"detail": "Content-Length required"})
+        return None
+    if not length.isdigit() or int(length) > public_max_body_bytes():
+        return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+    return None
+
+
 async def verify_api_key(request: Request, x_api_key: str | None = Header(None)) -> bool:
     """Verify API key for non-webhook endpoints."""
     if PUBLIC_TICKET_PATH_RE.match(request.url.path):
@@ -452,7 +481,7 @@ async def api_key_middleware(request: Request, call_next):
     # answer them instead of rejecting them with a 401.
     if request.method == "OPTIONS":
         return await call_next(request)
-    rejection = _voice_body_rejection(request)
+    rejection = _voice_body_rejection(request) or _public_body_rejection(request)
     if rejection is not None:
         return rejection
     try:
@@ -943,6 +972,7 @@ async def webhook_whatsapp(
 
 @app.post("/webhooks/webform", response_model=dict[str, Any], status_code=201)
 @limiter.limit(strict_limit)
+@public_llm_limit
 async def webhook_webform(
     request: Request,
     body: WebFormSubmission,
@@ -1107,6 +1137,7 @@ async def _run_voice_agent(
 
 @app.post("/webhooks/voice/message", response_model=dict[str, Any])
 @limiter.limit(strict_limit)
+@public_llm_limit
 async def webhook_voice_message(
     request: Request,
     body: VoiceMessageRequest,
@@ -1536,10 +1567,14 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 def _sanitize_validation_errors(errors: Sequence[Any]) -> list[dict[str, Any]]:
-    """Make Pydantic error contexts JSON-safe (exceptions aren't serializable)."""
+    """Make Pydantic errors JSON-safe and drop the submitted input.
+
+    Echoing `input` sent attacker-sized bodies (and other people's data in
+    logs) straight back (S8); the field location and message are enough.
+    """
     cleaned: list[dict[str, Any]] = []
     for err in errors:
-        item = dict(err)
+        item = {k: v for k, v in dict(err).items() if k not in ("input", "url")}
         ctx = item.get("ctx")
         if isinstance(ctx, dict):
             item["ctx"] = {
@@ -1586,7 +1621,7 @@ async def pydantic_validation_handler(request: Request, exc: PydanticValidationE
     """Handle Pydantic validation errors."""
     logger.warning(
         "Pydantic validation error",
-        errors=exc.errors(),
+        errors=_sanitize_validation_errors(exc.errors()),
         path=request.url.path,
     )
     return JSONResponse(
@@ -1594,7 +1629,7 @@ async def pydantic_validation_handler(request: Request, exc: PydanticValidationE
         content={
             "error": "VALIDATION_ERROR",
             "message": "Request validation failed",
-            "details": exc.errors(),
+            "details": _sanitize_validation_errors(exc.errors()),
         },
     )
 

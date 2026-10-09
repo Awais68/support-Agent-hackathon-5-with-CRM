@@ -374,6 +374,9 @@ Precedence (`env_config.py`): shell env > `.env.<ENVIRONMENT>` > `.env`. `ENVIRO
 | `DEBUG` | empty | Truthy values add tracebacks to error responses |
 | `RATE_LIMIT_PER_MINUTE` | `100` | Global per-IP limit |
 | `STRICT_RATE_LIMIT_PER_MINUTE` | `10` | Limit for webhooks, reply, ingest, and merge |
+| `PUBLIC_LLM_BUDGET_PER_HOUR` | `300` | Total web form + voice message submissions per hour, all clients together (spend cap) |
+| `PUBLIC_MAX_BODY_BYTES` | `65536` | Largest body accepted without an API key (413 above it; voice has its own cap) |
+| `TRUSTED_PROXIES` | empty | IPs/CIDRs whose `X-Forwarded-For` is trusted for rate limiting. Only proxies that append the client address; see docs/RATE_LIMITING.md |
 | `REDIS_URL` | empty (in-memory) | Shared rate-limit storage, e.g. `redis://localhost:6379/0` |
 
 ### Database
