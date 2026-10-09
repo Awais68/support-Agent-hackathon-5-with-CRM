@@ -148,6 +148,18 @@ async def test_redelivered_event_is_not_sent_twice(pool):
     assert sender._email_sender.await_count == 1
 
 
+async def test_rerun_for_same_inbound_message_is_not_sent_twice(pool):
+    """N4: a worker that crashed and re-ran the agent publishes a second
+    reply with a new agent_run_id; the customer still gets one message."""
+    ticket_id = await _ticket(pool)
+    sender = _sender(pool)
+    inbound = str(uuid.uuid4())
+
+    assert await sender.handle(_event(ticket_id, source_message_id=inbound)) == "sent"
+    assert await sender.handle(_event(ticket_id, source_message_id=inbound)) == "duplicate"
+    assert sender._email_sender.await_count == 1
+
+
 async def test_whatsapp_reply_goes_to_customer_phone(pool):
     ticket_id = await _ticket(pool, phone="+15550001111")
     sender = _sender(pool)

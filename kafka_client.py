@@ -10,7 +10,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import structlog
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
@@ -239,8 +239,18 @@ class NoOpKafkaProducer:
         return "noop-" + str(UUID(int=int(datetime.now().timestamp() * 1000000)))
 
 
+class NonRetryableError(Exception):
+    """Retrying cannot help; the consumer dead-letters the message at once."""
+
+
 class KafkaConsumerClient:
-    """Async Kafka consumer with error handling."""
+    """Async Kafka consumer with at-least-once delivery.
+
+    Offsets are committed by hand, one message at a time, and only after the
+    handler succeeded or the message was dead-lettered. A crash at any point
+    before that leaves the offset uncommitted, so the message is delivered
+    again; handlers must therefore be idempotent (see inbound_processing).
+    """
 
     def __init__(self, bootstrap_servers: str, group_id: str):
         self.bootstrap_servers = bootstrap_servers
@@ -269,7 +279,9 @@ class KafkaConsumerClient:
             group_id=self.group_id,
             value_deserializer=lambda m: m.decode("utf-8"),
             auto_offset_reset="earliest",
-            enable_auto_commit=True,
+            # Committing on fetch lost every message whose handler failed or
+            # whose worker died mid-run (AUDIT N4).
+            enable_auto_commit=False,
             **self._sasl_config(),
         )
         await self.consumer.start()
@@ -290,45 +302,141 @@ class KafkaConsumerClient:
         self,
         on_message: Callable[[KafkaMessage], Any],
         timeout_ms: int = 1000,
+        dlq_producer: Any = None,
+        max_attempts: int | None = None,
+        retry_backoff_seconds: float | None = None,
     ) -> None:
-        """Consume messages from subscribed topics."""
+        """Consume messages, retrying the handler and dead-lettering failures.
+
+        Each message is tried up to ``max_attempts`` times (env
+        ``KAFKA_HANDLER_MAX_ATTEMPTS``, default 3) with exponential backoff.
+        After the last failure it is published to the DLQ via
+        ``dlq_producer``; only then is its offset committed. If the DLQ write
+        itself fails, the error propagates without committing.
+        """
         if not self.consumer:
             raise RuntimeError("Consumer not started")
+        attempts_allowed = max_attempts or int(os.getenv("KAFKA_HANDLER_MAX_ATTEMPTS", "3"))
+        backoff = (
+            retry_backoff_seconds
+            if retry_backoff_seconds is not None
+            else float(os.getenv("KAFKA_HANDLER_RETRY_BACKOFF_SECONDS", "1"))
+        )
 
         try:
             async for raw_message in self.consumer:
-                message = None
                 try:
                     message = KafkaMessage.from_json(raw_message.value)
-                    logger.info(
-                        "Message received",
-                        topic=message.topic,
-                        message_id=message.message_id,
-                    )
-
-                    # Call handler
-                    result = on_message(message)
-                    if inspect.iscoroutine(result) or isinstance(result, asyncio.Task):
-                        await result
-
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
                     logger.error(
                         "Failed to parse message",
                         error=str(e),
-                        raw_value=raw_message.value[:200],
+                        raw_value=str(raw_message.value)[:200],
                     )
-                except Exception as e:
-                    logger.error(
-                        "Handler error",
-                        error=sanitize_error_message(str(e)),
-                        message_topic=getattr(message, "topic", None) or "unknown",
+                    await self._dead_letter(
+                        dlq_producer,
+                        raw_message,
+                        {"raw_value": str(raw_message.value)[:10000]},
+                        f"unparseable: {e}",
+                        attempts=0,
                     )
+                    await self._commit(raw_message)
+                    continue
+
+                logger.info(
+                    "Message received",
+                    topic=message.topic,
+                    message_id=message.message_id,
+                )
+                error = await self._handle_with_retries(
+                    on_message, message, attempts_allowed, backoff
+                )
+                if error is not None:
+                    attempts, exc = error
+                    await self._dead_letter(
+                        dlq_producer,
+                        raw_message,
+                        {"message_id": message.message_id, "payload": message.payload},
+                        sanitize_error_message(str(exc)),
+                        attempts=attempts,
+                        original_topic=message.topic,
+                    )
+                await self._commit(raw_message)
 
         except asyncio.CancelledError:
             logger.info("Consumer cancelled")
         except Exception as e:
             logger.error("Consumer error", error=sanitize_error_message(str(e)))
             raise
+
+    async def _handle_with_retries(
+        self,
+        on_message: Callable[[KafkaMessage], Any],
+        message: KafkaMessage,
+        attempts_allowed: int,
+        backoff: float,
+    ) -> tuple[int, Exception] | None:
+        """Run the handler; return (attempts, last error) if it never succeeded."""
+        for attempt in range(1, attempts_allowed + 1):
+            try:
+                result = on_message(message)
+                if inspect.iscoroutine(result) or isinstance(result, asyncio.Task):
+                    await result
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                final = isinstance(e, NonRetryableError) or attempt == attempts_allowed
+                logger.error(
+                    "Handler error",
+                    error=sanitize_error_message(str(e)),
+                    message_topic=message.topic,
+                    message_id=message.message_id,
+                    attempt=attempt,
+                    will_retry=not final,
+                )
+                if final:
+                    return attempt, e
+                if backoff:
+                    await asyncio.sleep(backoff * 2 ** (attempt - 1))
+        return None
+
+    async def _dead_letter(
+        self,
+        dlq_producer: Any,
+        raw_message: Any,
+        body: dict,
+        error: str,
+        attempts: int,
+        original_topic: str | None = None,
+    ) -> None:
+        if dlq_producer is None:
+            # Nowhere to park it: keep the offset so the message is not lost.
+            raise RuntimeError("Handler failed and no DLQ producer is configured")
+        await dlq_producer.send_message(
+            DLQ_TOPIC,
+            {
+                "original_topic": original_topic or raw_message.topic,
+                "kafka_topic": raw_message.topic,
+                "partition": raw_message.partition,
+                "offset": raw_message.offset,
+                "consumer_group": self.group_id,
+                "attempts": attempts,
+                "error": error,
+                "timestamp": datetime.now(UTC).isoformat(),
+                **body,
+            },
+        )
+        logger.warning(
+            "Message dead-lettered",
+            topic=raw_message.topic,
+            offset=raw_message.offset,
+            attempts=attempts,
+        )
+
+    async def _commit(self, raw_message: Any) -> None:
+        tp = TopicPartition(raw_message.topic, raw_message.partition)
+        await self.consumer.commit({tp: raw_message.offset + 1})
 
 
 def create_inbound_email_message(

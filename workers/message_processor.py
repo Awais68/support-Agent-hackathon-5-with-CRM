@@ -2,11 +2,12 @@
 
 import asyncio
 import os
+from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 import asyncpg
 import structlog
-from openai import APIError as OpenAIAPIError
 
 from agent.customer_success_agent import (
     AgentContext,
@@ -25,6 +26,7 @@ from kafka_client import (
     KafkaConsumerClient,
     KafkaMessage,
     KafkaProducerClient,
+    NonRetryableError,
     NoOpKafkaProducer,
 )
 from utils.redact import redact_dsn
@@ -32,6 +34,20 @@ from workers.metrics_collector import run_metrics_collector
 from workers.notification_sender import run_notification_sender_loop
 
 logger = structlog.get_logger(__name__)
+
+# A message redelivered this many times (worker crash loop, poison input) is
+# dead-lettered instead of being tried again.
+MAX_DELIVERIES = int(os.getenv("INBOUND_MAX_DELIVERIES", "10"))
+
+
+@dataclass
+class _Delivery:
+    """One delivery of an inbound message, as claimed in the ledger."""
+
+    message_id: str
+    attempt: int
+    ticket_id: UUID | None
+    claimed_at: datetime | None
 
 
 class MessageProcessor:
@@ -47,19 +63,43 @@ class MessageProcessor:
         self.embedding_provider = build_embedding_provider(self.openai_client)
 
     async def process_message(self, message: KafkaMessage) -> None:
-        """Process an inbound message."""
-        try:
-            topic = message.topic
-            payload = message.payload
+        """Process an inbound message; raise on failure.
 
+        Delivery is at-least-once, so the message is first claimed in the
+        inbound_processing ledger: a redelivery of a finished message is
+        skipped, and one that died part-way resumes on the ticket it already
+        created. Errors propagate so the consumer retries and finally
+        dead-letters the message instead of dropping it (AUDIT N4).
+        """
+        topic = message.topic
+        payload = message.payload
+        claim = await db.claim_inbound_message(self.db_pool, message.message_id, topic)
+        if claim is None:
             logger.info(
-                "Processing message",
+                "Inbound message already handled; skipping redelivery",
                 topic=topic,
                 message_id=message.message_id,
-                payload_keys=list(payload.keys()),
             )
+            return
+        delivery = _Delivery(
+            message_id=message.message_id,
+            attempt=claim["attempts"],
+            ticket_id=claim["ticket_id"],
+            claimed_at=claim["created_at"],
+        )
+        if delivery.attempt > MAX_DELIVERIES:
+            reason = f"gave up after {delivery.attempt - 1} deliveries"
+            await db.record_inbound_error(self.db_pool, message.message_id, reason, dead=True)
+            raise NonRetryableError(reason)
 
-            # Create agent context
+        logger.info(
+            "Processing message",
+            topic=topic,
+            message_id=message.message_id,
+            attempt=delivery.attempt,
+            payload_keys=list(payload.keys()),
+        )
+        try:
             agent_context = AgentContext(
                 db_pool=self.db_pool,
                 kafka_producer=self.kafka_producer,
@@ -67,30 +107,66 @@ class MessageProcessor:
                 embedding_provider=self.embedding_provider,
                 logger=logger,
             )
-
-            # Build agent
             agent = await build_agent(agent_context)
 
-            # Route by topic
             if topic == INBOUND_EMAIL_TOPIC:
-                await self._process_email_message(agent, payload)
+                await self._process_email_message(agent, payload, delivery)
             elif topic == INBOUND_WHATSAPP_TOPIC:
-                await self._process_whatsapp_message(agent, payload)
+                await self._process_whatsapp_message(agent, payload, delivery)
             elif topic == INBOUND_WEBFORM_TOPIC:
-                await self._process_webform_message(agent, payload)
+                await self._process_webform_message(agent, payload, delivery)
             else:
                 logger.warning("Unknown topic", topic=topic)
-
-        except (asyncpg.PostgresError, OpenAIAPIError, ConnectionError, Exception) as e:
+        except Exception as e:
+            error = sanitize_error_message(str(e))
             logger.error(
                 "Error processing message",
-                error=sanitize_error_message(str(e)),
-                topic=message.topic,
+                error=error,
+                topic=topic,
                 message_id=message.message_id,
+                attempt=delivery.attempt,
             )
-            # Message will be retried by consumer
+            try:
+                await db.record_inbound_error(self.db_pool, message.message_id, error)
+            except Exception:
+                logger.warning("Could not record inbound error", message_id=message.message_id)
+            raise
 
-    async def _process_email_message(self, agent, payload: dict) -> None:
+        await db.mark_inbound_done(self.db_pool, message.message_id)
+
+    async def _ticket_for(self, delivery: "_Delivery", create) -> dict:
+        """The ticket an earlier delivery created, or a new one via ``create``."""
+        if delivery.ticket_id:
+            ticket = await db.get_ticket(self.db_pool, delivery.ticket_id)
+            if ticket:
+                return ticket
+        ticket = await create()
+        await db.set_inbound_ticket(self.db_pool, delivery.message_id, ticket["id"])
+        return ticket
+
+    async def _answer(self, agent, delivery: "_Delivery", ticket: dict, **kwargs) -> None:
+        """Run the agent unless an earlier delivery already answered."""
+        if (
+            delivery.attempt > 1
+            and delivery.claimed_at is not None
+            and await db.has_completed_agent_run_since(
+                self.db_pool, ticket["id"], delivery.claimed_at
+            )
+        ):
+            logger.info(
+                "Agent already answered this message; not running it again",
+                ticket_number=ticket["ticket_number"],
+                message_id=delivery.message_id,
+            )
+            return
+        await agent.process_customer_message(
+            ticket_id=ticket["id"],
+            ticket_number=ticket["ticket_number"],
+            source_message_id=delivery.message_id,
+            **kwargs,
+        )
+
+    async def _process_email_message(self, agent, payload: dict, delivery: "_Delivery") -> None:
         """Process an email message."""
         try:
             customer_email = payload.get("customer_email", "")
@@ -111,26 +187,29 @@ class MessageProcessor:
                 name=sender_name,
             )
 
-            ticket = await db.create_ticket(
-                self.db_pool,
-                customer_email=customer_email,
-                customer_id=customer["id"],
-                subject=subject,
-                category="general",
-                priority="medium",
-                channel="email",
-                initial_message=body,
+            ticket = await self._ticket_for(
+                delivery,
+                lambda: db.create_ticket(
+                    self.db_pool,
+                    customer_email=customer_email,
+                    customer_id=customer["id"],
+                    subject=subject,
+                    category="general",
+                    priority="medium",
+                    channel="email",
+                    initial_message=body,
+                ),
             )
 
-            # Process with agent
-            await agent.process_customer_message(
-                ticket_id=ticket["id"],
+            await self._answer(
+                agent,
+                delivery,
+                ticket,
                 customer_id=customer["id"],
                 customer_email=customer_email,
                 customer_name=sender_name,
                 message=body,
                 channel="email",
-                ticket_number=ticket["ticket_number"],
             )
 
             logger.info("Email processed successfully", ticket_number=ticket["ticket_number"])
@@ -139,7 +218,7 @@ class MessageProcessor:
             logger.error("Error processing email message", error=sanitize_error_message(str(e)))
             raise
 
-    async def _process_whatsapp_message(self, agent, payload: dict) -> None:
+    async def _process_whatsapp_message(self, agent, payload: dict, delivery: "_Delivery") -> None:
         """Process a WhatsApp message."""
         try:
             customer_phone = payload.get("customer_phone", "")
@@ -160,26 +239,29 @@ class MessageProcessor:
             )
             customer_email = customer["email"]
 
-            ticket = await db.create_ticket(
-                self.db_pool,
-                customer_email=customer_email,
-                customer_id=customer["id"],
-                subject=f"WhatsApp: {message_body[:50]}",
-                category="general",
-                priority="medium",
-                channel="whatsapp",
-                initial_message=message_body,
+            ticket = await self._ticket_for(
+                delivery,
+                lambda: db.create_ticket(
+                    self.db_pool,
+                    customer_email=customer_email,
+                    customer_id=customer["id"],
+                    subject=f"WhatsApp: {message_body[:50]}",
+                    category="general",
+                    priority="medium",
+                    channel="whatsapp",
+                    initial_message=message_body,
+                ),
             )
 
-            # Process with agent
-            await agent.process_customer_message(
-                ticket_id=ticket["id"],
+            await self._answer(
+                agent,
+                delivery,
+                ticket,
                 customer_id=customer["id"],
                 customer_email=customer_email,
                 customer_name=customer_name,
                 message=message_body,
                 channel="whatsapp",
-                ticket_number=ticket["ticket_number"],
             )
 
             logger.info(
@@ -190,7 +272,7 @@ class MessageProcessor:
             logger.error("Error processing WhatsApp message", error=sanitize_error_message(str(e)))
             raise
 
-    async def _process_webform_message(self, agent, payload: dict) -> None:
+    async def _process_webform_message(self, agent, payload: dict, delivery: "_Delivery") -> None:
         """Process a web form message."""
         try:
             customer_email = payload.get("customer_email", "")
@@ -225,17 +307,18 @@ class MessageProcessor:
             # The API already created the ticket when it accepted the submission;
             # reuse it so the customer does not end up with two tickets.
             existing_ticket_id = payload.get("ticket_id")
-            ticket = None
-            if existing_ticket_id:
-                ticket = await db.get_ticket(self.db_pool, UUID(str(existing_ticket_id)))
-                if not ticket:
+            if existing_ticket_id and not delivery.ticket_id:
+                if await db.get_ticket(self.db_pool, UUID(str(existing_ticket_id))):
+                    delivery.ticket_id = UUID(str(existing_ticket_id))
+                else:
                     logger.warning(
                         "Webform payload referenced an unknown ticket; creating a new one",
                         ticket_id=str(existing_ticket_id),
                     )
 
-            if ticket is None:
-                ticket = await db.create_ticket(
+            ticket = await self._ticket_for(
+                delivery,
+                lambda: db.create_ticket(
                     self.db_pool,
                     customer_email=customer_email,
                     customer_id=customer["id"],
@@ -244,17 +327,18 @@ class MessageProcessor:
                     priority=priority,
                     channel="webform",
                     initial_message=message_body,
-                )
+                ),
+            )
 
-            # Process with agent
-            await agent.process_customer_message(
-                ticket_id=ticket["id"],
+            await self._answer(
+                agent,
+                delivery,
+                ticket,
                 customer_id=customer["id"],
                 customer_email=customer_email,
                 customer_name=customer_name,
                 message=message_body,
                 channel="webform",
-                ticket_number=ticket["ticket_number"],
             )
 
             logger.info("Web form processed successfully", ticket_number=ticket["ticket_number"])
@@ -285,6 +369,7 @@ async def run_kafka_consumer_loop(
         await consumer.consume_messages(
             on_message=processor.process_message,
             timeout_ms=1000,
+            dlq_producer=kafka_producer,
         )
     except asyncio.CancelledError:
         logger.info("Consumer cancelled")

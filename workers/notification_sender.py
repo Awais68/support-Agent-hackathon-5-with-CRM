@@ -5,8 +5,10 @@ consumer turns that event into a Gmail or WhatsApp send.
 
 Delivery guarantees:
 - Idempotent: each reply is claimed in ``outbound_deliveries`` (migration
-  011) under ``agent_run:<id>`` before the provider is called, so a
-  redelivered Kafka message is not sent twice.
+  011) before the provider is called, under ``inbound:<message id>`` (the
+  inbound message being answered) or, for events without one,
+  ``agent_run:<id>``. A redelivered Kafka message, or an agent re-run after
+  a worker crash, is not sent twice.
 - Retried: provider errors are retried with exponential backoff up to
   ``OUTBOUND_MAX_ATTEMPTS`` (default 3).
 - Dead-lettered: after the last attempt the row is marked ``failed`` and the
@@ -222,7 +224,10 @@ class OutboundSender:
         except ValueError:
             ticket_id = None
 
-        key = f"agent_run:{agent_run_id}"
+        # One reply per inbound message: after a crash the worker may re-run
+        # the agent (new agent_run_id) for the same inbound message.
+        source_message_id = payload.get("source_message_id")
+        key = f"inbound:{source_message_id}" if source_message_id else f"agent_run:{agent_run_id}"
         if not await self._claim(key, ticket_id, channel or "unknown"):
             logger.info("Outbound reply already handled", idempotency_key=key)
             return "duplicate"
@@ -318,7 +323,9 @@ async def run_notification_sender_loop(
 
     await consumer.start([NOTIFICATIONS_OUTBOUND_TOPIC])
     try:
-        await consumer.consume_messages(on_message=sender.handle, timeout_ms=1000)
+        await consumer.consume_messages(
+            on_message=sender.handle, timeout_ms=1000, dlq_producer=kafka_producer
+        )
     except asyncio.CancelledError:
         logger.info("Notification sender cancelled")
     finally:

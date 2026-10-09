@@ -970,6 +970,100 @@ async def update_message_sentiment(
         return dict(row) if row else None
 
 
+# Inbound processing ledger (migration 012)
+async def claim_inbound_message(
+    pool: asyncpg.Pool, message_id: str, topic: str
+) -> dict[str, Any] | None:
+    """Claim an inbound message for processing.
+
+    Returns the ledger row (status, attempts, ticket_id, created_at) when this
+    delivery should run, or None when the message is already done or dead.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO inbound_processing (message_id, topic)
+            VALUES ($1, $2)
+            ON CONFLICT (message_id) DO UPDATE
+                SET attempts = inbound_processing.attempts + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE inbound_processing.status = 'processing'
+            RETURNING status, attempts, ticket_id, created_at
+            """,
+            message_id,
+            topic,
+        )
+        return dict(row) if row else None
+
+
+async def set_inbound_ticket(pool: asyncpg.Pool, message_id: str, ticket_id: UUID) -> None:
+    """Remember the ticket a message created, so a redelivery reuses it."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE inbound_processing
+            SET ticket_id = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE message_id = $1
+            """,
+            message_id,
+            ticket_id,
+        )
+
+
+async def mark_inbound_done(pool: asyncpg.Pool, message_id: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE inbound_processing
+            SET status = 'done', last_error = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE message_id = $1
+            """,
+            message_id,
+        )
+
+
+async def record_inbound_error(
+    pool: asyncpg.Pool, message_id: str, error: str, dead: bool = False
+) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE inbound_processing
+            SET last_error = $2,
+                status = CASE WHEN $3 THEN 'dead' ELSE status END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE message_id = $1
+            """,
+            message_id,
+            error[:2000],
+            dead,
+        )
+
+
+async def has_completed_agent_run_since(
+    pool: asyncpg.Pool, ticket_id: UUID, since: datetime
+) -> bool:
+    """True if the agent successfully finished a run on this ticket since ``since``.
+
+    Runs that errored are excluded, including ones written before failed runs
+    got their own status (they carry result.status = 'failed').
+    """
+    async with pool.acquire() as conn:
+        return bool(
+            await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM agent_runs
+                    WHERE ticket_id = $1 AND status = 'completed' AND created_at >= $2
+                      AND coalesce(result->>'status', '') <> 'failed'
+                )
+                """,
+                ticket_id,
+                since,
+            )
+        )
+
+
 # Agent runs queries
 async def create_agent_run(
     pool: asyncpg.Pool,
@@ -1005,15 +1099,18 @@ async def complete_agent_run(
     output_message: str,
     tokens_used: int = 0,
     result: dict[str, Any] | None = None,
+    status: str = "completed",
 ) -> dict[str, Any]:
-    """Mark agent run as completed."""
+    """Finish an agent run as ``completed`` or ``failed``."""
+    if status not in ("completed", "failed"):
+        raise ValueError(f"invalid agent run status: {status}")
     result = dict(result) if result else {}
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             UPDATE agent_runs
             SET
-                status = 'completed',
+                status = $5,
                 output_message = $1,
                 tokens_used = $2,
                 result = $3,
@@ -1026,6 +1123,7 @@ async def complete_agent_run(
             tokens_used,
             json.dumps(result),
             agent_run_id,
+            status,
         )
         return dict(row) if row else {}
 

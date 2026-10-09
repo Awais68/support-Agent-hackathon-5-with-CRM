@@ -112,8 +112,14 @@ class CustomerSuccessAgent:
         message: str,
         channel: str = "email",
         ticket_number: str | None = None,
+        source_message_id: str | None = None,
     ) -> dict[str, Any]:
         """Process a customer message with agent orchestration.
+
+        ``source_message_id`` is the inbound Kafka message being answered. It
+        rides along on the outbound reply so the notification sender delivers
+        one reply per inbound message even if the worker re-runs the agent
+        after a crash.
 
         ``ticket_number`` is the customer-facing TKT-... string. Callers that
         already have it should pass it in; otherwise it is looked up.
@@ -504,7 +510,28 @@ class CustomerSuccessAgent:
                         error=sanitize_error_message(str(e)),
                     )
 
-            # Step 8: Update agent run with completion
+            # Step 8: Publish the reply, then mark the run completed. In this
+            # order a completed run always means the reply was handed to
+            # Kafka, which is what the worker checks before re-running a
+            # redelivered message (AUDIT N4).
+            await self.context.kafka_producer.send_message(
+                "notifications.outbound",
+                {
+                    "ticket_id": str(ticket_id),
+                    "customer_email": customer_email,
+                    "channel": channel,
+                    # The sender delivers customer_reply only; internal_note is
+                    # for operators and never leaves the system.
+                    "customer_reply": formatted_response,
+                    "internal_note": internal_note,
+                    "agent_run_id": str(agent_run_id),
+                    "source_message_id": source_message_id,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                },
+                key=str(ticket_id),
+            )
+
+            # Step 9: Update agent run with completion
             await db.complete_agent_run(
                 self.context.db_pool,
                 agent_run_id=agent_run_id,
@@ -524,23 +551,6 @@ class CustomerSuccessAgent:
                     "sentiment_drop_detected": sentiment_drop_detected,
                     "sentiment_drop_amount": sentiment_drop_amount,
                 },
-            )
-
-            # Step 9: Send response via Kafka
-            await self.context.kafka_producer.send_message(
-                "notifications.outbound",
-                {
-                    "ticket_id": str(ticket_id),
-                    "customer_email": customer_email,
-                    "channel": channel,
-                    # The sender delivers customer_reply only; internal_note is
-                    # for operators and never leaves the system.
-                    "customer_reply": formatted_response,
-                    "internal_note": internal_note,
-                    "agent_run_id": str(agent_run_id),
-                    "timestamp": datetime.now(UTC).isoformat(),
-                },
-                key=str(ticket_id),
             )
 
             # Step 10: Create agent completed event
@@ -610,6 +620,7 @@ class CustomerSuccessAgent:
                         agent_run_id=agent_run_id,
                         output_message=f"Error processing message: {str(e)}",
                         result={"status": "failed", "error": str(e)},
+                        status="failed",
                     )
             except Exception:
                 pass
