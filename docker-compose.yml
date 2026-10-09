@@ -179,10 +179,10 @@ services:
       - "3000:3000"
     environment:
       NODE_ENV: production
-      # Server-side route handlers (/api/tickets, /api/voice) call the API
-      # over the compose network with the shared key.
+      # Server-side route handlers (/api/tickets, /api/voice) call the API's
+      # public endpoints over the compose network. No API key on purpose
+      # (AUDIT S7): nothing in the web form may hold the master key.
       API_INTERNAL_URL: http://api:8000
-      API_KEY_SECRET: ${API_KEY:-${API_KEY_SECRET:?set API_KEY or API_KEY_SECRET in .env}}
     depends_on:
       api:
         condition: service_healthy

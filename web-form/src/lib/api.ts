@@ -137,7 +137,7 @@ export interface VoiceResponse {
 export async function submitVoiceMessage(
   payload: VoiceMessagePayload
 ): Promise<VoiceResponse> {
-  // Same-origin proxy: the backend endpoint needs the server-side API key.
+  // Same-origin proxy that caps the body; it adds no credentials.
   const response = await fetch('/api/voice', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

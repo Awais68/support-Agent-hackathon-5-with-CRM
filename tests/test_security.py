@@ -138,9 +138,14 @@ class TestVoiceCallSignature:
 
 
 class TestVoiceMessageAuth:
-    def test_requires_api_key(self, infra_client):
-        resp = infra_client.post("/webhooks/voice/message", json={"audio_base64": "AAAA"})
-        assert resp.status_code == 401
+    def test_audio_url_requires_api_key(self, infra_client):
+        # AUDIT S7: the endpoint is public (the browser calls it through a
+        # key-less proxy) and capped; the server-side fetch stays key-only.
+        # Size caps are covered in tests/test_voice_public_limits.py.
+        resp = infra_client.post(
+            "/webhooks/voice/message", json={"audio_url": "https://example.com/a.wav"}
+        )
+        assert resp.status_code == 403
 
     def test_internal_audio_url_rejected(self, infra_client):
         resp = infra_client.post(

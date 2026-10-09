@@ -259,6 +259,39 @@ def _is_test_mode() -> bool:
 # the handler. One path segment only, so nothing else can ride on the prefix.
 PUBLIC_TICKET_PATH_RE = re.compile(r"^/public/tickets/[^/]+$")
 
+# Voice messages come straight from the browser, so the endpoint is public
+# (no master key in the web form, AUDIT S7). It is rate limited, and the body
+# is capped before it is read: base64 of the largest accepted audio plus a
+# little room for the other JSON fields.
+VOICE_MESSAGE_PATH = "/webhooks/voice/message"
+_VOICE_JSON_OVERHEAD_BYTES = 4 * 1024
+
+
+def voice_max_audio_bytes() -> int:
+    return int(os.getenv("VOICE_MAX_AUDIO_BYTES", str(5 * 1024 * 1024)))
+
+
+def voice_max_body_bytes() -> int:
+    return (voice_max_audio_bytes() + 2) // 3 * 4 + _VOICE_JSON_OVERHEAD_BYTES
+
+
+def has_valid_api_key(headers) -> bool:
+    api_key = configured_api_key()
+    key = headers.get("X-API-Key")
+    return bool(api_key and key and hmac.compare_digest(key, api_key))
+
+
+def _voice_body_rejection(request: Request) -> JSONResponse | None:
+    """413/411 for voice bodies that are too large or of unknown size."""
+    if request.url.path != VOICE_MESSAGE_PATH or request.method != "POST":
+        return None
+    length = request.headers.get("content-length")
+    if length is None:
+        return JSONResponse(status_code=411, content={"detail": "Content-Length required"})
+    if not length.isdigit() or int(length) > voice_max_body_bytes():
+        return JSONResponse(status_code=413, content={"detail": "Voice message too large"})
+    return None
+
 
 async def verify_api_key(request: Request, x_api_key: str | None = Header(None)) -> bool:
     """Verify API key for non-webhook endpoints."""
@@ -272,13 +305,13 @@ async def verify_api_key(request: Request, x_api_key: str | None = Header(None))
         "/webhooks/webform",
         # Authenticated by Twilio signature inside the handler, not by API key.
         "/webhooks/voice/call",
+        # Public but capped; audio_url needs the key (checked in the handler).
+        VOICE_MESSAGE_PATH,
     ]:
         return True
 
     # Fail closed: with no key configured every protected request is rejected.
-    api_key = configured_api_key()
-    key = request.headers.get("X-API-Key")
-    if not api_key or not key or not hmac.compare_digest(key, api_key):
+    if not has_valid_api_key(request.headers):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     return True
@@ -392,6 +425,9 @@ async def api_key_middleware(request: Request, call_next):
     # answer them instead of rejecting them with a 401.
     if request.method == "OPTIONS":
         return await call_next(request)
+    rejection = _voice_body_rejection(request)
+    if rejection is not None:
+        return rejection
     try:
         await verify_api_key(request)
     except HTTPException as e:
@@ -470,9 +506,7 @@ async def prometheus_metrics(request: Request) -> Response:
 def _websocket_authorized(websocket: WebSocket, ticket_id: UUID) -> bool:
     if tracking.verify_tracking_token(ticket_id, websocket.query_params.get("token")):
         return True
-    api_key = configured_api_key()
-    key = websocket.headers.get("X-API-Key")
-    return bool(api_key and key and hmac.compare_digest(key, api_key))
+    return has_valid_api_key(websocket.headers)
 
 
 # WebSocket endpoint for real-time ticket updates
@@ -958,10 +992,19 @@ async def webhook_voice_message(
     if not (pool and kafka_producer and openai_client):
         raise ConfigurationError(message="Infrastructure not initialized")
 
+    # audio_url makes the server fetch a remote file; only key holders may.
+    if body.audio_url and not has_valid_api_key(request.headers):
+        raise HTTPException(status_code=403, detail="audio_url requires an API key")
+
     handler = VoiceHandler(kafka_producer, openai_client=openai_client)
-    audio_bytes = await handler.resolve_audio(body.audio_base64, body.audio_url)
+    max_audio = voice_max_audio_bytes()
+    audio_bytes = await handler.resolve_audio(
+        body.audio_base64, body.audio_url, max_bytes=max_audio
+    )
     if not audio_bytes:
         raise ValidationError(message="Provide a valid audio_base64 or audio_url")
+    if len(audio_bytes) > max_audio:
+        raise HTTPException(status_code=413, detail="Voice message too large")
 
     result = await handler.handle_voice_message(
         audio_bytes=audio_bytes,
