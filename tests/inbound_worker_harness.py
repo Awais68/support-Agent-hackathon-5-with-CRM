@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import json
 import os
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
@@ -90,16 +91,16 @@ async def main() -> None:
             if real_done:
                 await real_done(*args, **kwargs)
 
-        patches.append(patch.object(mp.db, "mark_inbound_done", done_then_hang, create=True))
+        patches.append(patch.object(mp.db, "mark_inbound_done", new=done_then_hang, create=True))
 
     for p in patches:
         p.start()
-    processor = mp.MessageProcessor(pool, producer)
+    processor = mp.MessageProcessor(pool, cast(Any, producer))
     consumer = KafkaConsumerClient(os.environ["HARNESS_KAFKA"], os.environ["HARNESS_GROUP"])
     await consumer.start([os.environ["HARNESS_TOPIC"]])
     record({"event": "started"})
 
-    kwargs = {}
+    kwargs: dict[str, Any] = {}
     params = inspect.signature(consumer.consume_messages).parameters
     if "dlq_producer" in params:
         kwargs = {"dlq_producer": producer, "retry_backoff_seconds": 0}

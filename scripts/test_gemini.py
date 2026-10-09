@@ -15,6 +15,7 @@ import asyncio
 import sys
 
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionToolParam
 
 sys.path.insert(0, ".")
 
@@ -86,7 +87,7 @@ async def check_chat(model: str = "gemini-3.6-flash") -> None:
     except Exception as exc:
         record(f"[info] chat completion ({model})", False, repr(exc)[:160], required=False)
 
-    tools = [
+    tools: list[ChatCompletionToolParam] = [
         {
             "type": "function",
             "function": {
@@ -110,7 +111,11 @@ async def check_chat(model: str = "gemini-3.6-flash") -> None:
         record(
             f"[info] tool calling ({model})",
             bool(calls),
-            calls[0].function.arguments if calls else "no tool_calls",
+            (
+                calls[0].function.arguments
+                if calls and calls[0].type == "function"
+                else "no tool_calls"
+            ),
             required=False,
         )
     except Exception as exc:

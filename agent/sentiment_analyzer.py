@@ -253,7 +253,7 @@ def _classify_emotion(
 
 
 def _pick_primary_emotion(emotion_scores: dict[str, float]) -> str:
-    return max(emotion_scores, key=emotion_scores.get)
+    return max(emotion_scores, key=lambda e: emotion_scores[e])
 
 
 def _compute_urgency(text: str, compound: float) -> float:

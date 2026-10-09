@@ -73,7 +73,7 @@ async def validate_url(url: str) -> None:
     except socket.gaierror as e:
         raise UnsafeURLError(f"cannot resolve {host!r}") from e
     for info in infos:
-        addr = info[4][0]
+        addr = str(info[4][0])
         if not _address_is_public(addr):
             raise UnsafeURLError(f"{host!r} resolves to non-public address {addr}")
 

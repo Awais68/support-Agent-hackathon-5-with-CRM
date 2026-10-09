@@ -56,10 +56,10 @@ class WebSocketManager:
                 stale.add(ws)
         if stale:
             async with self._lock:
-                conns = self._connections.get(ticket_id)
-                if conns:
-                    conns.difference_update(stale)
-                    if not conns:
+                live = self._connections.get(ticket_id)
+                if live:
+                    live.difference_update(stale)
+                    if not live:
                         del self._connections[ticket_id]
 
     async def broadcast_ticket_update(self, ticket_id: str, ticket_data: dict[str, Any]) -> None:

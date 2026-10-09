@@ -1402,7 +1402,7 @@ async def search_knowledge_base(
             )
 
     # Degrade to lexical search rather than failing the request outright.
-    if embedding is None:
+    if embedding is None or provider is None:
         results = await db.search_knowledge_base_text(
             pool,
             query=q,

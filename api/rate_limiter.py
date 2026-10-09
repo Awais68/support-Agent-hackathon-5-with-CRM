@@ -1,10 +1,10 @@
 """Rate limiting configuration using slowapi with optional Redis backend."""
 
 import os
+from collections.abc import Callable
 
 import structlog
 from slowapi import Limiter
-from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -15,7 +15,7 @@ logger = structlog.get_logger(__name__)
 RATE_LIMIT_PER_MINUTE = os.getenv("RATE_LIMIT_PER_MINUTE", "100")
 STRICT_RATE_LIMIT_PER_MINUTE = os.getenv("STRICT_RATE_LIMIT_PER_MINUTE", "10")
 
-default_limits = [f"{RATE_LIMIT_PER_MINUTE}/minute"]
+default_limits: list[str | Callable[..., str]] = [f"{RATE_LIMIT_PER_MINUTE}/minute"]
 strict_limit = f"{STRICT_RATE_LIMIT_PER_MINUTE}/minute"
 
 
@@ -35,7 +35,7 @@ limiter = Limiter(
 )
 
 
-async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+async def rate_limit_exceeded_handler(request: Request, exc: Exception) -> JSONResponse:
     response = JSONResponse(
         status_code=429,
         content={

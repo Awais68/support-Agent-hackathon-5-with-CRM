@@ -155,7 +155,8 @@ class WhatsAppHandler:
         self, to_number: str, message_body: str, media_url: str | None = None
     ) -> str:
         """Send a message via WhatsApp."""
-        if not self._configured:
+        client = self.client
+        if not self._configured or client is None:
             logger.warning("WhatsApp not configured, message not sent", to_number=to_number)
             return "not-configured"
 
@@ -179,7 +180,7 @@ class WhatsAppHandler:
                     loop = asyncio.get_event_loop()
                     message = await loop.run_in_executor(
                         None,
-                        lambda: self.client.messages.create(
+                        lambda: client.messages.create(
                             from_=f"whatsapp:{self.whatsapp_number}",
                             to=to_number,
                             body=message_body,
@@ -214,7 +215,8 @@ class WhatsAppHandler:
         self, to_number: str, template_sid: str, parameters: list | None = None
     ) -> str:
         """Send a template message via WhatsApp."""
-        if not self._configured:
+        client = self.client
+        if not self._configured or client is None:
             logger.warning(
                 "WhatsApp not configured, template message not sent", to_number=to_number
             )
@@ -230,7 +232,7 @@ class WhatsAppHandler:
                     loop = asyncio.get_event_loop()
                     message = await loop.run_in_executor(
                         None,
-                        lambda: self.client.messages.create(
+                        lambda: client.messages.create(
                             from_=f"whatsapp:{self.whatsapp_number}",
                             to=to_number,
                             content_sid=template_sid,

@@ -4,6 +4,7 @@ import copy
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 import asyncpg
@@ -19,7 +20,7 @@ from embeddings_provider import (
 )
 from exceptions import sanitize_error_message
 from kafka_client import (
-    KafkaProducerClient,
+    AnyKafkaProducer,
     create_escalation_message,
 )
 from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
@@ -33,7 +34,7 @@ class ToolContext:
     """Context for executing agent tools with access to DB, Kafka, and OpenAI."""
 
     db_pool: asyncpg.Pool
-    kafka_producer: KafkaProducerClient
+    kafka_producer: AnyKafkaProducer
     openai_client: AsyncOpenAI
     # Embeddings run on their own provider (see embeddings_provider). Left
     # unset, embeddings fall back to openai_client.
@@ -53,7 +54,7 @@ class ToolContext:
 
 
 # OpenAI tool schemas (proper format for chat.completions.create)
-OPENAI_TOOL_SCHEMAS = [
+OPENAI_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -265,7 +266,7 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
                     error=sanitize_error_message(str(e)),
                 )
 
-        if embedding is None:
+        if embedding is None or provider is None:
             results = await db.search_knowledge_base_text(
                 context.db_pool,
                 query=query,
@@ -433,7 +434,7 @@ async def get_customer_history(args: dict, context: ToolContext) -> dict:
             limit=limit,
         )
 
-        if context.bound:
+        if context.bound and context.customer_id is not None:
             history = await db.get_customer_history_by_id(
                 context.db_pool,
                 context.customer_id,

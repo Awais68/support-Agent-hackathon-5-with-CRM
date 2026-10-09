@@ -16,7 +16,7 @@ from embeddings_provider import (
     resolve_embedding_provider,
 )
 from exceptions import sanitize_error_message
-from kafka_client import KafkaProducerClient
+from kafka_client import AnyKafkaProducer
 from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
@@ -28,7 +28,7 @@ class ToolExecutor:
     def __init__(
         self,
         db_pool: asyncpg.Pool,
-        kafka_producer: KafkaProducerClient,
+        kafka_producer: AnyKafkaProducer,
         openai_client: AsyncOpenAI,
         embedding_provider: EmbeddingProvider | None = None,
     ):
@@ -69,7 +69,7 @@ class ToolExecutor:
                         error=sanitize_error_message(str(e)),
                     )
 
-            if query_embedding is None:
+            if query_embedding is None or provider is None:
                 results = await db.search_knowledge_base_text(
                     self.db_pool,
                     query=query,

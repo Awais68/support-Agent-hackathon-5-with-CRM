@@ -529,6 +529,7 @@ async def create_ticket(
             except asyncpg.UniqueViolationError:
                 if attempt == max_attempts - 1:
                     raise
+    raise AssertionError("unreachable: the last attempt returns or raises")
 
 
 async def get_ticket(pool: asyncpg.Pool, ticket_id: UUID) -> dict[str, Any] | None:
@@ -1159,8 +1160,7 @@ async def record_metric(
     """Record a metric."""
     if labels is None:
         labels = {}
-    if isinstance(labels, (dict, list)):
-        labels = json.dumps(labels)
+    labels_json = json.dumps(labels) if isinstance(labels, (dict, list)) else labels
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -1170,7 +1170,7 @@ async def record_metric(
             metric_name,
             metric_value,
             metric_type,
-            labels,
+            labels_json,
         )
 
 

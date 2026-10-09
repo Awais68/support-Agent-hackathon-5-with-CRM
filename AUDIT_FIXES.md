@@ -18,7 +18,7 @@ Commits between the audited `5e9d39a` and `5ca1c85`, re-tested on `fix/audit` be
 | Item | Claimed in | Re-test on `fix/audit` @ 5ca1c85 | Result |
 |---|---|---|---|
 | N1 (lint part): ruff + black red | 24467a0 | `ruff check .` → "All checks passed"; `black --check .` → 70 unchanged | Already fixed. E501 ignored with a written reason in `pyproject.toml` (black owns line length) |
-| N1 (mypy part) / N16 | — | `mypy .` → "Found 1 error … errors prevented further checking" | Open |
+| N1 (mypy part) / N16 | this commit | `mypy . --ignore-missing-imports` → "Success: no issues found in 90 source files" (was: aborts on the duplicate module, then 46 errors) | Fixed. Added `utils/__init__.py`, excluded local-only trees in `[tool.mypy]`, fixed the 46 errors in code (no ignores, no rule changes) and removed `continue-on-error` from the CI mypy step. mypy also found a real bug: chaos `_docker` rejected extra args (0080885) |
 | R2-A operator-voice reply | fb2358e | `tests/test_customer_reply.py` 17 passed | Already fixed |
 | R2-B `general` category | 211ff9f | `tests/test_kb_category.py` (needs PG; re-run on the live stack in P0 gate) | Already fixed |
 | R2-C sentiment gate | 7ec89d9 | `python -m agent.gate_eval` → TP=20 FP=1 FN=0 TN=21, P=0.95 R=1.00 | Already fixed |
@@ -63,8 +63,8 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 | N6 | Medium | `/health` 200 with DB down; no liveness/readiness split | Fixed: `/livez` (process only) and `/readyz` (DB + requested Kafka, 503 when down; DB ping bounded by `READINESS_DB_TIMEOUT_SECONDS`, default 2s, because a paused DB made it hang). `/health` = `/readyz`. k8s api liveness→`/livez`, readiness→`/readyz`; Render and compose api use `/readyz`. Tests: `tests/test_health_probes.py`. Live: paused postgres → `/readyz` 503 in 2.0s, `/livez` 200, recovers on unpause. |
 | S9 | High | next@14.2.35 critical/high advisories | Fixed: next 16.4.0 (the critical advisory covers every release up to 16.3.0-preview), React 19, ESLint 9 flat config (`next lint` is gone in 16), Tailwind 4 (v3 pulls chokidar/micromatch/braces). Route `params` are async now. New lint errors fixed in code, no rule disabled. `npm audit --omit=dev`: **0**. Full `npm audit`: 5 high, all from one dev-only root, `braces` <=3.0.3 (GHSA-vfj7-8cjw-p6xm, DoS on deeply nested patterns), via `eslint-config-next`→`@next/eslint-plugin-next`→`fast-glob`→`micromatch`. 3.0.3 is the latest braces release, so there is no fix to install; it only runs at lint time on repo-controlled globs. Re-check when braces or eslint-config-next ships a fix. Lockfile regenerated with npm 10 (node 20, as in the image and CI), because npm 11's lockfile failed `npm ci` there. Live: container on 16.4.0, form submit and tokenized tracking page work in Chrome, `tests/test_proxy_exploits_live.py` 14 passed. |
 | G2 / S8 (rate limit) | Medium | In-memory per-replica limiter, keyed on proxy IP | Documented, code still open: `docs/RATE_LIMITING.md` (limits per route, Redis needed for >1 replica, why keying on raw `X-Forwarded-For` is wrong, the trusted-proxy setup that fixes it). Live: 34 requests via the web form with 34 different `X-Forwarded-For` → one bucket (`client_ip=172.20.0.10`), `404×18, 429×16`. Global spend cap / CAPTCHA (S8) not done. |
-| N1 | High | CI never green (lint part already fixed) | Open (mypy) |
-| N16 | Medium | mypy aborts on duplicate module | Open |
+| N1 | High | CI never green | Fixed locally (ruff, black, mypy all clean and blocking); CI run not yet observed (push pending) |
+| N16 | Medium | mypy aborts on duplicate module | Fixed |
 | N2 | High | CD 0/7 (uppercase GHCR name, not gated on CI, no migrations) | Open |
 | N3 | High | chaos.yml invalid YAML (0/7) | Open |
 | R2-A/B/C | — | Round 2 items | Already fixed (see reconciliation) |

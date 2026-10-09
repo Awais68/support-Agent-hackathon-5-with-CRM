@@ -16,7 +16,7 @@ def _truncate_by_words(text: str, max_words: int) -> str:
     return " ".join(words[:max_words]) + "..."
 
 
-def truncate_for_channel(text: str, channel: str, max_chars: int = None) -> str:
+def truncate_for_channel(text: str, channel: str, max_chars: int | None = None) -> str:
     """Truncate and format text for a specific channel.
 
     Spec constraints:
@@ -153,7 +153,7 @@ def format_escalation_message(
 def format_ticket_summary(
     ticket_data: dict[str, Any],
     include_messages: bool = False,
-    messages: list = None,
+    messages: list | None = None,
 ) -> str:
     """Format a ticket summary for display."""
     lines = [
@@ -240,7 +240,7 @@ def create_channel_specific_signature(channel: str) -> str:
 
 
 def add_knowledge_base_source(
-    response: str, kb_article_id: str, kb_title: str, kb_link: str = None
+    response: str, kb_article_id: str, kb_title: str, kb_link: str | None = None
 ) -> str:
     """Add knowledge base source citation to response."""
     citation = f"\n\n📚 **Source:** {kb_title}"

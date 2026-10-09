@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 import asyncpg
@@ -26,7 +26,7 @@ from chat_provider import chat_model
 from database import queries as db
 from embeddings_provider import EmbeddingProvider, build_embedding_provider
 from exceptions import sanitize_error_message
-from kafka_client import KafkaProducerClient
+from kafka_client import AnyKafkaProducer, KafkaProducerClient
 from metrics import (
     sentiment_below_threshold,
     sentiment_emotion,
@@ -39,6 +39,13 @@ from metrics import (
     sentiment_urgency as metric_sentiment_urgency,
 )
 from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
+
+if TYPE_CHECKING:
+    from openai.types.chat import (
+        ChatCompletionMessageFunctionToolCall,
+        ChatCompletionMessageParam,
+        ChatCompletionToolParam,
+    )
 
 logger = structlog.get_logger(__name__)
 
@@ -55,7 +62,7 @@ class AgentContext:
     """Context for agent execution."""
 
     db_pool: asyncpg.Pool
-    kafka_producer: KafkaProducerClient
+    kafka_producer: AnyKafkaProducer
     openai_client: AsyncOpenAI
     # Embeddings run on their own provider (see embeddings_provider). Left
     # unset, embeddings fall back to openai_client.
@@ -346,8 +353,8 @@ class CustomerSuccessAgent:
                         async with _cb:
                             response = await self.context.openai_client.chat.completions.create(
                                 model=self.model,
-                                messages=messages,
-                                tools=tool_schemas,
+                                messages=cast("list[ChatCompletionMessageParam]", messages),
+                                tools=cast("list[ChatCompletionToolParam]", tool_schemas),
                                 tool_choice="auto",
                                 temperature=0.7,
                                 max_tokens=2000,
@@ -380,8 +387,10 @@ class CustomerSuccessAgent:
                         break
 
                     for tc in choice.message.tool_calls:
-                        tool_name = tc.function.name
-                        tool_args = json.loads(tc.function.arguments)
+                        # Only function tools are offered, so every call is one.
+                        call = cast("ChatCompletionMessageFunctionToolCall", tc).function
+                        tool_name = call.name
+                        tool_args = json.loads(call.arguments)
                         tool_calls.append(tool_name)
                         self.context.logger.info(
                             "Executing tool",

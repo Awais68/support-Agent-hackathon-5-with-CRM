@@ -307,7 +307,7 @@ async def run_load_test(base_url: str, total_requests: int, concurrency: int):
     p95 = latencies[int(len(latencies) * 0.95)] if latencies else 0
     p99 = latencies[int(len(latencies) * 0.99)] if latencies else 0
 
-    by_channel = {}
+    by_channel: dict[str, list] = {}
     for r in results:
         by_channel.setdefault(r.channel, []).append(r)
 

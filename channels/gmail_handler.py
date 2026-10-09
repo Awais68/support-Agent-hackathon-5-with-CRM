@@ -31,7 +31,7 @@ class GmailHandler:
 
     def __init__(self, kafka_producer: KafkaProducerClient):
         self.kafka_producer = kafka_producer
-        self.service = None
+        self.service: Any = None
         self.credentials_file = os.getenv("GMAIL_CREDENTIALS_FILE", "gmail_credentials.json")
         self.token_file = os.getenv("GMAIL_TOKEN_FILE", "gmail_token.json")
 

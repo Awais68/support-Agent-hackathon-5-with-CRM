@@ -3,6 +3,7 @@
 import os
 import re
 import traceback
+from collections.abc import Callable
 from typing import Any
 
 
@@ -92,7 +93,7 @@ class ExternalServiceError(AppError):
         )
 
 
-SENSITIVE_PATTERNS = [
+SENSITIVE_PATTERNS: list[tuple[str, str | Callable[[re.Match[str]], str]]] = [
     (
         r"(postgresql|mysql|mongodb)://[^@\s]+:[^@\s]+@",
         lambda m: m.group(0).split(":")[0] + "://****:****@",
@@ -108,10 +109,7 @@ def sanitize_error_message(msg: str) -> str:
     if not isinstance(msg, str):
         return str(msg)
     for pattern, replacement in SENSITIVE_PATTERNS:
-        if callable(replacement):
-            msg = re.sub(pattern, replacement, msg, flags=re.IGNORECASE)
-        else:
-            msg = re.sub(pattern, replacement, msg, flags=re.IGNORECASE)
+        msg = re.sub(pattern, replacement, msg, flags=re.IGNORECASE)
     return msg
 
 

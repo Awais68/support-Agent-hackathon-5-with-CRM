@@ -16,6 +16,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 import structlog
@@ -311,9 +312,9 @@ def parse_insert_count(result: str) -> int:
     return 0
 
 
-async def seed(pool: asyncpg.Pool) -> dict[str, any]:
+async def seed(pool: asyncpg.Pool) -> dict[str, Any]:
     """Run the full seed pipeline. Idempotent."""
-    results = {}
+    results: dict[str, Any] = {}
 
     # 1. Ensure migrations tracking table exists
     await ensure_schema_migrations_table(pool)

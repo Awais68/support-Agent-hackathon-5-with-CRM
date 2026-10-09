@@ -240,6 +240,10 @@ class NoOpKafkaProducer:
         return "noop-" + str(UUID(int=int(datetime.now().timestamp() * 1000000)))
 
 
+# Either producer; agents and tools only call send_message.
+AnyKafkaProducer = KafkaProducerClient | NoOpKafkaProducer
+
+
 class NonRetryableError(Exception):
     """Retrying cannot help; the consumer dead-letters the message at once."""
 
@@ -462,6 +466,8 @@ class KafkaConsumerClient:
         )
 
     async def _commit(self, raw_message: Any) -> None:
+        if not self.consumer:
+            raise RuntimeError("Consumer not started")
         tp = TopicPartition(raw_message.topic, raw_message.partition)
         await self.consumer.commit({tp: raw_message.offset + 1})
 

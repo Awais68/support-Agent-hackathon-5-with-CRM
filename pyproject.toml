@@ -82,6 +82,9 @@ quote-style = "double"
 
 [tool.mypy]
 ignore_missing_imports = true
+# Local-only trees (agent worktrees, venv, the Next.js app) are not part of
+# the Python package and contain duplicate module names.
+exclude = ['^\.kilo/', '^\.venv/', '^web-form/']
 
 [build-system]
 requires = ["hatchling"]

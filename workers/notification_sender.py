@@ -198,8 +198,8 @@ class OutboundSender:
             return None
 
         if channel == "whatsapp":
-            sender = self._get_whatsapp_sender()
-            result = await sender(await self._customer_phone(ticket_id), body)
+            send_whatsapp = self._get_whatsapp_sender()
+            result = await send_whatsapp(await self._customer_phone(ticket_id), body)
             # WhatsAppHandler reports these as return values, not exceptions.
             if result == "not-configured":
                 raise PermanentDeliveryError("Twilio WhatsApp is not configured")

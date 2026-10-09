@@ -127,11 +127,11 @@ class MCPServer:
             return True
         return False
 
-    def get_tool(self, name: str) -> MCPTool:
+    def get_tool(self, name: str) -> MCPTool | None:
         """Get a tool by name."""
         return self.tools.get(name)
 
-    def list_tools(self, category: str = None) -> list[dict[str, Any]]:
+    def list_tools(self, category: str | None = None) -> list[dict[str, Any]]:
         """List all available tools, optionally filtered by category."""
         tools_to_list = []
 
