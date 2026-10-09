@@ -716,38 +716,52 @@ services, HPA, PDB → `keda-install` and `scaledobject-worker` → `ingress`.
 ## Known Issues
 
 Found while reading the code and running it. The ones marked **(verified)** were reproduced on this
-machine.
+machine. The items marked ✅ were fixed on branch `fix/known-issues`; see
+[`FIX_REPORT.md`](FIX_REPORT.md) for how each fix was verified.
+
+### Fixed on `fix/known-issues`
+
+- ✅ **The web form Docker image didn't build** (`public/` missing; the npm 11 lockfile broke
+  `npm ci` on Node 20).
+- ✅ **Email and WhatsApp replies were never delivered.** `workers/notification_sender.py` now
+  consumes `notifications.outbound` with retries, a DLQ, and idempotency (`outbound_deliveries`,
+  migration 011). Real delivery still needs a Gmail token and Twilio credentials; it was verified
+  with mocked providers.
+- ✅ **Compose applied only `schema.sql` + `001`.** The new `migrate` and `kb-embed` services apply
+  schema + all migrations idempotently and embed the KB.
+- ✅ **The k8s worker ran uvicorn, and KEDA watched the wrong topic and group.**
+- ✅ **CORS preflight returned 401.** Origins now come from `CORS_ORIGINS`.
+- ✅ **`npm run lint` was interactive.**
+- ✅ **The browser couldn't reach the API in Compose, and the web form had no `API_KEY_SECRET`
+  there.** This is fixed for Compose only; k8s and Render still have the problem (item 6 below).
+- ✅ **Security:**
+  - The `test-key-12345` fallback is removed.
+  - The Twilio signature is required on `/webhooks/voice/call`, and the API key on
+    `/webhooks/voice/message`.
+  - An SSRF guard now protects `audio_url`.
 
 ### Broken or non-functional
 
-1. **The web form Docker image doesn't build (verified).** `web-form/Dockerfile:36` copies
-   `/app/public`, but `web-form/public/` isn't in git, so the build fails with `"/app/public": not
-   found`. This breaks `docker compose up`, `cd.yml`, and any clean image build. Fix: add
-   `web-form/public/.gitkeep`.
-2. **Email and WhatsApp replies are never delivered.** The agent publishes replies to
-   `notifications.outbound`, but nothing consumes that topic. `GmailHandler.send_reply` and
-   `WhatsAppHandler.send_message` are never called.
-3. **Docker Compose applies only `schema.sql` and `001`** (`docker-compose.yml:13-14`). Without
-   migration 009 (`embedding_model`), KB vector search fails with a missing column. Without 010,
-   `ON CONFLICT (title)` inserts fail.
-4. **In Kubernetes, the worker actually runs the API.** `k8s/deployment-worker.yaml` sets
-   `RUN_MODE=worker` but no `command`, so the image CMD (uvicorn) runs. Its liveness probe is a no-op
-   `sys.exit(0)`.
-5. **KEDA watches the wrong Kafka names.** The ScaledObject uses `topic: techflow-messages` and
-   `consumerGroup: techflow-worker-group`. The code uses `inbound.*` topics and group
-   `techflow-message-processor`. It also sets `idleReplicaCount: 0` together with `minReplicaCount: 2`,
-   which contradict each other.
-6. **The browser can't reach the API in Compose or Kubernetes.** `NEXT_PUBLIC_API_URL` is baked into
-   the browser bundle as `http://api:8000` (compose) or a cluster-internal DNS name (k8s), and the
-   browser can't resolve either.
-7. **`API_KEY_SECRET` is never set for the web form** in compose, Render, or k8s, so ticket tracking
-   (`/api/tickets/[id]`) returns 500 there. Locally, `.env.example` (`placeholder-secret-…`) and
-   `web-form/.env.local.example` (`test-key-12345`) ship mismatched keys, which gives a 401.
-8. **CORS preflight is rejected (verified).** `OPTIONS /tickets` returns 401 because the API-key
-   middleware runs before CORS. Browser calls to protected endpoints from another origin fail. Public
-   webhooks are not affected.
-9. **`npm run lint` opens an interactive prompt (verified),** because there's no ESLint config or
-   dependency. The CI frontend lint step will hang or fail.
+1. **Agent replies to email/WhatsApp read as operator notes.** The final agent message sometimes
+   says things like "I've responded to the customer…", and that text is what the outbound sender
+   delivers.
+2. **The agent passes the form category as a KB filter.** For `general` this returns 0 results and
+   the ticket escalates.
+3. **The sentiment gate escalates neutral technical questions.** For example, "failing with 429"
+   scored 0.24.
+4. **Missing Gmail token/credential files become root-owned directories** through the compose bind
+   mounts.
+5. **In Kubernetes, the worker liveness/readiness probes are no-ops** (`sys.exit(0)`), and the
+   worker Deployment lacks `GEMINI_*`/`DEEPSEEK_*` env.
+6. **The browser can't reach the API in Kubernetes or Render.** `NEXT_PUBLIC_API_URL` is baked into
+   the browser bundle as a cluster-internal name, and `API_INTERNAL_URL`/`API_KEY_SECRET` aren't set
+   for the web form there. Compose is fixed.
+7. **Twilio signature validation uses `request.url`,** so it fails behind a TLS-terminating
+   proxy/ingress.
+8. **The Playwright tests aren't marked `e2e`,** and they need `E2E_API_KEY` equal to the server's
+   `API_KEY_SECRET`.
+9. **`KafkaProducerClient` retries only connection/timeout errors,** so the first publish to a cold
+   broker can fail.
 10. **The k8s Ingress routes `/api` to the backend,** which has no `/api` prefix. It also shadows the
     Next.js `/api/tickets/[id]` route.
 11. **WhatsApp messages are silently dropped when `ENABLE_KAFKA=false`,** for example on Render, which
@@ -772,15 +786,12 @@ machine.
 
 ### Security and risk
 
-- **Hardcoded API key fallback:** when neither `API_KEY` nor `API_KEY_SECRET` is set, the backend
-  accepts `test-key-12345` (`api/main.py:247`).
-- **Unauthenticated endpoints that cost money:**
-  - `/webhooks/voice/call` doesn't check the Twilio signature.
-  - `/webhooks/voice/message` and `/webhooks/webform` are public, and each request triggers LLM, STT,
-    or TTS spend (rate limit 10/min per IP).
+- **Public endpoints that cost money:**
+  - `/webhooks/webform` is public, and each request triggers LLM spend (rate limit 10/min per IP).
   - WhatsApp signature checking is optional unless `REQUIRE_TWILIO_SIGNATURE=true`.
-- **SSRF:** `/webhooks/voice/message` with `audio_url` fetches any URL from the server and downloads it
-  fully before checking its size.
+- **`audio_url` DNS-rebinding window:** `utils/safe_fetch.py` resolves the host and then connects
+  separately. The host allowlist mitigates this.
+- **`database/seed.py` logs `db_url`, password included.**
 - **WebSocket `/ws/tickets/{uuid}` has no auth,** so anyone with a ticket UUID can subscribe.
 - **No upper bound** on `limit` for `/customers/{email}/history` or on `hours` for `/metrics/summary`.
 - **The worker logs the full `DATABASE_URL`, credentials included** (`workers/message_processor.py`).
@@ -827,8 +838,8 @@ machine.
   `send_response` tool and once by `api/main.py`.
 - **Gmail blocks the worker:** the handler uses blocking Google API calls inside async code, and
   `InstalledAppFlow.run_local_server` would hang a headless worker if no token exists.
-- **The test count badge in the old README said 136.** The current suite has 141 passing and 12
-  skipped.
+- **The test count badge in the old README said 136.** On `main` the suite had 141 passing and 12
+  skipped. On `fix/known-issues` it has 192 passing with the live stack (178 under the CI filter).
 
 ---
 
@@ -852,3 +863,12 @@ These were run on 2026-10-09 against a fresh `git clone` (Linux, Node 24.13, uv-
 | `web-form`: `npm run lint` | ❌ interactive ESLint setup prompt |
 | `web-form`: `docker build .` | ❌ `"/app/public": not found` |
 | Worker, Kafka, full `docker compose up`, k8s, Render | ⚠️ Not run |
+
+After the fixes on `fix/known-issues`, these were re-run on the same day:
+- full `docker compose up --build` (all healthchecks green)
+- Chrome E2E
+- 12/12 Playwright tests live
+- the worker + Kafka outbound flow
+- `kubeconform` plus a server dry-run of the k8s manifests
+
+Render was not run. Details are in [`FIX_REPORT.md`](FIX_REPORT.md).
