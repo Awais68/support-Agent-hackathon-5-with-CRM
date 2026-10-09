@@ -44,8 +44,9 @@ export default function TicketStatus({ ticket, onRefresh, isRefreshing }: Ticket
 
     function connect() {
       const ticketId = (ticket as any).id || ticket.ticket_id;
-      if (!ticketId) return;
-      const ws = connectTicketWebSocket(ticketId);
+      const token = ticket.tracking_token;
+      if (!ticketId || !token) return;
+      const ws = connectTicketWebSocket(ticketId, token);
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
@@ -59,9 +60,10 @@ export default function TicketStatus({ ticket, onRefresh, isRefreshing }: Ticket
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         wsRef.current = null;
-        if (isMounted) {
+        // 1008 = token refused; retrying with the same token cannot succeed.
+        if (isMounted && event.code !== 1008) {
           reconnectTimer = setTimeout(connect, 3000);
         }
       };
@@ -81,7 +83,7 @@ export default function TicketStatus({ ticket, onRefresh, isRefreshing }: Ticket
         wsRef.current = null;
       }
     };
-  }, [(ticket as any).id, ticket.ticket_id, onRefresh]);
+  }, [(ticket as any).id, ticket.ticket_id, ticket.tracking_token, onRefresh]);
 
   return (
     <div className="bg-white rounded-lg shadow-lg p-6 sm:p-8">

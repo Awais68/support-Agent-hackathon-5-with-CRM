@@ -98,9 +98,12 @@ export async function getTicketStatus(
   return response.json();
 }
 
-export function connectTicketWebSocket(ticketId: string): WebSocket {
+// The API refuses the socket without the ticket's tracking token.
+export function connectTicketWebSocket(ticketId: string, trackingToken: string): WebSocket {
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-  const wsUrl = apiUrl.replace(/^http/, 'ws') + `/ws/tickets/${ticketId}`;
+  const wsUrl =
+    apiUrl.replace(/^http/, 'ws') +
+    `/ws/tickets/${encodeURIComponent(ticketId)}?token=${encodeURIComponent(trackingToken)}`;
   return new WebSocket(wsUrl);
 }
 

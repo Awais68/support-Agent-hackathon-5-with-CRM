@@ -467,14 +467,30 @@ async def prometheus_metrics(request: Request) -> Response:
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+def _websocket_authorized(websocket: WebSocket, ticket_id: UUID) -> bool:
+    if tracking.verify_tracking_token(ticket_id, websocket.query_params.get("token")):
+        return True
+    api_key = configured_api_key()
+    key = websocket.headers.get("X-API-Key")
+    return bool(api_key and key and hmac.compare_digest(key, api_key))
+
+
 # WebSocket endpoint for real-time ticket updates
 @app.websocket("/ws/tickets/{ticket_id}")
 async def websocket_ticket(
     websocket: WebSocket,
     ticket_id: UUID,
 ):
-    """WebSocket endpoint for real-time ticket updates."""
+    """WebSocket endpoint for real-time ticket updates.
+
+    HTTP middleware does not run for WebSockets, so the check lives here: the
+    customer's tracking token (?token=) or the master key (X-API-Key header)
+    must be presented before the handshake is accepted (AUDIT S4).
+    """
     tid = str(ticket_id)
+    if not _websocket_authorized(websocket, ticket_id):
+        await websocket.close(code=1008)
+        return
     await ws_manager.connect(websocket, tid)
     try:
         while True:
