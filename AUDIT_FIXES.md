@@ -43,6 +43,18 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 | N4 | High | Kafka auto-commit + swallowed exception = message loss | Fixed (N4 commit): auto-commit off; the offset is committed only after the handler succeeds or the message is written to the `dlq` topic (retries: `KAFKA_HANDLER_MAX_ATTEMPTS`, default 3, exponential backoff); if the DLQ write fails nothing is committed. Handler errors now propagate. Idempotency: new `inbound_processing` ledger (migration 012) keyed on the Kafka message id skips finished messages, reuses the ticket a dead delivery created and gives up after `INBOUND_MAX_DELIVERIES` (10); the agent publishes the reply before marking its run completed, a redelivery skips the agent if a successful run exists since the claim, failed runs are now stored as `failed`, and the sender dedups on `inbound:<message id>`. Note: the agent also emits its own `dlq` event per failed run, so one message can produce one agent DLQ event per attempt plus the consumer's final one | `tests/test_inbound_redelivery.py` (real Kafka + PG, worker SIGKILLed): kill mid-agent failed (message lost) → passes, exactly one ticket, one completed run, one reply; kill after agent passes; failed first attempt is retried and answered. `tests/test_consumer_commit.py` 8 passed; `test_notification_sender.py::test_rerun_for_same_inbound_message_is_not_sent_twice` failed → passes. Live (LLM unreachable): 3 attempts, agent re-run each time |
 | S7 | Medium | `/api/voice` proxy attaches the master key; no size cap / rate limit | Fixed (S7 commit): the web form no longer holds the master key (removed from compose and `.env.local.example`); the proxy adds no credentials and refuses bodies over the cap (Content-Length and streamed count, 413). `/webhooks/voice/message` is public but capped: body > base64(`VOICE_MAX_AUDIO_BYTES`, default 5 MB)+4 KB → 413 before parsing, no Content-Length → 411, decoded audio re-checked; `audio_url` (server-side fetch) needs the API key (403). Existing `strict_limit` (10/min/IP) stays. Not done here: per-session tokens and a global LLM/STT spend cap (shared with S8, see P1/P2); behind the proxy every browser shares the web-form IP for the limiter (see rate-limit note). Local `web-form/.env.local` still has `API_KEY_SECRET`: delete that line | `tests/test_voice_public_limits.py`: 3 failed (12 MB-class body processed, no key path) → 5 passed; live `test_proxy_exploits_live.py`: 2 failed (12 MB via proxy → 200; web-form container env had `API_KEY_SECRET`) → 14 passed. `test_security.py::test_requires_api_key` replaced by `test_audio_url_requires_api_key` (endpoint is public by design now) |
 
+### P0 gate (2026-10-09, `fix/audit` @ 7692662)
+
+- **Exploits re-run:** every P0 exploit test passes on the fixed code: S1/S7 live proxy (14), S13, S2 (7, real PG),
+  S3 (3, real PG), S4 (6), S5 (2, real Docker), S6 (8), N4 (3 real Kafka + PG redelivery, 8 commit,
+  1 sender dedup), S7 API (5).
+- **Full suite** against the live compose stack (providers mocked: every LLM/STT/Twilio/Gmail URL points at a
+  closed port): 311 passed, 0 failed, 0 skipped (`-m` all, incl. e2e/Playwright; the Docker-context test needs
+  the buildx plugin, run outside the tool sandbox).
+- **Chrome:** form submit → ticket number → "Track Your Ticket" opens `/ticket/<n>?t=<token>`, shows the
+  redacted ticket, WebSocket accepted with the token; worker processed the message once (ledger `done`, attempt 1).
+- **CI:** not recorded yet: the push of `fix/audit` was not permitted from this session (see PR checklist).
+
 ## P1
 
 | ID | Sev | Finding | Status |
@@ -95,6 +107,8 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 | R2-2 | Low | Replies open with "Great question" | Open |
 | R2-3 | Low | `send_response` publishes a second payload shape on `notifications.outbound` | Open |
 | R2-4 | Low | = N12 billing patterns | Open |
+| X1 | Low | (found in P0 gate) uvicorn access log prints the WebSocket URL including `?token=` (tracking token) | Open |
+| X2 | Low | (found in P0 gate) when the agent falls back without `send_response` (circuit open, model answered in text) on webform/voice, the reply is published but never stored, so the tracking page shows nothing | Open |
 | R2-5 | Low | Emotion stems in `sentiment_analyzer.py` end in `\b` | Open |
 
 ## Data clean-up (you)
@@ -112,4 +126,14 @@ ORDER BY ci.created_at;
 
 ## Secrets to rotate (you)
 
-Filled in at the end of P0 (S5/S6).
+Anything that was in `.env*`, `credentials.json` or `gmail_*` at the time an image was built before
+d7a647c (S5) is in that image's layers; the DB password was also in worker/seed logs before b403af6 (S6).
+The web form held `API_KEY_SECRET` until 7692662 (S7). Rotate, then rebuild and redeploy:
+
+- `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY` (and `GROQ_API_KEY` / `OPENAI_API_KEY` if set)
+- Gmail OAuth client secret (`GMAIL_CLIENT_SECRET` / `credentials.json`) and revoke the refresh token in `gmail_token.json`
+- `API_KEY` / `API_KEY_SECRET` (also changes tracking tokens unless `TRACKING_TOKEN_SECRET` is set separately)
+- Database password (`POSTGRES_PASSWORD` / `DATABASE_URL`) for every environment that ran the old worker
+- Twilio `TWILIO_AUTH_TOKEN` (and the account SID's API keys if any)
+- Delete pushed images built before d7a647c from GHCR / Render
+- Locally: remove the `API_KEY_SECRET` line from `web-form/.env.local`
