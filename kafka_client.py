@@ -19,6 +19,7 @@ from tenacity import (
 )
 
 from exceptions import sanitize_error_message
+from utils import heartbeat
 from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
@@ -256,6 +257,8 @@ class KafkaConsumerClient:
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
         self.consumer: AIOKafkaConsumer | None = None
+        # Monotonic start of the handler call in flight; None while idle.
+        self._handling_since: float | None = None
 
     def _sasl_config(self) -> dict:
         """Build SASL config dict from environment variables."""
@@ -323,6 +326,7 @@ class KafkaConsumerClient:
             else float(os.getenv("KAFKA_HANDLER_RETRY_BACKOFF_SECONDS", "1"))
         )
 
+        beats = asyncio.create_task(self._heartbeat_loop())
         try:
             async for raw_message in self.consumer:
                 try:
@@ -348,9 +352,13 @@ class KafkaConsumerClient:
                     topic=message.topic,
                     message_id=message.message_id,
                 )
-                error = await self._handle_with_retries(
-                    on_message, message, attempts_allowed, backoff
-                )
+                self._handling_since = asyncio.get_running_loop().time()
+                try:
+                    error = await self._handle_with_retries(
+                        on_message, message, attempts_allowed, backoff
+                    )
+                finally:
+                    self._handling_since = None
                 if error is not None:
                     attempts, exc = error
                     await self._dead_letter(
@@ -368,6 +376,25 @@ class KafkaConsumerClient:
         except Exception as e:
             logger.error("Consumer error", error=sanitize_error_message(str(e)))
             raise
+        finally:
+            beats.cancel()
+
+    async def _heartbeat_loop(self) -> None:
+        """Refresh this group's heartbeat while the loop is not stuck (N6).
+
+        Runs beside the consume loop so an idle topic still beats; skips the
+        beat once one handler call has run longer than WORKER_STALL_SECONDS,
+        which lets the probe restart a hung worker.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            started = self._handling_since
+            if started is None or loop.time() - started < heartbeat.stall_seconds():
+                try:
+                    heartbeat.beat(self.group_id)
+                except OSError as e:
+                    logger.warning("Heartbeat write failed", error=str(e))
+            await asyncio.sleep(heartbeat.interval_seconds())
 
     async def _handle_with_retries(
         self,

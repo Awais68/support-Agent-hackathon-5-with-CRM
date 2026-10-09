@@ -60,7 +60,7 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 | ID | Sev | Finding | Status |
 |---|---|---|---|
 | N5 | High | Human `/reply` never reaches email/WhatsApp | Fixed (N5 commit): `/tickets/{id}/reply` publishes `{reply_message_id, source: human, customer_reply, channel, customer_email}` to `notifications.outbound`; a publish failure returns 503 naming the saved message instead of a silent 201. The sender delivers these under `reply:<message id>` (deduped), skips the agent operator-voice guard for them, and still skips in-app channels. Tests: `tests/test_human_reply.py` 2 failed → passed; 3 new sender tests failed → passed. Live: reply → `outbound_deliveries` row `reply:<id>` (failed only because Gmail is mocked) |
-| N6 | Medium | `/health` 200 with DB down; no liveness/readiness split | Open |
+| N6 | Medium | `/health` 200 with DB down; no liveness/readiness split | Fixed: `/livez` (process only) and `/readyz` (DB + requested Kafka, 503 when down; DB ping bounded by `READINESS_DB_TIMEOUT_SECONDS`, default 2s, because a paused DB made it hang). `/health` = `/readyz`. k8s api liveness→`/livez`, readiness→`/readyz`; Render and compose api use `/readyz`. Tests: `tests/test_health_probes.py`. Live: paused postgres → `/readyz` 503 in 2.0s, `/livez` 200, recovers on unpause. |
 | S9 | High | next@14.2.35 critical/high advisories | Open |
 | G2 / S8 (rate limit) | Medium | In-memory per-replica limiter, keyed on proxy IP | Open |
 | N1 | High | CI never green (lint part already fixed) | Open (mypy) |
@@ -95,7 +95,7 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 | G7 | Low | gitleaks unpinned; pre-push hook scans HEAD only | Open |
 | G8 | Info | Python ≥3.13 declared, tests pass on 3.12 | Open |
 | C1 | Low | Misleading comment `message_processor.py:90` | Open (removed with N4) |
-| C2 | Medium | Worker healthcheck `kill -0 1` | Open |
+| C2 | Medium | Worker healthcheck `kill -0 1` | Fixed with N6: each consumer refreshes `$WORKER_HEARTBEAT_DIR/<group>` (also when idle) unless one handler call exceeds `WORKER_STALL_SECONDS` (600); `python -m utils.worker_healthcheck --max-age N` fails on any stale file. k8s worker liveness 120s / readiness 30s, compose 60s. Tests: `tests/test_worker_heartbeat.py`. Live: compose worker `healthy`, 3 heartbeat files. |
 | C3 | Low | Tests accept HTTP 500 (`tests/test_e2e.py:20,37,55`) | Open |
 | C4 | Medium | Migrations 001/004 seed demo data; two runners; no downs; 010 unbounded DELETE; no retention | Open |
 | C5 | Low | Docs: inconsistent test counts; DEPLOYMENT.md stale | Open |

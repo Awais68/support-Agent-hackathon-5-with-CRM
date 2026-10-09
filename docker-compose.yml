@@ -121,7 +121,7 @@ services:
     volumes:
       - .:/app
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -156,11 +156,12 @@ services:
       - ./gmail_credentials.json:/app/gmail_credentials.json:ro
       - ./gmail_token.json:/app/gmail_token.json
     healthcheck:
-      test: ["CMD-SHELL", "kill -0 1"]
+      # Fails when a consumer loop died or is stuck (AUDIT N6/C2).
+      test: ["CMD", "python", "-m", "utils.worker_healthcheck", "--max-age", "60"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     networks:
       - techflow
 

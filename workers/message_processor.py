@@ -29,6 +29,7 @@ from kafka_client import (
     NonRetryableError,
     NoOpKafkaProducer,
 )
+from utils import heartbeat
 from utils.redact import redact_dsn
 from workers.metrics_collector import run_metrics_collector
 from workers.notification_sender import run_notification_sender_loop
@@ -377,9 +378,22 @@ async def run_kafka_consumer_loop(
         await consumer.stop()
 
 
+async def run_process_heartbeat() -> None:
+    """Beat while the event loop runs, so a metrics-only worker has a probe too."""
+    while True:
+        try:
+            heartbeat.beat("worker")
+        except OSError as e:
+            logger.warning("Heartbeat write failed", error=str(e))
+        await asyncio.sleep(heartbeat.interval_seconds())
+
+
 async def main():
     """Main entry point for worker."""
     load_environment()
+    # Probes read these files (python -m utils.worker_healthcheck); stale ones
+    # from a previous run of this container must not count.
+    heartbeat.reset()
 
     # Load configuration
     db_url = os.getenv("DATABASE_URL", "postgresql://localhost/techflow")
@@ -413,12 +427,14 @@ async def main():
             run_kafka_consumer_loop(db_pool, kafka_producer, kafka_bootstrap),
             run_notification_sender_loop(db_pool, kafka_producer, kafka_bootstrap),
             run_metrics_collector(db_pool, kafka_producer, collection_interval=300),
+            run_process_heartbeat(),
         ]
     else:
         logger.info("Kafka disabled — worker running metrics collection only")
         kafka_producer = NoOpKafkaProducer()
         tasks = [
             run_metrics_collector(db_pool, kafka_producer, collection_interval=300),
+            run_process_heartbeat(),
         ]
 
     try:

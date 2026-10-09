@@ -1,5 +1,6 @@
 """FastAPI application for TechFlow CRM Digital FTE."""
 
+import asyncio
 import hmac
 import os
 import re
@@ -305,6 +306,8 @@ async def verify_api_key(request: Request, x_api_key: str | None = Header(None))
     # Skip verification for webhook, health, and metrics endpoints
     if request.url.path in [
         "/health",
+        "/livez",
+        "/readyz",
         "/metrics",
         "/webhooks/whatsapp",
         "/webhooks/webform",
@@ -472,15 +475,54 @@ app.add_middleware(
 )
 
 
-# Health check endpoint
-@app.get("/health", response_model=HealthResponse)
+# Health checks. /livez: the process answers (k8s liveness, never touches
+# dependencies, so a DB outage does not restart every pod). /readyz: DB and,
+# when requested, Kafka are usable; 503 otherwise so the pod is taken out of
+# rotation (AUDIT N6). /health is kept for existing callers with /readyz
+# semantics.
+@app.get("/livez", include_in_schema=False)
 @limiter.exempt
-async def health_check(request: Request, pool: asyncpg.Pool = Depends(get_db)) -> HealthResponse:
-    """Health check endpoint."""
+async def liveness_check(request: Request) -> dict[str, str]:
+    """Liveness probe: the event loop is serving requests."""
+    return {"status": "alive"}
+
+
+_pending_db_pings: set[asyncio.Task] = set()
+
+
+async def _db_select_one(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.fetchval("SELECT 1")
+
+
+async def _ping_db(pool: asyncpg.Pool, timeout: float) -> None:
+    """SELECT 1 that answers within ``timeout`` even if the DB is unresponsive.
+
+    asyncio.timeout around pool.acquire() is not enough: on cancellation the
+    pool resets the connection, which blocks on the same unresponsive DB. The
+    ping runs as its own task; after the timeout it is cancelled and left to
+    unwind in the background.
+    """
+    task = asyncio.create_task(_db_select_one(pool))
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        _pending_db_pings.add(task)
+        task.add_done_callback(_pending_db_pings.discard)
+        raise TimeoutError
+    task.result()
+
+
+async def _readiness(request: Request) -> JSONResponse:
     db_status = "ok"
+    pool = getattr(request.app.state, "db_pool", None)
     try:
-        async with pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
+        if pool is None:
+            raise ConfigurationError(message="Database not initialized")
+        await _ping_db(pool, float(os.getenv("READINESS_DB_TIMEOUT_SECONDS", "2")))
+    except TimeoutError:
+        logger.error("Database health check timed out")
+        db_status = "error"
     except asyncpg.PostgresError as e:
         logger.error("Database health check failed", error=sanitize_error_message(str(e)))
         db_status = "error"
@@ -493,11 +535,27 @@ async def health_check(request: Request, pool: asyncpg.Pool = Depends(get_db)) -
     else:
         kafka_status = "disabled" if not _kafka_requested() else "error"
 
-    return HealthResponse(
-        status="healthy" if db_status == "ok" else "degraded",
+    ready = db_status == "ok" and kafka_status != "error"
+    body = HealthResponse(
+        status="healthy" if ready else "degraded",
         db=db_status,
         kafka=kafka_status,
     )
+    return JSONResponse(status_code=200 if ready else 503, content=body.model_dump())
+
+
+@app.get("/readyz", response_model=HealthResponse)
+@limiter.exempt
+async def readiness_check(request: Request) -> JSONResponse:
+    """Readiness probe: 503 while the DB (or a requested Kafka) is down."""
+    return await _readiness(request)
+
+
+@app.get("/health", response_model=HealthResponse)
+@limiter.exempt
+async def health_check(request: Request) -> JSONResponse:
+    """Health check (same as /readyz)."""
+    return await _readiness(request)
 
 
 # Prometheus metrics endpoint

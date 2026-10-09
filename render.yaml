@@ -28,7 +28,7 @@ services:
     plan: free
     rootDir: .
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /health
+    healthCheckPath: /readyz
     autoDeploy: true
     preDeployCommand: bash scripts/render_migrate.sh
     envVars:

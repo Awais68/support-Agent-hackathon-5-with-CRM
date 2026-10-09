@@ -75,8 +75,12 @@ spec:
           exec:
             command:
             - python
-            - -c
-            - "import sys; sys.exit(0)"
+            - -m
+            - utils.worker_healthcheck
+            - --max-age
+            - "120"
+          # Heartbeats: utils/heartbeat.py; a handler stuck longer than
+          # WORKER_STALL_SECONDS stops beating (AUDIT N6/C2).
           initialDelaySeconds: 30
           periodSeconds: 20
           timeoutSeconds: 5
@@ -85,8 +89,10 @@ spec:
           exec:
             command:
             - python
-            - -c
-            - "import sys; sys.exit(0)"
+            - -m
+            - utils.worker_healthcheck
+            - --max-age
+            - "30"
           initialDelaySeconds: 15
           periodSeconds: 10
           timeoutSeconds: 3

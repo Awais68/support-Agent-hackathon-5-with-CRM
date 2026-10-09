@@ -16,8 +16,8 @@ def test_health_check(client):
     """Test health check endpoint."""
     response = client.get("/health")
 
-    # Health check might fail without full setup, but endpoint should exist
-    assert response.status_code in [200, 500]  # 200 if services ready, 500 if not
+    # 200 when ready; without a DB it is 503 by design (AUDIT N6), never 500.
+    assert response.status_code in [200, 503]
 
 
 def test_api_key_required(client):
