@@ -11,6 +11,9 @@ Delivery guarantees:
   ``OUTBOUND_MAX_ATTEMPTS`` (default 3).
 - Dead-lettered: after the last attempt the row is marked ``failed`` and the
   original event is published to the DLQ topic.
+- Customer-voiced only: just ``customer_reply`` is delivered, never the
+  agent's ``internal_note``. An empty or operator-voiced reply is not sent;
+  the row is marked ``failed`` and the ticket escalated for a human.
 
 Only events carrying ``agent_run_id`` are delivered. The ``send_response``
 tool also publishes to this topic mid-run, but the agent always publishes
@@ -34,6 +37,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from agent.reply_guard import operator_voice_reason
 from exceptions import sanitize_error_message
 from kafka_client import (
     DLQ_TOPIC,
@@ -178,9 +182,7 @@ class OutboundSender:
     # Delivery
     # ------------------------------------------------------------------
     async def _send_once(self, channel: str, payload: dict, ticket_id: UUID | None) -> str | None:
-        body = payload.get("message") or payload.get("content") or ""
-        if not body:
-            raise PermanentDeliveryError("empty message body")
+        body = payload.get("customer_reply") or ""
 
         if channel in ("email", "gmail"):
             to_email = payload.get("customer_email")
@@ -229,6 +231,19 @@ class OutboundSender:
             await self._finish(key, "skipped", 0, error="in-app channel")
             return "skipped"
 
+        blocked = operator_voice_reason(payload.get("customer_reply"))
+        if blocked:
+            error = f"blocked: {blocked}"
+            await self._finish(key, "failed", 0, error=error)
+            await self._escalate(ticket_id)
+            logger.warning(
+                "Outbound reply blocked; ticket escalated",
+                idempotency_key=key,
+                channel=channel,
+                reason=blocked,
+            )
+            return "blocked"
+
         attempts = 0
         try:
             async for attempt in AsyncRetrying(
@@ -263,6 +278,12 @@ class OutboundSender:
             attempts=attempts,
         )
         return "sent"
+
+    async def _escalate(self, ticket_id: UUID | None) -> None:
+        if ticket_id is None:
+            return
+        async with self.db_pool.acquire() as conn:
+            await conn.execute("UPDATE tickets SET status = 'escalated' WHERE id = $1", ticket_id)
 
     async def _dead_letter(self, message: KafkaMessage, error: str, attempts: int) -> None:
         try:

@@ -59,7 +59,8 @@ async def pool():
         # comes from the real migration file.
         await conn.execute("""
             CREATE TABLE tickets (
-                id UUID PRIMARY KEY, customer_id UUID NOT NULL, subject TEXT
+                id UUID PRIMARY KEY, customer_id UUID NOT NULL, subject TEXT,
+                status VARCHAR(50) DEFAULT 'open'
             );
             CREATE TABLE customer_identifiers (
                 customer_id UUID NOT NULL,
@@ -100,7 +101,8 @@ def _event(ticket_id, channel="email", agent_run_id=None, **extra) -> KafkaMessa
         "ticket_id": ticket_id,
         "customer_email": "jane@example.com",
         "channel": channel,
-        "message": "Here is how to export your data.",
+        "customer_reply": "Here is how to export your data.",
+        "internal_note": "I've responded to the customer with the export steps.",
         "agent_run_id": agent_run_id or str(uuid.uuid4()),
     }
     payload.update(extra)
@@ -268,7 +270,7 @@ async def test_kafka_topic_message_triggers_send(pool):
                 "ticket_id": ticket_id,
                 "customer_email": "jane@example.com",
                 "channel": "email",
-                "message": f"reply for {agent_run_id}",
+                "customer_reply": f"Your reply for {agent_run_id}",
                 "agent_run_id": agent_run_id,
             },
             key=ticket_id,
@@ -283,7 +285,7 @@ async def test_kafka_topic_message_triggers_send(pool):
         await admin.close()
 
     email.assert_awaited_once_with(
-        "jane@example.com", "Cannot export CSV", f"reply for {agent_run_id}"
+        "jane@example.com", "Cannot export CSV", f"Your reply for {agent_run_id}"
     )
     row = await _row(pool, agent_run_id)
     assert row["status"] == "sent"
@@ -302,3 +304,44 @@ async def test_missing_gmail_token_fails_without_oauth_prompt(pool, tmp_path, mo
     row = await _row(pool, event.payload["agent_run_id"])
     assert row["attempts"] == 1 and "token file" in row["last_error"]
     assert producer.send_message.await_args.args[0] == DLQ_TOPIC
+
+
+async def _ticket_status(pool, ticket_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT status FROM tickets WHERE id = $1", uuid.UUID(ticket_id))
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "",
+        "I've responded to the customer with the CSV export steps.",
+        "The customer wants to export data; sent them the KB link.",
+    ],
+)
+@pytest.mark.parametrize("channel", ["email", "whatsapp"])
+async def test_empty_or_operator_voiced_reply_is_blocked_and_escalated(pool, channel, reply):
+    ticket_id = await _ticket(pool, phone="+15550001111")
+    producer = AsyncMock()
+    sender = _sender(pool, producer=producer)
+    event = _event(ticket_id, channel=channel, customer_reply=reply)
+
+    assert await sender.handle(event) == "blocked"
+    sender._email_sender.assert_not_awaited()
+    sender._whatsapp_sender.assert_not_awaited()
+    row = await _row(pool, event.payload["agent_run_id"])
+    assert row["status"] == "failed" and row["last_error"].startswith("blocked:")
+    assert await _ticket_status(pool, ticket_id) == "escalated"
+    # Not a delivery failure: replaying it would be blocked again.
+    producer.send_message.assert_not_awaited()
+
+
+async def test_internal_note_is_never_delivered(pool):
+    ticket_id = await _ticket(pool)
+    sender = _sender(pool)
+    event = _event(ticket_id)
+
+    assert await sender.handle(event) == "sent"
+    sent_body = sender._email_sender.await_args.args[2]
+    assert sent_body == event.payload["customer_reply"]
+    assert event.payload["internal_note"] not in sent_body

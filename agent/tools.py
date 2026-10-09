@@ -9,6 +9,7 @@ import asyncpg
 import structlog
 from openai import AsyncOpenAI
 
+from agent.reply_guard import operator_voice_reason
 from database import queries as db
 from embeddings_provider import (
     EMBEDDING_CIRCUIT_BREAKER,
@@ -188,7 +189,10 @@ OPENAI_TOOL_SCHEMAS = [
                     },
                     "response_body": {
                         "type": "string",
-                        "description": "The response message to send",
+                        "description": (
+                            "The exact message the customer will read, written directly "
+                            "to them (second person). Never describe what you did."
+                        ),
                     },
                     "response_type": {
                         "type": "string",
@@ -570,6 +574,21 @@ async def send_response(args: dict, context: ToolContext) -> dict:
         channel = args.get("channel", "email")
         response_body = args.get("response_body", "")
         response_type = args.get("response_type", "informational")
+
+        # Refuse internal or empty text before it is stored or delivered; the
+        # error tells the model to rewrite it for the customer.
+        rejection = operator_voice_reason(response_body)
+        if rejection:
+            logger.warning("send_response rejected", ticket_id=ticket_id, reason=rejection)
+            return {
+                "sent": False,
+                "message_id": None,
+                "message": "Response not sent.",
+                "error": (
+                    f"response_body rejected ({rejection}). Write it directly to the "
+                    "customer in the second person; do not describe your own actions."
+                ),
+            }
 
         logger.info(
             "Sending response",

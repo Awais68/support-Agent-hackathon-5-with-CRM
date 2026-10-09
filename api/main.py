@@ -753,14 +753,16 @@ async def webhook_webform(
                 channel="webform",
                 ticket_number=ticket["ticket_number"],
             )
-            await db.add_message(
-                pool,
-                ticket_id=ticket["id"],
-                customer_id=ticket["customer_id"],
-                direction="outbound",
-                content=result["response"],
-                channel="webform",
-            )
+            # send_response already stored the reply; a blocked reply is empty.
+            if result["response"] and not result.get("reply_persisted"):
+                await db.add_message(
+                    pool,
+                    ticket_id=ticket["id"],
+                    customer_id=ticket["customer_id"],
+                    direction="outbound",
+                    content=result["response"],
+                    channel="webform",
+                )
         except Exception as e:
             logger.warning(
                 "Synchronous agent reply failed",
@@ -783,6 +785,15 @@ async def webhook_webform(
 # ---------------------------------------------------------------------------
 # Voice channel (voice messages + phone calls)
 # ---------------------------------------------------------------------------
+VOICE_FALLBACK_REPLY = (
+    "I'm sorry, I'm having trouble right now. A human agent will call you back shortly."
+)
+VOICE_HANDOFF_REPLY = (
+    "Thanks for your patience. I've passed your request to our support team, "
+    "and a human agent will follow up with you shortly."
+)
+
+
 async def _run_voice_agent(
     pool: asyncpg.Pool,
     kafka_producer: KafkaProducerClient,
@@ -832,7 +843,8 @@ async def _run_voice_agent(
     )
 
     return {
-        "response": result["response"],
+        # Empty when the agent's reply was blocked and the ticket escalated.
+        "response": result["response"] or VOICE_HANDOFF_REPLY,
         "ticket_id": result["ticket_id"],
         "ticket_number": ticket["ticket_number"],
     }
@@ -955,9 +967,7 @@ async def webhook_voice_call(request: Request) -> Response:
         reply = agent_result["response"]
     except Exception as e:
         logger.error("Voice call agent failed", error=sanitize_error_message(str(e)))
-        reply = (
-            "I'm sorry, I'm having trouble right now. " "A human agent will call you back shortly."
-        )
+        reply = VOICE_FALLBACK_REPLY
 
     if was_translated:
         reply = await handler.translate_to_language(reply, lang)

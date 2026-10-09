@@ -19,6 +19,7 @@ from agent.formatters import (
 )
 from agent.pre_processing_gate import GateAction, run_gate
 from agent.prompts import CHANNEL_ADDENDUMS, CLASSIFICATION_PROMPT, SYSTEM_PROMPT
+from agent.reply_guard import operator_voice_reason
 from agent.sentiment_analyzer import detect_sentiment_drop
 from agent.tools import OPENAI_TOOL_SCHEMAS, ToolContext, execute_tool
 from chat_provider import chat_model
@@ -40,6 +41,13 @@ from metrics import (
 from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
+
+
+def _tool_succeeded(tool_result: str, flag: str) -> bool:
+    try:
+        return bool(json.loads(tool_result).get(flag))
+    except (ValueError, AttributeError):
+        return False
 
 
 @dataclass
@@ -180,6 +188,10 @@ class CustomerSuccessAgent:
             tool_calls = []
             token_usage = 0
             was_escalated = False
+            # The customer only ever sees text passed to send_response (or a
+            # fixed system reply). The model's closing chat message is an
+            # internal note for the support team.
+            sent_reply: str | None = None
 
             # Persist sentiment score + emotion + urgency + aspects to messages table
             if gate_result.sentiment_score is not None:
@@ -365,6 +377,10 @@ class CustomerSuccessAgent:
                             turn=turn,
                         )
                         tool_result = await execute_tool(tool_name, tool_args, tool_context)
+                        if tool_name == "send_response" and _tool_succeeded(tool_result, "sent"):
+                            sent_reply = tool_args.get("response_body") or sent_reply
+                        elif tool_name == "escalate_to_human":
+                            was_escalated = True
                         messages.append(
                             {
                                 "role": "tool",
@@ -401,28 +417,69 @@ class CustomerSuccessAgent:
                     )
             ticket_number = ticket_number or str(ticket_id)
 
-            if channel == "email":
+            # Separate what the customer reads from the agent's own notes.
+            if sent_reply is not None:
+                customer_reply, internal_note = sent_reply, output_message
+            else:
+                # Gate/fallback replies are fixed customer-facing text; a model
+                # that answered without send_response may still have written
+                # to the customer, which the guard below checks.
+                customer_reply, internal_note = output_message, ""
+
+            blocked_reason = operator_voice_reason(customer_reply)
+            if blocked_reason:
+                self.context.logger.warning(
+                    "Customer reply blocked; escalating instead",
+                    ticket_id=str(ticket_id),
+                    reason=blocked_reason,
+                )
+                internal_note = "\n\n".join(
+                    part
+                    for part in (
+                        f"Reply blocked ({blocked_reason}):",
+                        customer_reply,
+                        internal_note,
+                    )
+                    if part
+                )
+                customer_reply = ""
+                was_escalated = True
+                try:
+                    await db.update_ticket_status(self.context.db_pool, ticket_id, "escalated")
+                except Exception as e:
+                    self.context.logger.warning(
+                        "Could not escalate ticket after blocked reply",
+                        ticket_id=str(ticket_id),
+                        error=sanitize_error_message(str(e)),
+                    )
+
+            if not customer_reply:
+                formatted_response = ""
+            elif channel == "email":
                 formatted_response = format_email_response(
-                    output_message,
+                    customer_reply,
                     customer_name=customer_name,
                     ticket_number=ticket_number,
                 )
             elif channel == "whatsapp":
-                formatted_response = format_whatsapp_response(output_message)
+                formatted_response = format_whatsapp_response(customer_reply)
             elif channel == "webform":
                 formatted_response = format_web_form_response(
-                    output_message,
+                    customer_reply,
                     ticket_number=ticket_number,
                     tracking_url=f"https://support.techflow.com/track/{ticket_number}",
                 )
             else:
-                formatted_response = output_message
+                formatted_response = customer_reply
 
             # The ALLOW path records the outbound message through the
             # send_response tool. ESCALATE and DEFLECT never reach that tool, so
             # persist their reply here — otherwise the human agent picking up an
             # escalation cannot see what the customer was already told.
-            if gate_result.action in (GateAction.ESCALATE, GateAction.DEFLECT):
+            if formatted_response and gate_result.action in (
+                GateAction.ESCALATE,
+                GateAction.DEFLECT,
+            ):
                 try:
                     await db.add_message(
                         self.context.db_pool,
@@ -449,7 +506,9 @@ class CustomerSuccessAgent:
                 result={
                     "classification": classification,
                     "tool_calls": tool_calls,
-                    "escalated": was_escalated or "escalate" in output_message.lower(),
+                    "escalated": was_escalated,
+                    "internal_note": internal_note,
+                    "reply_blocked": blocked_reason,
                     "sentiment_score": gate_result.sentiment_score,
                     "emotion": gate_result.emotion,
                     "urgency_score": gate_result.urgency_score,
@@ -467,7 +526,10 @@ class CustomerSuccessAgent:
                     "ticket_id": str(ticket_id),
                     "customer_email": customer_email,
                     "channel": channel,
-                    "message": formatted_response,
+                    # The sender delivers customer_reply only; internal_note is
+                    # for operators and never leaves the system.
+                    "customer_reply": formatted_response,
+                    "internal_note": internal_note,
                     "agent_run_id": str(agent_run_id),
                     "timestamp": datetime.now(UTC).isoformat(),
                 },
@@ -510,6 +572,10 @@ class CustomerSuccessAgent:
                 "ticket_id": str(ticket_id),
                 "agent_run_id": str(agent_run_id),
                 "response": formatted_response,
+                "internal_note": internal_note,
+                # send_response already stored this reply in the conversation.
+                "reply_persisted": sent_reply is not None and not blocked_reason,
+                "escalated": was_escalated,
                 "classification": classification,
                 "tool_calls": tool_calls,
                 "tokens_used": token_usage,
