@@ -113,3 +113,84 @@ For webform tickets, the agent's reply rows appear in `outbound_deliveries` as `
 All temporary containers, volumes, and images for this run were removed (`docker compose -p spfix
 down -v`, the throwaway `sp-fix-pg` and k3s containers, and the scratch images). Unrelated local
 containers were not touched.
+
+---
+
+# Round 2
+
+Three customer-facing fixes and the hygiene items, on the same branch (one commit each). Providers
+stayed mocked throughout: compose ran with `TWILIO_*` blanked, no Gmail token, and the web form
+delivers in-app.
+
+| # | Issue | Fix (commit) | Evidence | Status |
+|---|---|---|---|---|
+| A | Email/WhatsApp delivered the agent's operator note ("I've responded to the customer…") | Outbound payload carries `customer_reply` (the `send_response` body only) and `internal_note` separately. `agent/reply_guard.py` rejects third-person or narrating text in `send_response` and blocks + escalates an operator-voiced final reply (fb2358e) | `tests/test_customer_reply.py` (17). Live: both Chrome tickets' `notifications.outbound` payloads have `customer_reply` that passes the guard; the operator text sits in `internal_note` | **Verified** (delivery itself: **Verified with mock**) |
+| B | `category=general` returned 0 KB results | `database/queries.py`: `kb_category_filter` maps form → KB categories (`bug`→`technical`; `general`/`feedback`/unknown → no filter); an empty filtered search retries the whole KB. Tool description updated (211ff9f) | `tests/test_kb_category.py` (17; 11 fail on the old code) against real PostgreSQL + pgvector. Live: a general question got 5 semantic results and was answered from "Exporting Data" | **Verified** |
+| C | Sentiment gate escalated calm technical questions | Technical failure words are masked before VADER; explicit hostility and critical incidents escalate on their own rules; legal stems fixed (7ec89d9) | Eval below; `tests/test_gate_eval.py` (11) asserts recall = 1.0, precision ≥ 0.9. Live: "429 … script is broken" → allow (0.5), answered | **Verified** |
+| H1 | `uv.lock` untracked | Committed (2263e88) | `uv lock --check` exit 0; `uv sync --frozen` from a clean `git archive` installs and imports | **Verified** |
+| H2 | Playwright key undocumented / errors without browsers | Marked `e2e`; key = `E2E_API_KEY` → `API_KEY_SECRET`; skip if chromium is missing; `.env.example` + README (56a8015, b50f5ad) | Full live suite 244 passed, 0 skipped | **Verified** |
+| H3 | Live-stack tests never ran in CI | `ci.yml` job `live-stack` (pgvector + Kafka services, migrate, uvicorn, `pytest -m "integration or e2e"`, 15 min timeout) (b50f5ad) | Simulated locally from a clean checkout without `.env`: 14 passed in ~12 s. GitHub result: see CI status | see CI status |
+
+### Category mismatches (fix B)
+
+| Form category | KB category used | Note |
+|---|---|---|
+| general | none (whole KB) | no `general` articles exist |
+| feedback | none (whole KB) | no `feedback` articles exist |
+| bug | technical | |
+| technical, billing | same | |
+| — | onboarding, product | in the KB but not offered by the form; reachable only unfiltered |
+
+### Sentiment gate eval (fix C)
+
+`tests/fixtures/sentiment_gate_eval.json`, 42 messages (20 should escalate): normal technical 12,
+mildly frustrated 8, urgent-but-polite 6, angry 6, abusive 4, legal/refund threats 6.
+Run: `uv run python -m agent.gate_eval -v`.
+
+| | TP | FP | FN | TN | Precision | Recall |
+|---|---|---|---|---|---|---|
+| Before (main) | 15 | 13 | 5 | 9 | 0.54 | 0.75 |
+| After | 20 | 1 | 0 | 21 | **0.95** | **1.00** |
+
+The remaining false positive is mildly_frustrated-06 ("Kind of disappointed the Slack integration
+doesn't support threads…", VADER 0.17). **Caveat:** the eval set and the lexicon were written by the
+same author in the same change, so these numbers likely overstate real-world accuracy. A labelled
+sample of real tickets is the next step.
+
+### Test counts
+
+- CI filter (`-m "not slow and not integration and not e2e"`): **230 passed**, 14 deselected.
+- Full suite with the compose stack (real PostgreSQL, Kafka, API, Playwright): **244 passed, 0 skipped**.
+- Lint: ruff and black clean; web form `npm run lint` exit 0 (warnings only), `npm run build` exit 0.
+
+### Live check (`docker compose -p spfix up -d --build`, Twilio blanked)
+
+- **General question** (TKT-20261009-9A7C78, "export dashboard to CSV/Excel"): gate allow (0.83),
+  5 semantic KB results, answer from "Exporting Data", status open, customer-voiced reply
+  (`docs/fix-report/09-round2-general-submitted.jpg`). The model omitted the category this time, so
+  the `general` mapping itself was proven by the tests, not by this run.
+- **Technical question** (TKT-20261009-AD6876, "429 … script is broken"): gate allow (0.5), KB
+  searched with `category=technical`, reply explains the rate limit and `Retry-After`, status open.
+- Not exercised live: real Gmail/WhatsApp delivery (providers mocked / unconfigured).
+
+### CI status
+
+CI_STATUS_PLACEHOLDER
+
+### New findings (round 2, not fixed)
+
+1. **The reply guard is a heuristic.** "Customer asked how…" (no article) is not caught; the
+   internal note of TKT-20261009-9A7C78 passed it. It only matters if internal text is ever routed
+   to delivery again.
+2. **Replies open with "Great question".** Prompt tone issue.
+3. **The `send_response` tool event still publishes `content` to `notifications.outbound`** (round-1
+   finding 5). It is not delivered, but two payload shapes remain on one topic.
+4. **Pricing patterns are too broad.** Any question containing "bill", "invoice" or "cost" escalates.
+5. **Emotion stems in `agent/sentiment_analyzer.py` still end in `\b`** (e.g. "frustrat" misses
+   "frustrated"); only the gate's legal stems were fixed.
+6. **Correction to round-1 finding 10:** `/webhooks/voice/call` already honours
+   `TWILIO_VOICE_WEBHOOK_URL` (`api/main.py:904`). The WhatsApp webhook (`api/main.py:663`) has no
+   override and still uses `request.url`.
+7. **`main` CI was already red before this branch** (ruff/black, round-1 finding 17).
+8. **Render PR previews:** whether they are enabled can't be seen from the repo (`render.yaml` sets
+   `autoDeploy: true` with no branch, so it follows the service's dashboard branch).

@@ -748,50 +748,51 @@ machine. The items marked ✅ were fixed on branch `fix/known-issues`; see
   - The Twilio signature is required on `/webhooks/voice/call`, and the API key on
     `/webhooks/voice/message`.
   - An SSRF guard now protects `audio_url`.
+- ✅ **Agent replies read as operator notes.** Only the `send_response` body is delivered now
+  (`customer_reply`); the agent's final message travels separately as `internal_note`, and a guard
+  (`agent/reply_guard.py`) blocks third-person/narrating text and escalates instead.
+- ✅ **The form category emptied KB search.** `general`/`feedback` no longer filter, `bug` maps to
+  `technical`, and an empty filtered search retries the whole KB.
+- ✅ **The sentiment gate escalated calm technical questions.** Failure words ("error", "broken",
+  "429 failing") no longer count as negative; explicit hostility and critical incidents escalate.
+  Eval (`python -m agent.gate_eval`, 42 messages): precision 0.54→0.95, recall 0.75→1.00.
+- ✅ **The Playwright tests are marked `e2e`** and read `E2E_API_KEY` (falls back to `API_KEY_SECRET`).
+- ✅ **`uv.lock` is committed;** `uv sync --frozen` works.
 
 ### Broken or non-functional
 
-1. **Agent replies to email/WhatsApp read as operator notes.** The final agent message sometimes
-   says things like "I've responded to the customer…", and that text is what the outbound sender
-   delivers.
-2. **The agent passes the form category as a KB filter.** For `general` this returns 0 results and
-   the ticket escalates.
-3. **The sentiment gate escalates neutral technical questions.** For example, "failing with 429"
-   scored 0.24.
-4. **Missing Gmail token/credential files become root-owned directories** through the compose bind
+1. **Missing Gmail token/credential files become root-owned directories** through the compose bind
    mounts.
-5. **In Kubernetes, the worker liveness/readiness probes are no-ops** (`sys.exit(0)`), and the
+2. **In Kubernetes, the worker liveness/readiness probes are no-ops** (`sys.exit(0)`), and the
    worker Deployment lacks `GEMINI_*`/`DEEPSEEK_*` env.
-6. **The browser can't reach the API in Kubernetes or Render.** `NEXT_PUBLIC_API_URL` is baked into
+3. **The browser can't reach the API in Kubernetes or Render.** `NEXT_PUBLIC_API_URL` is baked into
    the browser bundle as a cluster-internal name, and `API_INTERNAL_URL`/`API_KEY_SECRET` aren't set
    for the web form there. Compose is fixed.
-7. **Twilio signature validation uses `request.url`,** so it fails behind a TLS-terminating
-   proxy/ingress.
-8. **The Playwright tests aren't marked `e2e`,** and they need `E2E_API_KEY` equal to the server's
-   `API_KEY_SECRET`.
-9. **`KafkaProducerClient` retries only connection/timeout errors,** so the first publish to a cold
+4. **WhatsApp signature validation uses `request.url`,** so it fails behind a TLS-terminating
+   proxy/ingress. The voice webhook already has a `TWILIO_VOICE_WEBHOOK_URL` override; WhatsApp has none.
+5. **`KafkaProducerClient` retries only connection/timeout errors,** so the first publish to a cold
    broker can fail.
-10. **The k8s Ingress routes `/api` to the backend,** which has no `/api` prefix. It also shadows the
-    Next.js `/api/tickets/[id]` route.
-11. **WhatsApp messages are silently dropped when `ENABLE_KAFKA=false`,** for example on Render, which
-    ships with Kafka off.
-12. **`database/seed.py --migrations-only` still seeds data and backfills embeddings.** The flag only
-    changes log text.
-13. **Two migration runners keep separate tracking tables** (`schema_migrations` in `seed.py` and
-    `_migrations_applied` in `render_migrate.sh`). Running both on the same DB re-applies the
-    non-idempotent `001`, which then fails on the unique title index.
-14. **Gate and sentiment regexes miss words.** Word stems are followed by `\b`, so they never match the
-    full word. For example, `\blawsu\b` misses "lawsuit" and `\blitigat\b` misses "litigation"
-    (`agent/pre_processing_gate.py:67,71`). Many emotion stems have the same problem ("frustrated",
-    "unacceptable"). Other patterns are too broad: "cost", "bill", "down", and "production" all
-    escalate.
-15. **Every agent run is recorded as `completed`,** even when it fails (`queries.complete_agent_run`),
+6. **The k8s Ingress routes `/api` to the backend,** which has no `/api` prefix. It also shadows the
+   Next.js `/api/tickets/[id]` route.
+7. **WhatsApp messages are silently dropped when `ENABLE_KAFKA=false`,** for example on Render, which
+   ships with Kafka off.
+8. **`database/seed.py --migrations-only` still seeds data and backfills embeddings.** The flag only
+   changes log text.
+9. **Two migration runners keep separate tracking tables** (`schema_migrations` in `seed.py` and
+   `_migrations_applied` in `render_migrate.sh`). Running both on the same DB re-applies the
+   non-idempotent `001`, which then fails on the unique title index.
+10. **Gate regexes are partly fixed.** The legal stems now match ("lawsuit", "litigation"), but the
+    emotion stems in `agent/sentiment_analyzer.py` still end in `\b` ("frustrated" is missed), and the
+    pricing patterns are too broad: any question mentioning "bill", "invoice" or "cost" escalates.
+11. **Every agent run is recorded as `completed`,** even when it fails (`queries.complete_agent_run`),
     so failure metrics always read 0.
-16. **`chaos.yml` can't work.** It runs on a fresh GitHub runner and health-checks `localhost:8000`
+12. **`chaos.yml` can't work.** It runs on a fresh GitHub runner and health-checks `localhost:8000`
     without starting any stack. Chaos experiment 01 also expects a restart policy that compose doesn't
     define.
-17. **The Grafana dashboard isn't loaded.** There are no provisioning files, and the login defaults to
+13. **The Grafana dashboard isn't loaded.** There are no provisioning files, and the login defaults to
     `admin/admin`.
+14. **Two producers still publish to `notifications.outbound`:** the `send_response` tool event uses
+    `content`, the final reply uses `customer_reply`. Only the latter is delivered.
 
 ### Security and risk
 
@@ -848,7 +849,7 @@ machine. The items marked ✅ were fixed on branch `fix/known-issues`; see
 - **Gmail blocks the worker:** the handler uses blocking Google API calls inside async code, and
   `InstalledAppFlow.run_local_server` would hang a headless worker if no token exists.
 - **The test count badge in the old README said 136.** On `main` the suite had 141 passing and 12
-  skipped. On `fix/known-issues` it has 192 passing with the live stack (178 under the CI filter).
+  skipped. On `fix/known-issues` it has 244 passing with the live stack (230 under the CI filter).
 
 ---
 
