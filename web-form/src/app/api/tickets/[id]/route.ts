@@ -10,7 +10,12 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   const ticketId = params.id;
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+  // Server-side call: inside compose the browser-facing URL (localhost) is
+  // not the API, so prefer the internal service URL when it is set.
+  const apiUrl =
+    process.env.API_INTERNAL_URL ||
+    process.env.NEXT_PUBLIC_API_URL ||
+    'http://localhost:8000';
   const apiKey = process.env.API_KEY_SECRET;
 
   if (!apiKey) {

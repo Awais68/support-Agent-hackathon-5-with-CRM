@@ -167,7 +167,9 @@ services:
       context: ./web-form
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: http://api:8000
+        # Baked into the browser bundle, so it must be reachable from the
+        # user's browser, not just from inside the compose network.
+        NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
         NEXT_PUBLIC_COMPANY_NAME: ${COMPANY_NAME:-TechFlow Analytics}
         NEXT_PUBLIC_SUPPORT_EMAIL: ${SUPPORT_EMAIL:-support@techflow-analytics.com}
     container_name: techflow-web-form
@@ -175,6 +177,10 @@ services:
       - "3000:3000"
     environment:
       NODE_ENV: production
+      # Server-side route handlers (/api/tickets, /api/voice) call the API
+      # over the compose network with the shared key.
+      API_INTERNAL_URL: http://api:8000
+      API_KEY_SECRET: ${API_KEY:-${API_KEY_SECRET:?set API_KEY or API_KEY_SECRET in .env}}
     depends_on:
       api:
         condition: service_healthy
