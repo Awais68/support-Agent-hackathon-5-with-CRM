@@ -35,7 +35,7 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 |---|---|---|---|---|
 | S1 | Critical | Web-form proxy `/api/tickets/[id]` attaches the master key; `..%2F` reaches any GET | Fixed (S1 commit) | `tests/test_proxy_exploits_live.py`: 10 failed (all audit URLs 200 with ticket/customer/metrics data) → 11 passed (400; own ticket via token/email 200, wrong token 404) |
 | S13 | Low | `get_ticket` exposes `agent_runs` (internal prompts, errors) | Fixed (S1 commit): customers only see `/public/tickets/*`, which drops agent_runs, customer identity, assignment and message metadata; `/tickets/{id}` stays key-only | `tests/test_ticket_tracking.py::test_valid_token_returns_redacted_view` |
-| S2 | High | Fuzzy email identity merge (`alice1@` → Alice) | Open | |
+| S2 | High | Fuzzy email identity merge (`alice1@` → Alice) | Fixed (S2 commit): exact normalized email only in `get_customer_or_create_by_identifier`, `create_ticket`, `find_customer_by_name_email`, `get_customer_history`; look-alikes become a new customer with a review hint. Existing links: see "Data clean-up" below | `tests/test_identity_exact_match.py` (real PG): 6 failed → 7 passed |
 | S3 | High | LLM tools take model-supplied `ticket_id` / `customer_email` | Open | |
 | S4 | High | WebSocket `/ws/tickets/{id}` unauthenticated | Open | |
 | S5 | High | `.env.development*`, `credentials.json`, `.kilo/` baked into the image | Open | |
@@ -96,6 +96,19 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 | R2-3 | Low | `send_response` publishes a second payload shape on `notifications.outbound` | Open |
 | R2-4 | Low | = N12 billing patterns | Open |
 | R2-5 | Low | Emotion stems in `sentiment_analyzer.py` end in `\b` | Open |
+
+## Data clean-up (you)
+
+S2 stops new fuzzy links but does not touch existing rows. List email identifiers that
+differ from their customer's own email, review each, and move the wrong ones with
+`POST /customers/{id}/merge` or delete the identifier row:
+
+```sql
+SELECT c.id, c.email AS customer_email, ci.identifier_value AS linked_email, ci.created_at
+FROM customer_identifiers ci JOIN customers c ON c.id = ci.customer_id
+WHERE ci.identifier_type = 'email' AND lower(ci.identifier_value) <> lower(c.email)
+ORDER BY ci.created_at;
+```
 
 ## Secrets to rotate (you)
 

@@ -13,11 +13,12 @@ import structlog
 
 FUZZY_THRESHOLD_DEFAULT = 0.3
 
-# Trigram similarity alone is not enough to identify a person by email:
-# similarity('dup-test-1787409712@example.com', 'test@example.com') = 0.53,
-# far above the 0.3 threshold, which merged unrelated customers. Fuzzy email
-# matching therefore also requires the same domain and a small edit distance on
-# the local part (typo 'jon'→'john' = 1; unrelated locals are far apart).
+# An email is linked to an existing customer only on an EXACT match after
+# normalize_email(). A near-miss is a different mailbox: alice1@acmecorp.com
+# is edit distance 1 from alice@acmecorp.com and belongs to whoever registered
+# it, so linking it handed a stranger Alice's ticket history (AUDIT S2). Fuzzy
+# email (same domain + small local-part edit distance) is only a review hint on
+# the new customer, never a link.
 EMAIL_LOCAL_MAX_DISTANCE = int(os.getenv("EMAIL_FUZZY_MAX_DISTANCE", "2"))
 
 # Name similarity is NOT an identity signal. Measured with pg_trgm on real pairs:
@@ -33,6 +34,11 @@ EMAIL_LOCAL_MAX_DISTANCE = int(os.getenv("EMAIL_FUZZY_MAX_DISTANCE", "2"))
 NAME_FUZZY_THRESHOLD = float(os.getenv("NAME_FUZZY_THRESHOLD", "0.6"))
 NAME_FUZZY_AMBIGUITY_MARGIN = float(os.getenv("NAME_FUZZY_AMBIGUITY_MARGIN", "0.08"))
 EMBEDDING_DIM = 1536
+
+
+def normalize_email(email: str) -> str:
+    """Canonical form for identity matching: trimmed and lower-cased."""
+    return (email or "").strip().lower()
 
 
 @dataclass
@@ -199,7 +205,14 @@ async def get_customer_or_create_by_identifier(
     tier: str = "starter",
     fuzzy_threshold: float = FUZZY_THRESHOLD_DEFAULT,
 ) -> dict[str, Any]:
-    """Get a customer by identifier, with fuzzy fallback on email/name, or create new."""
+    """Get a customer by exact identifier, or create a new one.
+
+    Emails match only exactly after normalize_email(). Similar emails or names
+    are recorded as a review hint on the NEW customer, never linked.
+    """
+    if identifier_type == "email":
+        identifier_value = normalize_email(identifier_value)
+
     async with pool.acquire() as conn:
         async with conn.transaction():
             # ── Step 1: exact match via identifier table ──
@@ -208,7 +221,10 @@ async def get_customer_or_create_by_identifier(
                 SELECT c.id, c.email, c.name, c.company, c.tier, c.created_at, c.updated_at, c.metadata
                 FROM customers c
                 JOIN customer_identifiers ci ON ci.customer_id = c.id
-                WHERE ci.identifier_type = $1 AND ci.identifier_value = $2
+                WHERE ci.identifier_type = $1
+                  AND (ci.identifier_value = $2
+                       OR ($1 = 'email' AND lower(ci.identifier_value) = $2))
+                LIMIT 1
                 """,
                 identifier_type,
                 identifier_value,
@@ -216,49 +232,53 @@ async def get_customer_or_create_by_identifier(
             if existing:
                 return dict(existing)
 
-            fuzzy_matched = False
-
-            # ── Step 2: fuzzy fallback on email ──
+            # ── Step 1b: exact email on the customer row (no identifier yet) ──
             if identifier_type == "email":
-                fuzzy_row = await conn.fetchrow(
+                existing = await conn.fetchrow(
                     """
-                    SELECT id, email, name, company, tier, created_at, updated_at, metadata,
-                           similarity(email, $1) AS sim
+                    SELECT id, email, name, company, tier, created_at, updated_at, metadata
+                    FROM customers
+                    WHERE lower(email) = $1
+                    LIMIT 1
+                    """,
+                    identifier_value,
+                )
+                if existing:
+                    await conn.execute(
+                        """
+                        INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)
+                        VALUES ($1, 'email', $2)
+                        ON CONFLICT (identifier_type, identifier_value) DO NOTHING
+                        """,
+                        existing["id"],
+                        identifier_value,
+                    )
+                    return dict(existing)
+
+            # ── Steps 2-3: similar email or name → review hint only, never a link ──
+            duplicate_hint: dict[str, Any] = {}
+            candidate = None
+            if identifier_type == "email":
+                candidate = await conn.fetchrow(
+                    """
+                    SELECT id, name, similarity(email, $1) AS sim
                     FROM customers
                     WHERE email % $1
-                      AND split_part(email, '@', 2) = split_part($1, '@', 2)
+                      AND split_part(lower(email), '@', 2) = split_part($1, '@', 2)
                       AND levenshtein(
-                            split_part(email, '@', 1), split_part($1, '@', 1)
+                            split_part(lower(email), '@', 1), split_part($1, '@', 1)
                           ) <= $2
+                      AND similarity(email, $1) >= $3
                     ORDER BY sim DESC
                     LIMIT 1
                     """,
                     identifier_value,
                     EMAIL_LOCAL_MAX_DISTANCE,
+                    fuzzy_threshold,
                 )
-                if fuzzy_row and fuzzy_row["sim"] >= fuzzy_threshold:
-                    await conn.execute(
-                        """
-                        INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)
-                        VALUES ($1, $2, $3)
-                        ON CONFLICT (identifier_type, identifier_value) DO NOTHING
-                        """,
-                        fuzzy_row["id"],
-                        identifier_type,
-                        identifier_value,
-                    )
-                    fuzzy_matched = True
-                    existing = fuzzy_row
-
-            if fuzzy_matched:
-                return dict(existing)
-
-            # ── Step 3: name similarity is flagged for review, never auto-linked ──
             # See NAME_FUZZY_THRESHOLD: a name match cannot tell a typo apart from a
-            # different person, so linking on it would silently merge two customers.
-            # Record the candidate on the new row instead and let a human resolve it.
-            duplicate_hint: dict[str, Any] = {}
-            if name and name != "Customer":
+            # different person either.
+            if candidate is None and name and name != "Customer":
                 candidate = await conn.fetchrow(
                     """
                     SELECT id, name, similarity(name, $1) AS sim
@@ -271,19 +291,19 @@ async def get_customer_or_create_by_identifier(
                     name,
                     NAME_FUZZY_THRESHOLD,
                 )
-                if candidate:
-                    duplicate_hint = {
-                        "possible_duplicate_of": str(candidate["id"]),
-                        "possible_duplicate_name": candidate["name"],
-                        "possible_duplicate_similarity": float(candidate["sim"]),
-                        "needs_identity_review": True,
-                    }
-                    logger.info(
-                        "possible_duplicate_customer",
-                        identifier_type=identifier_type,
-                        candidate_id=str(candidate["id"]),
-                        similarity=float(candidate["sim"]),
-                    )
+            if candidate:
+                duplicate_hint = {
+                    "possible_duplicate_of": str(candidate["id"]),
+                    "possible_duplicate_name": candidate["name"],
+                    "possible_duplicate_similarity": float(candidate["sim"]),
+                    "needs_identity_review": True,
+                }
+                logger.info(
+                    "possible_duplicate_customer",
+                    identifier_type=identifier_type,
+                    candidate_id=str(candidate["id"]),
+                    similarity=float(candidate["sim"]),
+                )
 
             # ── Step 4: create new customer + identifier ──
             if identifier_type == "email":
@@ -334,89 +354,37 @@ async def find_customer_by_name_email(
     email: str,
     name: str | None = None,
     company: str | None = None,
-    fuzzy_threshold: float = FUZZY_THRESHOLD_DEFAULT,
 ) -> dict[str, Any] | None:
-    """
-    Look up a customer by email (exact first, then fuzzy), optionally by name.
+    """Look up a customer by exact (normalized) email.
 
-    Read-only: this never writes an identifier link. Every result carries a
-    ``match_type`` of ``exact_email``, ``fuzzy_email`` or ``fuzzy_name`` so the
-    caller can weigh how much to trust it. A name-only match is returned only when
-    corroborated by the email domain or company and when no runner-up is close
-    enough to make the choice ambiguous. Returns the best match or None.
+    ``name`` and ``company`` are accepted for callers but never used to pick a
+    customer: a similar email or name belongs to a different person as often
+    as not (AUDIT S2). Similar customers surface through the review queue
+    instead. The result carries ``match_type = "exact_email"``.
     """
+    normalized = normalize_email(email)
+    if not normalized:
+        return None
     async with pool.acquire() as conn:
-        # Exact email match
         row = await conn.fetchrow(
-            "SELECT id, email, name, company, tier, created_at, updated_at, metadata FROM customers WHERE email = $1",
-            email,
-        )
-        if row:
-            match = dict(row)
-            match["match_type"] = "exact_email"
-            return match
-
-        # Fuzzy email match (same domain + small local-part edit distance)
-        fuzzy_row = await conn.fetchrow(
             """
-            SELECT id, email, name, company, tier, created_at, updated_at, metadata,
-                   similarity(email, $1) AS sim
+            SELECT id, email, name, company, tier, created_at, updated_at, metadata
             FROM customers
-            WHERE email % $1
-              AND split_part(email, '@', 2) = split_part($1, '@', 2)
-              AND levenshtein(split_part(email, '@', 1), split_part($1, '@', 1)) <= $2
-            ORDER BY sim DESC
+            WHERE lower(email) = $1
+               OR id = (
+                    SELECT customer_id FROM customer_identifiers
+                    WHERE identifier_type = 'email' AND lower(identifier_value) = $1
+                    LIMIT 1
+               )
             LIMIT 1
             """,
-            email,
-            EMAIL_LOCAL_MAX_DISTANCE,
+            normalized,
         )
-        if fuzzy_row and fuzzy_row["sim"] >= fuzzy_threshold:
-            match = dict(fuzzy_row)
-            match["match_type"] = "fuzzy_email"
-            return match
-
-        # Fuzzy name match: corroborated and unambiguous only, never on its own.
-        if name:
-            candidates = await conn.fetch(
-                """
-                SELECT id, email, name, company, tier, created_at, updated_at, metadata,
-                       similarity(name, $1) AS sim
-                FROM customers
-                WHERE name % $1
-                  AND similarity(name, $1) >= $2
-                ORDER BY sim DESC
-                LIMIT 2
-                """,
-                name,
-                max(fuzzy_threshold, NAME_FUZZY_THRESHOLD),
-            )
-            if candidates:
-                best = dict(candidates[0])
-                # A close runner-up means we cannot tell which person this is.
-                ambiguous = (
-                    len(candidates) > 1
-                    and (best["sim"] - candidates[1]["sim"]) < NAME_FUZZY_AMBIGUITY_MARGIN
-                )
-                query_domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
-                best_email = best.get("email") or ""
-                best_domain = best_email.rsplit("@", 1)[-1].lower() if "@" in best_email else ""
-                same_domain = bool(query_domain) and query_domain == best_domain
-                same_company = bool(
-                    company
-                    and best.get("company")
-                    and company.strip().lower() == best["company"].strip().lower()
-                )
-                if (same_domain or same_company) and not ambiguous:
-                    best["match_type"] = "fuzzy_name"
-                    return best
-                logger.debug(
-                    "name_match_rejected",
-                    reason="ambiguous" if ambiguous else "uncorroborated",
-                    similarity=float(best["sim"]),
-                )
-
-        return None
+        if not row:
+            return None
+        match = dict(row)
+        match["match_type"] = "exact_email"
+        return match
 
 
 async def get_customer_history(
@@ -433,9 +401,10 @@ async def get_customer_history(
         customer_id = await conn.fetchval(
             """
             SELECT customer_id FROM customer_identifiers
-            WHERE identifier_type = 'email' AND identifier_value = $1
+            WHERE identifier_type = 'email' AND lower(identifier_value) = $1
+            LIMIT 1
             """,
-            email,
+            normalize_email(email),
         )
         if not customer_id:
             return []
@@ -472,6 +441,7 @@ async def create_ticket(
     customer_id: UUID | None = None,
 ) -> dict[str, Any]:
     """Create a new ticket with auto-generated ticket number."""
+    customer_email = normalize_email(customer_email)
     max_attempts = 3
     original_customer_id = customer_id
 
@@ -485,37 +455,28 @@ async def create_ticket(
                     )
 
                     if not customer_id:
+                        # Exact normalized email only; a look-alike address is a
+                        # different customer (AUDIT S2).
                         customer_row = await conn.fetchrow(
-                            "SELECT id FROM customers WHERE email = $1", customer_email
+                            """
+                            SELECT id FROM customers WHERE lower(email) = $1
+                            UNION ALL
+                            SELECT customer_id FROM customer_identifiers
+                            WHERE identifier_type = 'email' AND lower(identifier_value) = $1
+                            LIMIT 1
+                            """,
+                            customer_email,
                         )
                         if customer_row:
                             customer_id = customer_row["id"]
                         else:
-                            fuzzy_row = await conn.fetchrow(
-                                """
-                                SELECT id, similarity(email, $1) AS sim
-                                FROM customers
-                                WHERE email % $1
-                                  AND split_part(email, '@', 2) = split_part($1, '@', 2)
-                                  AND levenshtein(
-                                        split_part(email, '@', 1), split_part($1, '@', 1)
-                                      ) <= $2
-                                ORDER BY sim DESC
-                                LIMIT 1
-                                """,
+                            customer_row = await conn.fetchrow(
+                                "INSERT INTO customers (email, name, tier) VALUES ($1, $2, $3) RETURNING id",
                                 customer_email,
-                                EMAIL_LOCAL_MAX_DISTANCE,
+                                customer_email.split("@")[0],
+                                "starter",
                             )
-                            if fuzzy_row and fuzzy_row["sim"] >= FUZZY_THRESHOLD_DEFAULT:
-                                customer_id = fuzzy_row["id"]
-                            else:
-                                customer_row = await conn.fetchrow(
-                                    "INSERT INTO customers (email, name, tier) VALUES ($1, $2, $3) RETURNING id",
-                                    customer_email,
-                                    customer_email.split("@")[0],
-                                    "starter",
-                                )
-                                customer_id = customer_row["id"]
+                            customer_id = customer_row["id"]
 
                     # Register the email identifier so customer history resolves
                     # regardless of which channel created the ticket.
