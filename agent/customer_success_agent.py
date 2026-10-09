@@ -21,7 +21,7 @@ from agent.pre_processing_gate import GateAction, run_gate
 from agent.prompts import CHANNEL_ADDENDUMS, CLASSIFICATION_PROMPT, SYSTEM_PROMPT
 from agent.reply_guard import operator_voice_reason
 from agent.sentiment_analyzer import detect_sentiment_drop
-from agent.tools import OPENAI_TOOL_SCHEMAS, ToolContext, execute_tool
+from agent.tools import ToolContext, execute_tool, tool_schemas_for
 from chat_provider import chat_model
 from database import queries as db
 from embeddings_provider import EmbeddingProvider, build_embedding_provider
@@ -314,7 +314,14 @@ class CustomerSuccessAgent:
                     kafka_producer=self.context.kafka_producer,
                     openai_client=self.context.openai_client,
                     embedding_provider=self.context.embedding_provider,
+                    # Bind the run to this ticket: tools ignore any ticket or
+                    # customer the model names (AUDIT S3).
+                    ticket_id=UUID(str(ticket_id)),
+                    customer_id=UUID(str(customer_id)),
+                    customer_email=customer_email,
+                    channel=channel,
                 )
+                tool_schemas = tool_schemas_for(tool_context)
 
                 messages = [
                     {"role": "system", "content": system_prompt},
@@ -334,7 +341,7 @@ class CustomerSuccessAgent:
                             response = await self.context.openai_client.chat.completions.create(
                                 model=self.model,
                                 messages=messages,
-                                tools=OPENAI_TOOL_SCHEMAS,
+                                tools=tool_schemas,
                                 tool_choice="auto",
                                 temperature=0.7,
                                 max_tokens=2000,

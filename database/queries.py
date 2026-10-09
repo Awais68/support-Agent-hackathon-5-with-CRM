@@ -391,12 +391,6 @@ async def get_customer_history(
     pool: asyncpg.Pool, email: str, limit: int = 10, include_resolved: bool = True
 ) -> list[dict[str, Any]]:
     """Get customer's ticket history. Resolves customer via identifier table for cross-channel support."""
-    status_filter = (
-        "(status IN ('open', 'in_progress', 'escalated', 'closed'))"
-        if not include_resolved
-        else "(1=1)"
-    )
-
     async with pool.acquire() as conn:
         customer_id = await conn.fetchval(
             """
@@ -406,9 +400,21 @@ async def get_customer_history(
             """,
             normalize_email(email),
         )
-        if not customer_id:
-            return []
+    if not customer_id:
+        return []
+    return await get_customer_history_by_id(pool, customer_id, limit, include_resolved)
 
+
+async def get_customer_history_by_id(
+    pool: asyncpg.Pool, customer_id: UUID, limit: int = 10, include_resolved: bool = True
+) -> list[dict[str, Any]]:
+    """Ticket history for one customer id (the agent's tools are bound to it)."""
+    status_filter = (
+        "(status IN ('open', 'in_progress', 'escalated', 'closed'))"
+        if not include_resolved
+        else "(1=1)"
+    )
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
             SELECT

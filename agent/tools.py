@@ -1,5 +1,6 @@
 """Agent tools for TechFlow CRM Digital FTE using OpenAI SDK with real DB/Kafka integration."""
 
+import copy
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -37,6 +38,18 @@ class ToolContext:
     # Embeddings run on their own provider (see embeddings_provider). Left
     # unset, embeddings fall back to openai_client.
     embedding_provider: EmbeddingProvider | None = None
+    # The ticket this run answers. When set, the server owns these IDs: the
+    # model never sees ticket/customer parameters and any it sends are
+    # replaced (AUDIT S3), so a prompt injection cannot point a tool at
+    # another customer's ticket or history.
+    ticket_id: UUID | None = None
+    customer_id: UUID | None = None
+    customer_email: str | None = None
+    channel: str | None = None
+
+    @property
+    def bound(self) -> bool:
+        return self.ticket_id is not None and self.customer_id is not None
 
 
 # OpenAI tool schemas (proper format for chat.completions.create)
@@ -411,7 +424,7 @@ async def get_customer_history(args: dict, context: ToolContext) -> dict:
     """Retrieve customer's ticket history and previous interactions (cross-channel)."""
     try:
         customer_email = args.get("customer_email", "")
-        limit = args.get("limit", 10)
+        limit = _clamp_limit(args.get("limit", 10))
         include_resolved = args.get("include_resolved", True)
 
         logger.info(
@@ -420,14 +433,22 @@ async def get_customer_history(args: dict, context: ToolContext) -> dict:
             limit=limit,
         )
 
-        history = await db.get_customer_history(
-            pool=context.db_pool,
-            email=customer_email,
-            limit=limit,
-            include_resolved=include_resolved,
-        )
+        if context.bound:
+            history = await db.get_customer_history_by_id(
+                context.db_pool,
+                context.customer_id,
+                limit=limit,
+                include_resolved=include_resolved,
+            )
+        else:
+            history = await db.get_customer_history(
+                pool=context.db_pool,
+                email=customer_email,
+                limit=limit,
+                include_resolved=include_resolved,
+            )
 
-        if not history:
+        if not history and not context.bound:
             phone = args.get("customer_phone")
             if phone:
                 customer = await db.get_customer_by_identifier(context.db_pool, "phone", phone)
@@ -611,6 +632,14 @@ async def send_response(args: dict, context: ToolContext) -> dict:
             }
 
         customer_id = ticket["customer_id"]
+        if context.bound and customer_id != context.customer_id:
+            logger.warning("send_response ticket/customer mismatch", ticket_id=ticket_id)
+            return {
+                "sent": False,
+                "message_id": None,
+                "message": f"Ticket {ticket_id} not found",
+                "error": "Ticket not found",
+            }
 
         # Add message to database
         message = await db.add_message(
@@ -690,11 +719,66 @@ _TOOL_DISPATCH = {
 }
 
 
+# Arguments that name a ticket, customer or delivery target. On a bound
+# context they are hidden from the model and filled in by the server.
+_BOUND_ARGS = ("ticket_id", "customer_email", "customer_phone", "channel")
+# Tools a bound run must not call: the ticket already exists, and a new one
+# could be filed under any email the model chose.
+_UNBOUND_ONLY_TOOLS = frozenset({"create_ticket"})
+_MAX_HISTORY_LIMIT = 50
+
+
+def _clamp_limit(value) -> int:
+    try:
+        return max(1, min(int(value), _MAX_HISTORY_LIMIT))
+    except (TypeError, ValueError):
+        return 10
+
+
+def tool_schemas_for(context: ToolContext) -> list[dict]:
+    """Tool schemas to offer the model for this context.
+
+    Unbound contexts get the full schemas. Bound ones drop create_ticket and
+    every ID/target parameter, so the model has nothing to point elsewhere.
+    """
+    if not context.bound:
+        return OPENAI_TOOL_SCHEMAS
+    schemas = []
+    for schema in OPENAI_TOOL_SCHEMAS:
+        if schema["function"]["name"] in _UNBOUND_ONLY_TOOLS:
+            continue
+        schema = copy.deepcopy(schema)
+        params = schema["function"]["parameters"]
+        for key in _BOUND_ARGS:
+            params.get("properties", {}).pop(key, None)
+        if "required" in params:
+            params["required"] = [k for k in params["required"] if k not in _BOUND_ARGS]
+        schemas.append(schema)
+    return schemas
+
+
+def _bind_args(args: dict, context: ToolContext) -> dict:
+    """Replace any model-supplied IDs with the run's own."""
+    bound = {k: v for k, v in args.items() if k not in _BOUND_ARGS}
+    bound["ticket_id"] = str(context.ticket_id)
+    bound["customer_email"] = context.customer_email or ""
+    if context.channel:
+        bound["channel"] = context.channel
+    dropped = sorted(k for k in args if k in _BOUND_ARGS and args[k] != bound.get(k))
+    if dropped:
+        logger.warning("Ignoring model-supplied tool IDs", fields=dropped)
+    return bound
+
+
 async def execute_tool(name: str, args: dict, context: ToolContext) -> str:
     """Execute a tool by name and return JSON string result."""
     fn = _TOOL_DISPATCH.get(name)
     try:
-        if fn:
+        if fn and context.bound and name in _UNBOUND_ONLY_TOOLS:
+            result = {"error": f"{name} is not available while answering a ticket."}
+        elif fn:
+            if context.bound:
+                args = _bind_args(args, context)
             result = await fn(args, context)
         else:
             result = {"error": f"Unknown tool: {name}"}
