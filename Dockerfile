@@ -50,5 +50,8 @@ USER appuser
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import asyncio; from api.main import app; print('healthy')" || exit 1
 
-# Default to API mode (binds to $PORT so Render/Heroku-style hosts work)
-CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Default to API mode (binds to $PORT so Render/Heroku-style hosts work).
+# `exec` replaces the shell so uvicorn is PID 1 and receives SIGTERM; a plain
+# `sh -c` stays PID 1, ignores the signal and the container is SIGKILLed after
+# the grace period with requests in flight.
+CMD ["sh", "-c", "exec uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
