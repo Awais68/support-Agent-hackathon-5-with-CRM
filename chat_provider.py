@@ -1,16 +1,23 @@
 """Chat (LLM) provider selection.
 
-DeepSeek is preferred when ``DEEPSEEK_API_KEY`` is set; otherwise chat falls
-back to OpenRouter. Both expose an OpenAI-compatible API, so the rest of the
-code keeps using ``AsyncOpenAI`` unchanged. Embeddings are unaffected — they
-are chosen separately in ``embeddings_provider`` (DeepSeek serves no
-embedding models).
+Chat runs on DeepSeek (``DEEPSEEK_API_KEY``, model ``deepseek-chat``).
+OpenRouter is an optional fallback, used only when ``DEEPSEEK_API_KEY`` is
+empty and ``OPENROUTER_API_KEY`` is set. Both expose an OpenAI-compatible API,
+so the rest of the code keeps using ``AsyncOpenAI`` unchanged. Every chat call
+goes through ``build_chat_client``/``chat_model``. Embeddings are chosen
+separately in ``embeddings_provider`` (DeepSeek serves no embedding models).
+
+Do not set ``DEEPSEEK_MODEL=deepseek-reasoner``: it does not support tool
+calls, which the agent loop depends on.
 """
 
 import os
 from dataclasses import dataclass
 
+import structlog
 from openai import AsyncOpenAI
+
+logger = structlog.get_logger(__name__)
 
 DEEPSEEK_BASE_URL_DEFAULT = "https://api.deepseek.com"
 DEEPSEEK_MODEL_DEFAULT = "deepseek-chat"
@@ -57,10 +64,15 @@ def chat_model() -> str:
 def build_chat_client() -> AsyncOpenAI:
     """OpenAI-compatible client for the active chat provider.
 
-    Raises ``ValueError`` when neither DEEPSEEK_API_KEY nor OPENROUTER_API_KEY
-    is set.
+    Raises ``ValueError`` when neither DEEPSEEK_API_KEY nor the optional
+    OPENROUTER_API_KEY is set.
     """
     cfg = chat_provider_config()
     if not cfg.api_key:
-        raise ValueError("No chat provider key set: define DEEPSEEK_API_KEY or OPENROUTER_API_KEY")
+        raise ValueError("No chat provider key set: define DEEPSEEK_API_KEY")
+    if cfg.name != "deepseek":
+        logger.warning(
+            "DEEPSEEK_API_KEY is not set: chat runs on the OpenRouter fallback",
+            model=cfg.model,
+        )
     return AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)

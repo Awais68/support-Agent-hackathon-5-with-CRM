@@ -1,0 +1,23 @@
+groups:
+  - name: knowledge-base
+    rules:
+      # GEMINI_API_KEY missing: no embedding provider, every KB search is
+      # lexical. /readyz also reports embeddings=missing.
+      - alert: EmbeddingsNotConfigured
+        expr: embeddings_configured == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No embedding provider (GEMINI_API_KEY unset)"
+          description: "Knowledge base search on {{ $labels.instance }} is lexical-only."
+
+      # Any lexical fallback: key missing, Gemini down/out of quota, breaker
+      # open, or the KB not indexed for the active embedding model.
+      - alert: KBSearchLexicalFallback
+        expr: sum by (reason) (increase(kb_search_lexical_fallback_total[5m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "KB search fell back to lexical ({{ $labels.reason }})"
+          description: "{{ $value }} searches in 5 min answered without vectors."

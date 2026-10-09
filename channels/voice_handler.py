@@ -16,7 +16,7 @@ Providers (all OpenAI-compatible, over HTTP — no extra SDKs required):
 
 - STT:  Groq Whisper (default) → OpenAI Whisper → degraded mode
 - TTS:  OpenAI TTS → gTTS (offline) → text-only (no audio)
-- NLP:  the existing OpenRouter chat client (no extra cost)
+- NLP:  the shared chat client (DeepSeek, see chat_provider) → Groq
 """
 
 import base64
@@ -260,7 +260,7 @@ class VoiceHandler:
         return max(0.0, min(1.0, 1.0 - abs(avg) / 1.5))
 
     # ------------------------------------------------------------------
-    # Language detection + translation (NLP via OpenRouter → Groq fallback)
+    # Language detection + translation (NLP via the chat provider → Groq fallback)
     # ------------------------------------------------------------------
     async def _llm_completion(
         self,
@@ -269,7 +269,7 @@ class VoiceHandler:
         max_tokens: int = 500,
         json_mode: bool = False,
     ) -> str | None:
-        """Run an LLM completion through OpenRouter, falling back to Groq.
+        """Run an LLM completion through the chat provider, falling back to Groq.
 
         Returns the raw content string, or ``None`` when no provider works so
         callers can degrade gracefully.
@@ -294,7 +294,7 @@ class VoiceHandler:
                 return content.strip() if isinstance(content, str) else None
             except Exception as e:
                 logger.warning(
-                    "OpenRouter completion failed, trying Groq",
+                    "Chat provider completion failed, trying Groq",
                     error=sanitize_error_message(str(e)),
                 )
 

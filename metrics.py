@@ -35,6 +35,19 @@ kb_searches = Counter(
     ["category", "results_count"],
 )
 
+# Knowledge base search health. Lexical fallback answers worse than vector
+# search, so it is alerted on (monitoring/alerts.yml), not just logged.
+embeddings_configured = Gauge(
+    "embeddings_configured",
+    "1 when an embedding provider is configured (GEMINI_API_KEY), else 0",
+)
+
+kb_search_lexical_fallback = Counter(
+    "kb_search_lexical_fallback_total",
+    "KB searches answered lexically instead of by vector",
+    ["reason", "surface"],
+)
+
 # Histogram metrics (latency/duration)
 message_processing_time = Histogram(
     "message_processing_seconds",

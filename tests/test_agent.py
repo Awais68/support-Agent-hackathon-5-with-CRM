@@ -20,6 +20,7 @@ from agent.sentiment_analyzer import (
     detect_sentiment_drop,
 )
 from agent.tools import ToolContext, create_ticket, search_knowledge_base
+from embeddings_provider import EmbeddingProvider
 
 
 @pytest.mark.asyncio
@@ -58,6 +59,7 @@ async def test_search_knowledge_base_tool():
         db_pool=mock_db_pool,
         kafka_producer=mock_kafka,
         openai_client=mock_openai,
+        embedding_provider=EmbeddingProvider(client=mock_openai, model="test-embedding"),
     )
 
     # Mock database search results

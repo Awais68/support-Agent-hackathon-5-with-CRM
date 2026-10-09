@@ -259,7 +259,7 @@ async def backfill_knowledge_base_embeddings(pool: asyncpg.Pool) -> int:
     """
     provider = build_embedding_provider(None)
     if provider is None:
-        logger.warning(
+        logger.error(
             "No embedding provider configured — knowledge base left unembedded, "
             "semantic search will degrade to lexical"
         )

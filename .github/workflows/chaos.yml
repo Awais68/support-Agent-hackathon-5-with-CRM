@@ -37,11 +37,15 @@ env:
   # (runner Compose version), so both must be present.
   API_KEY_SECRET: chaos-ci-key
   TECHFLOW_API_KEY: chaos-ci-key
-  OPENROUTER_API_KEY: mock-not-a-key
-  OPENROUTER_BASE_URL: http://127.0.0.1:9/v1
-  GEMINI_API_KEY: ""
+  # Dummy provider keys pointing at a closed port: LLM and embedding calls
+  # fail fast and nothing leaves the runner. GEMINI_API_KEY must be non-empty
+  # or /readyz reports embeddings=missing (status degraded) and every
+  # experiment's health pre-check fails.
+  DEEPSEEK_API_KEY: mock-not-a-key
+  DEEPSEEK_BASE_URL: http://127.0.0.1:9/v1
+  GEMINI_API_KEY: mock-not-a-key
   GEMINI_BASE_URL: http://127.0.0.1:9/v1
-  DEEPSEEK_API_KEY: ""
+  OPENROUTER_API_KEY: ""
   GROQ_API_KEY: ""
   OPENAI_API_KEY: ""
   TWILIO_ACCOUNT_SID: ""

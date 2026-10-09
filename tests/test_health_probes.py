@@ -41,6 +41,7 @@ def client(monkeypatch):
     monkeypatch.setenv("ENABLE_KAFKA", "true")
     monkeypatch.setattr(app.state, "kafka_enabled", True, raising=False)
     monkeypatch.setattr(app.state, "db_pool", _pool(), raising=False)
+    monkeypatch.setattr(app.state, "embedding_provider", MagicMock(), raising=False)
     return TestClient(app, raise_server_exceptions=False)
 
 
@@ -53,7 +54,12 @@ def test_ready_when_db_and_kafka_are_up(client):
     for path in ("/readyz", "/health"):
         resp = client.get(path)
         assert resp.status_code == 200, path
-        assert resp.json() == {"status": "healthy", "db": "ok", "kafka": "ok"}
+        assert resp.json() == {
+            "status": "healthy",
+            "db": "ok",
+            "kafka": "ok",
+            "embeddings": "ok",
+        }
 
 
 @pytest.mark.parametrize("path", ["/readyz", "/health"])

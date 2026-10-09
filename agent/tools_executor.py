@@ -13,6 +13,7 @@ from database import queries as db
 from embeddings_provider import (
     EMBEDDING_CIRCUIT_BREAKER,
     EmbeddingProvider,
+    record_lexical_fallback,
     resolve_embedding_provider,
 )
 from exceptions import sanitize_error_message
@@ -50,7 +51,7 @@ class ToolExecutor:
 
             if provider is None:
                 degraded_reason = "No embedding provider configured"
-                logger.warning("No embedding provider, using lexical KB search", query=query)
+                record_lexical_fallback("not_configured", "tool_executor", query=query)
             else:
                 _cb = get_circuit_breaker(EMBEDDING_CIRCUIT_BREAKER)
                 try:
@@ -58,13 +59,14 @@ class ToolExecutor:
                         query_embedding = await provider.embed(query)
                 except CircuitBreakerError:
                     degraded_reason = "AI service temporarily unavailable"
-                    logger.warning("Embedding circuit open, using lexical KB search", query=query)
+                    record_lexical_fallback("circuit_open", "tool_executor", query=query)
                 except (OpenAIAPIError, APITimeoutError, APIConnectionError) as e:
                     # Provider down or out of credits: degrade to lexical search
                     # rather than returning an empty knowledge base.
                     degraded_reason = "AI service temporarily unavailable"
-                    logger.warning(
-                        "Embedding failed, using lexical KB search",
+                    record_lexical_fallback(
+                        "embedding_failed",
+                        "tool_executor",
                         query=query,
                         error=sanitize_error_message(str(e)),
                     )
@@ -97,6 +99,9 @@ class ToolExecutor:
                     )
                     search_mode = "text"
                     degraded_reason = "Knowledge base not indexed for the active " "embedding model"
+                    record_lexical_fallback(
+                        "not_indexed", "tool_executor", query=query, embedding_model=provider.model
+                    )
 
             logger.info(
                 "KB search completed",

@@ -16,6 +16,7 @@ from database import queries as db
 from embeddings_provider import (
     EMBEDDING_CIRCUIT_BREAKER,
     EmbeddingProvider,
+    record_lexical_fallback,
     resolve_embedding_provider,
 )
 from exceptions import sanitize_error_message
@@ -37,7 +38,8 @@ class ToolContext:
     kafka_producer: AnyKafkaProducer
     openai_client: AsyncOpenAI
     # Embeddings run on their own provider (see embeddings_provider). Left
-    # unset, embeddings fall back to openai_client.
+    # unset, KB search is lexical (logged and counted) unless EMBEDDING_MODEL
+    # opts in to embedding through openai_client.
     embedding_provider: EmbeddingProvider | None = None
     # The ticket this run answers. When set, the server owns these IDs: the
     # model never sees ticket/customer parameters and any it sends are
@@ -246,7 +248,7 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
 
         if provider is None:
             degraded_reason = "No embedding provider configured"
-            logger.warning("No embedding provider, using lexical KB search", query=query)
+            record_lexical_fallback("not_configured", "agent_tool", query=query)
         else:
             _cb = get_circuit_breaker(EMBEDDING_CIRCUIT_BREAKER)
             try:
@@ -254,14 +256,15 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
                     embedding = await provider.embed(query)
             except CircuitBreakerError:
                 degraded_reason = "AI service temporarily unavailable"
-                logger.warning("Embedding circuit open, using lexical KB search", query=query)
+                record_lexical_fallback("circuit_open", "agent_tool", query=query)
             except Exception as e:
                 # An embedding outage (provider down, out of credits, bad model
                 # name) must not cost the agent its knowledge base — degrade to
                 # lexical search instead of escalating to a human.
                 degraded_reason = "AI service temporarily unavailable"
-                logger.warning(
-                    "Embedding failed, using lexical KB search",
+                record_lexical_fallback(
+                    "embedding_failed",
+                    "agent_tool",
                     query=query,
                     error=sanitize_error_message(str(e)),
                 )
@@ -299,6 +302,9 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
                 )
                 search_mode = "text"
                 degraded_reason = "Knowledge base not indexed for the active embedding model"
+                record_lexical_fallback(
+                    "not_indexed", "agent_tool", query=query, embedding_model=provider.model
+                )
 
         found = len(results) > 0
         logger.info(

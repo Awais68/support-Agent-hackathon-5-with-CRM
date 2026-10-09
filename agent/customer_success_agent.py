@@ -22,7 +22,7 @@ from agent.prompts import CHANNEL_ADDENDUMS, CLASSIFICATION_PROMPT, SYSTEM_PROMP
 from agent.reply_guard import operator_voice_reason
 from agent.sentiment_analyzer import detect_sentiment_drop
 from agent.tools import ToolContext, execute_tool, tool_schemas_for
-from chat_provider import chat_model
+from chat_provider import build_chat_client, chat_model
 from database import queries as db
 from embeddings_provider import EmbeddingProvider, build_embedding_provider
 from exceptions import sanitize_error_message
@@ -671,10 +671,7 @@ async def example_usage():
     )
     kafka_producer = KafkaProducerClient("localhost:9092")
     await kafka_producer.start()
-    client = AsyncOpenAI(
-        api_key=os.getenv("OPENROUTER_API_KEY"),
-        base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-    )
+    client = build_chat_client()
 
     context = AgentContext(
         db_pool=pool,

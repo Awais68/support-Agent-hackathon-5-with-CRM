@@ -40,11 +40,25 @@ spec:
             configMapKeyRef:
               name: techflow-config
               key: kafka-servers
+        - name: DEEPSEEK_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: techflow-secrets
+              key: deepseek-api-key
+        - name: DEEPSEEK_MODEL
+          value: "deepseek-chat"
+        - name: GEMINI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: techflow-secrets
+              key: gemini-api-key
+        # Optional chat fallback, used only when DEEPSEEK_API_KEY is empty.
         - name: OPENROUTER_API_KEY
           valueFrom:
             secretKeyRef:
               name: techflow-secrets
               key: openrouter-api-key
+              optional: true
         - name: OPENROUTER_BASE_URL
           value: "https://openrouter.ai/api/v1"
         - name: TWILIO_ACCOUNT_SID

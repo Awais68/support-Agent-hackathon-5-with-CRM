@@ -62,6 +62,7 @@ from embeddings_provider import (  # noqa: E402
     EMBEDDING_CIRCUIT_BREAKER,
     EmbeddingProvider,
     build_embedding_provider,
+    record_lexical_fallback,
 )
 from exceptions import (  # noqa: E402
     AppError,
@@ -109,6 +110,7 @@ class HealthResponse(BaseModel):
     status: str
     db: str
     kafka: str
+    embeddings: str
 
 
 class CreateTicketRequest(BaseModel):
@@ -250,7 +252,7 @@ async def get_kafka(request: Request) -> KafkaProducerClient:
 
 
 async def get_openai(request: Request) -> AsyncOpenAI:
-    """Get the OpenRouter chat client from request state."""
+    """Get the chat client (DeepSeek, see chat_provider) from request state."""
     client = getattr(request.app.state, "openai_client", None)
     if not client:
         raise ConfigurationError(message="OpenAI client not initialized")
@@ -413,8 +415,8 @@ async def lifespan(app: FastAPI):
         logger.info("Kafka disabled via ENABLE_KAFKA=false — running in degraded mode")
         app.state.kafka_producer = NoOpKafkaProducer()
 
-    # Initialize the chat client: DeepSeek when DEEPSEEK_API_KEY is set,
-    # otherwise OpenRouter. Empty strings count as unset.
+    # Initialize the chat client: DeepSeek; OpenRouter only as the optional
+    # fallback when DEEPSEEK_API_KEY is empty. Empty strings count as unset.
     try:
         app.state.openai_client = build_chat_client()
     except ValueError as e:
@@ -425,8 +427,9 @@ async def lifespan(app: FastAPI):
         "Chat provider initialized", provider=chat_provider_config().name, model=chat_model()
     )
 
-    # Embeddings go to their own provider: OpenRouter serves chat here but has
-    # no embedding credits, so knowledge base search runs on Gemini.
+    # Embeddings go to their own provider (Gemini): DeepSeek serves no
+    # embedding models. A missing GEMINI_API_KEY is logged as an error here
+    # and shows as embeddings=missing on /readyz.
     app.state.embedding_provider = build_embedding_provider(app.state.openai_client)
 
     # Initialize WebSocket manager
@@ -584,10 +587,16 @@ async def _readiness(request: Request) -> JSONResponse:
         kafka_status = "disabled" if not _kafka_requested() else "error"
 
     ready = db_status == "ok" and kafka_status != "error"
+    # Missing embeddings do not take the pod out of rotation (lexical search
+    # still answers), but they must not read as healthy either.
+    embeddings_status = (
+        "ok" if getattr(request.app.state, "embedding_provider", None) is not None else "missing"
+    )
     body = HealthResponse(
-        status="healthy" if ready else "degraded",
+        status="healthy" if ready and embeddings_status == "ok" else "degraded",
         db=db_status,
         kafka=kafka_status,
+        embeddings=embeddings_status,
     )
     return JSONResponse(status_code=200 if ready else 503, content=body.model_dump())
 
@@ -1446,20 +1455,18 @@ async def search_knowledge_base(
 
     if provider is None:
         degraded_reason = "No embedding provider configured"
-        logger.warning("No embedding provider, falling back to text KB search", query=q)
+        record_lexical_fallback("not_configured", "api_search", query=q)
     else:
         try:
             async with _cb:
                 embedding = await provider.embed(q)
         except CircuitBreakerError:
             degraded_reason = "AI service temporarily unavailable"
-            logger.warning("Embedding circuit open, falling back to text KB search", query=q)
+            record_lexical_fallback("circuit_open", "api_search", query=q)
         except OpenAIAPIError as e:
             degraded_reason = "AI service temporarily unavailable"
-            logger.warning(
-                "Embedding failed, falling back to text KB search",
-                query=q,
-                error=sanitize_error_message(str(e)),
+            record_lexical_fallback(
+                "embedding_failed", "api_search", query=q, error=sanitize_error_message(str(e))
             )
 
     # Degrade to lexical search rather than failing the request outright.
@@ -1503,8 +1510,9 @@ async def search_knowledge_base(
             category=category,
             max_results=limit,
         )
-        logger.warning(
-            "No comparable vectors for embedding model, using text search",
+        record_lexical_fallback(
+            "not_indexed",
+            "api_search",
             query=q,
             embedding_model=provider.model,
             text_results=len(text_results) if text_results else 0,
@@ -1673,7 +1681,7 @@ async def connection_error_handler(request: Request, exc: ConnectionError):
 
 @app.exception_handler(OpenAIAPIError)
 async def openai_error_handler(request: Request, exc: OpenAIAPIError):
-    """Handle OpenAI/OpenRouter API errors."""
+    """Handle errors from the OpenAI-compatible chat provider."""
     logger.error(
         "OpenAI API error",
         error=sanitize_error_message(str(exc)),

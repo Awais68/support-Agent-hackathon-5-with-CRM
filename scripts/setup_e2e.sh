@@ -92,11 +92,14 @@ export API_KEY="${API_KEY:-$(openssl rand -hex 16)}"
 export E2E_API_KEY="$API_KEY"
 # Only export these when actually set: exporting an empty value would shadow
 # the key that api/main.py loads from .env.
-if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+if [[ -n "${DEEPSEEK_API_KEY:-}" ]]; then
+  export DEEPSEEK_API_KEY
+  echo "==> DEEPSEEK_API_KEY detected from environment"
+elif [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
   export OPENROUTER_API_KEY
-  echo "==> OPENROUTER_API_KEY detected from environment"
+  echo "==> OPENROUTER_API_KEY detected from environment (fallback provider)"
 else
-  echo "==> OPENROUTER_API_KEY not set in shell — falling back to .env"
+  echo "==> DEEPSEEK_API_KEY not set in shell — falling back to .env"
 fi
 if [[ -n "${GROQ_API_KEY:-}" ]]; then
   export GROQ_API_KEY

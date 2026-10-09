@@ -1,6 +1,6 @@
 """Tests for the embedding provider split and the knowledge base fallback.
 
-These cover the failure that shipped silently: chat runs on OpenRouter, whose
+These cover the failure that shipped silently: chat ran on OpenRouter, whose
 account has no embedding credits, so every ``/embeddings`` call returned HTTP
 402 and the agent answered "escalate to human support" on every knowledge base
 lookup instead of degrading to lexical search.
@@ -63,6 +63,8 @@ def test_empty_gemini_key_falls_back_to_chat_client(monkeypatch):
     # An exported-but-empty var is common in shell wrappers and must count as unset.
     monkeypatch.setenv("GEMINI_API_KEY", "   ")
     monkeypatch.setenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
+    # The opt-in only applies off DeepSeek (no embedding models there).
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     chat_client = MagicMock()
 
     provider = build_embedding_provider(chat_client)

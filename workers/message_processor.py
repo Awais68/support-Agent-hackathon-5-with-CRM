@@ -58,10 +58,10 @@ class MessageProcessor:
     def __init__(self, db_pool: asyncpg.Pool, kafka_producer: KafkaProducerClient):
         self.db_pool = db_pool
         self.kafka_producer = kafka_producer
-        # DeepSeek when DEEPSEEK_API_KEY is set, otherwise OpenRouter.
+        # DeepSeek; OpenRouter only as the optional fallback (chat_provider).
         self.openai_client = build_chat_client()
-        # Embeddings go to their own provider: OpenRouter serves chat here but
-        # has no embedding credits, so knowledge base search runs on Gemini.
+        # Embeddings go to their own provider (Gemini): DeepSeek serves no
+        # embedding models.
         self.embedding_provider = build_embedding_provider(self.openai_client)
 
     async def process_message(self, message: KafkaMessage) -> None:
