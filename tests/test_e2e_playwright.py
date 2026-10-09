@@ -32,12 +32,10 @@ if not _PLAYWRIGHT_AVAILABLE:
 pytestmark = pytest.mark.e2e
 
 BASE_URL = "http://localhost:8000"
-# Must match the live server's key. The server reads API_KEY, then
-# API_KEY_SECRET; E2E_API_KEY overrides both when the server runs elsewhere
-# with a different key (scripts/setup_e2e.sh exports it).
-API_KEY = (
-    os.getenv("E2E_API_KEY") or os.getenv("API_KEY") or os.getenv("API_KEY_SECRET") or ""
-)
+# Must match the live server's key. API_KEY can't be used here: conftest.py
+# overwrites it with the in-process test key. Falls back to API_KEY_SECRET,
+# which is what a server started from .env reads when API_KEY is unset.
+API_KEY = os.getenv("E2E_API_KEY") or os.getenv("API_KEY_SECRET") or ""
 
 
 @pytest.fixture(scope="session", autouse=True)

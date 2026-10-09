@@ -345,7 +345,7 @@ Tests that need live services skip unless you point them at one:
 |---|---|---|
 | `OUTBOUND_TEST_DATABASE_URL` (or `DATABASE_URL`) | `test_notification_sender.py`, `test_kb_category.py` | Any PostgreSQL with pgvector; each test uses a throwaway schema |
 | `OUTBOUND_TEST_KAFKA` | Kafka test in `test_notification_sender.py` (`integration`) | e.g. `localhost:9092` |
-| `E2E_API_KEY` | `test_e2e_playwright.py` (`e2e`, needs the API on `:8000` and `playwright install chromium`) | Optional. Falls back to `API_KEY`, then `API_KEY_SECRET`, the same order the server reads them. Set it only when the server under test uses a different key |
+| `E2E_API_KEY` | `test_e2e_playwright.py` (`e2e`, needs the API on `:8000` and `playwright install chromium`) | Optional. Falls back to `API_KEY_SECRET` (export it from `.env`). Set it when the server uses `API_KEY` or another key; `tests/conftest.py` overwrites `API_KEY` with the in-process test key, so the tests can't read it |
 
 ### Full stack with Docker Compose ⚠️ not run, and fails as written
 
