@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import signal
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
@@ -388,6 +389,27 @@ async def run_process_heartbeat() -> None:
         await asyncio.sleep(heartbeat.interval_seconds())
 
 
+async def run_until_signalled(tasks: list) -> None:
+    """Run the worker tasks until they finish or SIGTERM/SIGINT arrives.
+
+    As PID 1 in a container the process has no default SIGTERM action, so
+    without a handler `docker stop` and pod termination waited out the grace
+    period and SIGKILLed the worker (AUDIT X3).
+    """
+    loop = asyncio.get_running_loop()
+    runner = asyncio.gather(*tasks)
+    signals = (signal.SIGTERM, signal.SIGINT)
+    for sig in signals:
+        loop.add_signal_handler(sig, runner.cancel)
+    try:
+        await runner
+    except asyncio.CancelledError:
+        logger.info("Worker shutting down on signal")
+    finally:
+        for sig in signals:
+            loop.remove_signal_handler(sig)
+
+
 async def main():
     """Main entry point for worker."""
     load_environment()
@@ -439,9 +461,7 @@ async def main():
 
     try:
         # Run Gmail polling, inbound consumer, outbound sender and metrics
-        await asyncio.gather(*tasks)
-    except KeyboardInterrupt:
-        logger.info("Worker shutting down...")
+        await run_until_signalled(tasks)
     finally:
         await kafka_producer.stop()
         await db_pool.close()

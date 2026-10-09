@@ -109,6 +109,7 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 | R2-4 | Low | = N12 billing patterns | Open |
 | X1 | Low | (found in P0 gate) uvicorn access log prints the WebSocket URL including `?token=` (tracking token) | Open |
 | X2 | Low | (found in P0 gate) when the agent falls back without `send_response` (circuit open, model answered in text) on webform/voice, the reply is published but never stored, so the tracking page shows nothing | Open |
+| X3 | Medium | (found by chaos 04) the worker ignores SIGTERM as PID 1, so `docker stop` / pod termination SIGKILLs it after the grace period (10.3s, exit 137); consumers never leave their groups | Fixed: SIGTERM/SIGINT cancel the worker tasks and the normal cleanup runs. Live: `docker stop` 0.6s, exit 0, "Worker shutdown complete" logged. Test: `tests/test_worker_shutdown.py` |
 | R2-5 | Low | Emotion stems in `sentiment_analyzer.py` end in `\b` | Open |
 
 ## Data clean-up (you)
