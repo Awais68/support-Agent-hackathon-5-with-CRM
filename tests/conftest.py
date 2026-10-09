@@ -1,9 +1,10 @@
 """Pytest configuration and fixtures."""
 
-import os
 import asyncio
-import pytest
+import os
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 # Explicit test mode: the API refuses to start without a key outside it, and
 # tests authenticate with this fixed, non-secret value. Set before any app
@@ -12,7 +13,9 @@ os.environ["RUN_MODE"] = "test"
 os.environ["API_KEY"] = "test-key-12345"
 
 from openai import AsyncOpenAI
+
 from kafka_client import KafkaProducerClient
+
 
 @pytest.fixture(scope="session")
 def event_loop():
