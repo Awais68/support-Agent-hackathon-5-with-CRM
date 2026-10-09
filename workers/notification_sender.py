@@ -88,7 +88,8 @@ class OutboundSender:
             handler = GmailHandler(self.kafka_producer)
             # GmailHandler.authenticate() falls back to an interactive browser
             # OAuth flow when there is no token, which would hang a container.
-            if not os.path.exists(handler.token_file):
+            # (isfile: a missing bind-mount source becomes a directory.)
+            if not os.path.isfile(handler.token_file):
                 raise PermanentDeliveryError(
                     f"Gmail token file {handler.token_file!r} not found"
                 )

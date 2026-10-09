@@ -269,3 +269,20 @@ async def test_kafka_topic_message_triggers_send(pool):
 
     row = await _row(pool, agent_run_id)
     assert row["status"] == "sent"
+
+
+async def test_missing_gmail_token_fails_without_oauth_prompt(
+    pool, tmp_path, monkeypatch
+):
+    # A bind-mounted token path that does not exist on the host shows up as
+    # a directory; it must be a permanent failure, not an OAuth browser flow.
+    monkeypatch.setenv("GMAIL_TOKEN_FILE", str(tmp_path))
+    ticket_id = await _ticket(pool)
+    producer = AsyncMock()
+    sender = OutboundSender(pool, producer, max_attempts=3, retry_wait_seconds=0)
+    event = _event(ticket_id)
+
+    assert await sender.handle(event) == "failed"
+    row = await _row(pool, event.payload["agent_run_id"])
+    assert row["attempts"] == 1 and "token file" in row["last_error"]
+    assert producer.send_message.await_args.args[0] == DLQ_TOPIC
