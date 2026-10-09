@@ -18,6 +18,10 @@ spec:
       maxUnavailable: 0
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: /metrics
       labels:
         app: api
         version: v1
@@ -30,6 +34,11 @@ spec:
         - containerPort: 8000
           name: http
           protocol: TCP
+        # Prometheus scrapes this pod port directly; the Service and ingress
+        # only carry 8000, so metrics are not public (S11).
+        - containerPort: 9100
+          name: metrics
+          protocol: TCP
         env:
         - name: DATABASE_URL
           valueFrom:
@@ -41,11 +50,25 @@ spec:
             configMapKeyRef:
               name: techflow-config
               key: kafka-servers
+        - name: DEEPSEEK_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: techflow-secrets
+              key: deepseek-api-key
+        - name: DEEPSEEK_MODEL
+          value: "deepseek-chat"
+        - name: GEMINI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: techflow-secrets
+              key: gemini-api-key
+        # Optional chat fallback, used only when DEEPSEEK_API_KEY is empty.
         - name: OPENROUTER_API_KEY
           valueFrom:
             secretKeyRef:
               name: techflow-secrets
               key: openrouter-api-key
+              optional: true
         - name: OPENROUTER_BASE_URL
           value: "https://openrouter.ai/api/v1"
         - name: API_KEY
@@ -62,9 +85,11 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
+        # /livez never checks dependencies (a DB outage must not restart every
+        # pod); /readyz returns 503 while the DB or Kafka is down (AUDIT N6).
         livenessProbe:
           httpGet:
-            path: /health
+            path: /livez
             port: 8000
           initialDelaySeconds: 10
           periodSeconds: 10
@@ -72,7 +97,7 @@ spec:
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /health
+            path: /readyz
             port: 8000
           initialDelaySeconds: 5
           periodSeconds: 5

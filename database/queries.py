@@ -1,24 +1,24 @@
 """Async database queries for TechFlow CRM Digital FTE."""
 
-import os
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any
 from uuid import UUID
 
 import asyncpg
 import structlog
 
-
 FUZZY_THRESHOLD_DEFAULT = 0.3
 
-# Trigram similarity alone is not enough to identify a person by email:
-# similarity('dup-test-1787409712@example.com', 'test@example.com') = 0.53,
-# far above the 0.3 threshold, which merged unrelated customers. Fuzzy email
-# matching therefore also requires the same domain and a small edit distance on
-# the local part (typo 'jon'→'john' = 1; unrelated locals are far apart).
+# An email is linked to an existing customer only on an EXACT match after
+# normalize_email(). A near-miss is a different mailbox: alice1@acmecorp.com
+# is edit distance 1 from alice@acmecorp.com and belongs to whoever registered
+# it, so linking it handed a stranger Alice's ticket history (AUDIT S2). Fuzzy
+# email (same domain + small local-part edit distance) is only a review hint on
+# the new customer, never a link.
 EMAIL_LOCAL_MAX_DISTANCE = int(os.getenv("EMAIL_FUZZY_MAX_DISTANCE", "2"))
 
 # Name similarity is NOT an identity signal. Measured with pg_trgm on real pairs:
@@ -36,11 +36,17 @@ NAME_FUZZY_AMBIGUITY_MARGIN = float(os.getenv("NAME_FUZZY_AMBIGUITY_MARGIN", "0.
 EMBEDDING_DIM = 1536
 
 
+def normalize_email(email: str) -> str:
+    """Canonical form for identity matching: trimmed and lower-cased."""
+    return (email or "").strip().lower()
+
+
 @dataclass
 class FuzzyMatchResult:
-    customer: Optional[Dict[str, Any]] = None
-    match_field: Optional[str] = None  # 'email' or 'name'
+    customer: dict[str, Any] | None = None
+    match_field: str | None = None  # 'email' or 'name'
     similarity: float = 0.0
+
 
 logger = structlog.get_logger(__name__)
 
@@ -70,7 +76,7 @@ async def fuzzy_search_customers(
     search_field: str = "email",
     threshold: float = FUZZY_THRESHOLD_DEFAULT,
     limit: int = 5,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Fuzzy search customers by name or email using pg_trgm similarity().
 
@@ -99,7 +105,7 @@ async def fuzzy_search_customers(
         return [dict(row) for row in rows]
 
 
-async def get_customer(pool: asyncpg.Pool, email: str) -> Optional[Dict[str, Any]]:
+async def get_customer(pool: asyncpg.Pool, email: str) -> dict[str, Any] | None:
     """Get customer by email."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -111,7 +117,7 @@ async def get_customer(pool: asyncpg.Pool, email: str) -> Optional[Dict[str, Any
 
 async def create_customer(
     pool: asyncpg.Pool, email: str, name: str, company: str = "", tier: str = "starter"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Create a new customer."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -133,7 +139,7 @@ async def get_customer_by_identifier(
     pool: asyncpg.Pool,
     identifier_type: str,
     identifier_value: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Get customer by any identifier type (email, phone, web_session)."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -154,7 +160,7 @@ async def add_customer_identifier(
     customer_id: UUID,
     identifier_type: str,
     identifier_value: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Add a new identifier to an existing customer."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -174,7 +180,7 @@ async def add_customer_identifier(
 async def link_identifiers(
     pool: asyncpg.Pool,
     customer_id: UUID,
-    identifiers: List[tuple[str, str]],
+    identifiers: list[tuple[str, str]],
 ) -> None:
     """Link multiple identifier (type, value) pairs to a customer, skipping conflicts."""
     async with pool.acquire() as conn:
@@ -198,8 +204,15 @@ async def get_customer_or_create_by_identifier(
     name: str = "Customer",
     tier: str = "starter",
     fuzzy_threshold: float = FUZZY_THRESHOLD_DEFAULT,
-) -> Dict[str, Any]:
-    """Get a customer by identifier, with fuzzy fallback on email/name, or create new."""
+) -> dict[str, Any]:
+    """Get a customer by exact identifier, or create a new one.
+
+    Emails match only exactly after normalize_email(). Similar emails or names
+    are recorded as a review hint on the NEW customer, never linked.
+    """
+    if identifier_type == "email":
+        identifier_value = normalize_email(identifier_value)
+
     async with pool.acquire() as conn:
         async with conn.transaction():
             # ── Step 1: exact match via identifier table ──
@@ -208,7 +221,10 @@ async def get_customer_or_create_by_identifier(
                 SELECT c.id, c.email, c.name, c.company, c.tier, c.created_at, c.updated_at, c.metadata
                 FROM customers c
                 JOIN customer_identifiers ci ON ci.customer_id = c.id
-                WHERE ci.identifier_type = $1 AND ci.identifier_value = $2
+                WHERE ci.identifier_type = $1
+                  AND (ci.identifier_value = $2
+                       OR ($1 = 'email' AND lower(ci.identifier_value) = $2))
+                LIMIT 1
                 """,
                 identifier_type,
                 identifier_value,
@@ -216,49 +232,53 @@ async def get_customer_or_create_by_identifier(
             if existing:
                 return dict(existing)
 
-            fuzzy_matched = False
-
-            # ── Step 2: fuzzy fallback on email ──
+            # ── Step 1b: exact email on the customer row (no identifier yet) ──
             if identifier_type == "email":
-                fuzzy_row = await conn.fetchrow(
+                existing = await conn.fetchrow(
                     """
-                    SELECT id, email, name, company, tier, created_at, updated_at, metadata,
-                           similarity(email, $1) AS sim
+                    SELECT id, email, name, company, tier, created_at, updated_at, metadata
+                    FROM customers
+                    WHERE lower(email) = $1
+                    LIMIT 1
+                    """,
+                    identifier_value,
+                )
+                if existing:
+                    await conn.execute(
+                        """
+                        INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)
+                        VALUES ($1, 'email', $2)
+                        ON CONFLICT (identifier_type, identifier_value) DO NOTHING
+                        """,
+                        existing["id"],
+                        identifier_value,
+                    )
+                    return dict(existing)
+
+            # ── Steps 2-3: similar email or name → review hint only, never a link ──
+            duplicate_hint: dict[str, Any] = {}
+            candidate = None
+            if identifier_type == "email":
+                candidate = await conn.fetchrow(
+                    """
+                    SELECT id, name, similarity(email, $1) AS sim
                     FROM customers
                     WHERE email % $1
-                      AND split_part(email, '@', 2) = split_part($1, '@', 2)
+                      AND split_part(lower(email), '@', 2) = split_part($1, '@', 2)
                       AND levenshtein(
-                            split_part(email, '@', 1), split_part($1, '@', 1)
+                            split_part(lower(email), '@', 1), split_part($1, '@', 1)
                           ) <= $2
+                      AND similarity(email, $1) >= $3
                     ORDER BY sim DESC
                     LIMIT 1
                     """,
                     identifier_value,
                     EMAIL_LOCAL_MAX_DISTANCE,
+                    fuzzy_threshold,
                 )
-                if fuzzy_row and fuzzy_row["sim"] >= fuzzy_threshold:
-                    await conn.execute(
-                        """
-                        INSERT INTO customer_identifiers (customer_id, identifier_type, identifier_value)
-                        VALUES ($1, $2, $3)
-                        ON CONFLICT (identifier_type, identifier_value) DO NOTHING
-                        """,
-                        fuzzy_row["id"],
-                        identifier_type,
-                        identifier_value,
-                    )
-                    fuzzy_matched = True
-                    existing = fuzzy_row
-
-            if fuzzy_matched:
-                return dict(existing)
-
-            # ── Step 3: name similarity is flagged for review, never auto-linked ──
             # See NAME_FUZZY_THRESHOLD: a name match cannot tell a typo apart from a
-            # different person, so linking on it would silently merge two customers.
-            # Record the candidate on the new row instead and let a human resolve it.
-            duplicate_hint: Dict[str, Any] = {}
-            if name and name != "Customer":
+            # different person either.
+            if candidate is None and name and name != "Customer":
                 candidate = await conn.fetchrow(
                     """
                     SELECT id, name, similarity(name, $1) AS sim
@@ -271,19 +291,19 @@ async def get_customer_or_create_by_identifier(
                     name,
                     NAME_FUZZY_THRESHOLD,
                 )
-                if candidate:
-                    duplicate_hint = {
-                        "possible_duplicate_of": str(candidate["id"]),
-                        "possible_duplicate_name": candidate["name"],
-                        "possible_duplicate_similarity": float(candidate["sim"]),
-                        "needs_identity_review": True,
-                    }
-                    logger.info(
-                        "possible_duplicate_customer",
-                        identifier_type=identifier_type,
-                        candidate_id=str(candidate["id"]),
-                        similarity=float(candidate["sim"]),
-                    )
+            if candidate:
+                duplicate_hint = {
+                    "possible_duplicate_of": str(candidate["id"]),
+                    "possible_duplicate_name": candidate["name"],
+                    "possible_duplicate_similarity": float(candidate["sim"]),
+                    "needs_identity_review": True,
+                }
+                logger.info(
+                    "possible_duplicate_customer",
+                    identifier_type=identifier_type,
+                    candidate_id=str(candidate["id"]),
+                    similarity=float(candidate["sim"]),
+                )
 
             # ── Step 4: create new customer + identifier ──
             if identifier_type == "email":
@@ -332,110 +352,69 @@ async def get_customer_or_create_by_identifier(
 async def find_customer_by_name_email(
     pool: asyncpg.Pool,
     email: str,
-    name: Optional[str] = None,
-    company: Optional[str] = None,
-    fuzzy_threshold: float = FUZZY_THRESHOLD_DEFAULT,
-) -> Optional[Dict[str, Any]]:
-    """
-    Look up a customer by email (exact first, then fuzzy), optionally by name.
+    name: str | None = None,
+    company: str | None = None,
+) -> dict[str, Any] | None:
+    """Look up a customer by exact (normalized) email.
 
-    Read-only: this never writes an identifier link. Every result carries a
-    ``match_type`` of ``exact_email``, ``fuzzy_email`` or ``fuzzy_name`` so the
-    caller can weigh how much to trust it. A name-only match is returned only when
-    corroborated by the email domain or company and when no runner-up is close
-    enough to make the choice ambiguous. Returns the best match or None.
+    ``name`` and ``company`` are accepted for callers but never used to pick a
+    customer: a similar email or name belongs to a different person as often
+    as not (AUDIT S2). Similar customers surface through the review queue
+    instead. The result carries ``match_type = "exact_email"``.
     """
+    normalized = normalize_email(email)
+    if not normalized:
+        return None
     async with pool.acquire() as conn:
-        # Exact email match
         row = await conn.fetchrow(
-            "SELECT id, email, name, company, tier, created_at, updated_at, metadata FROM customers WHERE email = $1",
-            email,
-        )
-        if row:
-            match = dict(row)
-            match["match_type"] = "exact_email"
-            return match
-
-        # Fuzzy email match (same domain + small local-part edit distance)
-        fuzzy_row = await conn.fetchrow(
             """
-            SELECT id, email, name, company, tier, created_at, updated_at, metadata,
-                   similarity(email, $1) AS sim
+            SELECT id, email, name, company, tier, created_at, updated_at, metadata
             FROM customers
-            WHERE email % $1
-              AND split_part(email, '@', 2) = split_part($1, '@', 2)
-              AND levenshtein(split_part(email, '@', 1), split_part($1, '@', 1)) <= $2
-            ORDER BY sim DESC
+            WHERE lower(email) = $1
+               OR id = (
+                    SELECT customer_id FROM customer_identifiers
+                    WHERE identifier_type = 'email' AND lower(identifier_value) = $1
+                    LIMIT 1
+               )
             LIMIT 1
             """,
-            email,
-            EMAIL_LOCAL_MAX_DISTANCE,
+            normalized,
         )
-        if fuzzy_row and fuzzy_row["sim"] >= fuzzy_threshold:
-            match = dict(fuzzy_row)
-            match["match_type"] = "fuzzy_email"
-            return match
-
-        # Fuzzy name match: corroborated and unambiguous only, never on its own.
-        if name:
-            candidates = await conn.fetch(
-                """
-                SELECT id, email, name, company, tier, created_at, updated_at, metadata,
-                       similarity(name, $1) AS sim
-                FROM customers
-                WHERE name % $1
-                  AND similarity(name, $1) >= $2
-                ORDER BY sim DESC
-                LIMIT 2
-                """,
-                name,
-                max(fuzzy_threshold, NAME_FUZZY_THRESHOLD),
-            )
-            if candidates:
-                best = dict(candidates[0])
-                # A close runner-up means we cannot tell which person this is.
-                ambiguous = (
-                    len(candidates) > 1
-                    and (best["sim"] - candidates[1]["sim"]) < NAME_FUZZY_AMBIGUITY_MARGIN
-                )
-                query_domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
-                best_email = best.get("email") or ""
-                best_domain = best_email.rsplit("@", 1)[-1].lower() if "@" in best_email else ""
-                same_domain = bool(query_domain) and query_domain == best_domain
-                same_company = bool(
-                    company
-                    and best.get("company")
-                    and company.strip().lower() == best["company"].strip().lower()
-                )
-                if (same_domain or same_company) and not ambiguous:
-                    best["match_type"] = "fuzzy_name"
-                    return best
-                logger.debug(
-                    "name_match_rejected",
-                    reason="ambiguous" if ambiguous else "uncorroborated",
-                    similarity=float(best["sim"]),
-                )
-
-        return None
+        if not row:
+            return None
+        match = dict(row)
+        match["match_type"] = "exact_email"
+        return match
 
 
 async def get_customer_history(
     pool: asyncpg.Pool, email: str, limit: int = 10, include_resolved: bool = True
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get customer's ticket history. Resolves customer via identifier table for cross-channel support."""
-    status_filter = "(status IN ('open', 'in_progress', 'escalated', 'closed'))" if not include_resolved else "(1=1)"
-
     async with pool.acquire() as conn:
         customer_id = await conn.fetchval(
             """
             SELECT customer_id FROM customer_identifiers
-            WHERE identifier_type = 'email' AND identifier_value = $1
+            WHERE identifier_type = 'email' AND lower(identifier_value) = $1
+            LIMIT 1
             """,
-            email,
+            normalize_email(email),
         )
-        if not customer_id:
-            return []
+    if not customer_id:
+        return []
+    return await get_customer_history_by_id(pool, customer_id, limit, include_resolved)
 
+
+async def get_customer_history_by_id(
+    pool: asyncpg.Pool, customer_id: UUID, limit: int = 10, include_resolved: bool = True
+) -> list[dict[str, Any]]:
+    """Ticket history for one customer id (the agent's tools are bound to it)."""
+    status_filter = (
+        "(status IN ('open', 'in_progress', 'escalated', 'closed'))"
+        if not include_resolved
+        else "(1=1)"
+    )
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
             SELECT
@@ -465,9 +444,10 @@ async def create_ticket(
     priority: str = "medium",
     channel: str = "email",
     initial_message: str = "",
-    customer_id: Optional[UUID] = None,
-) -> Dict[str, Any]:
+    customer_id: UUID | None = None,
+) -> dict[str, Any]:
     """Create a new ticket with auto-generated ticket number."""
+    customer_email = normalize_email(customer_email)
     max_attempts = 3
     original_customer_id = customer_id
 
@@ -476,40 +456,33 @@ async def create_ticket(
             customer_id = original_customer_id
             try:
                 async with conn.transaction():
-                    ticket_number = f"TKT-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+                    ticket_number = (
+                        f"TKT-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+                    )
 
                     if not customer_id:
+                        # Exact normalized email only; a look-alike address is a
+                        # different customer (AUDIT S2).
                         customer_row = await conn.fetchrow(
-                            "SELECT id FROM customers WHERE email = $1", customer_email
+                            """
+                            SELECT id FROM customers WHERE lower(email) = $1
+                            UNION ALL
+                            SELECT customer_id FROM customer_identifiers
+                            WHERE identifier_type = 'email' AND lower(identifier_value) = $1
+                            LIMIT 1
+                            """,
+                            customer_email,
                         )
                         if customer_row:
                             customer_id = customer_row["id"]
                         else:
-                            fuzzy_row = await conn.fetchrow(
-                                """
-                                SELECT id, similarity(email, $1) AS sim
-                                FROM customers
-                                WHERE email % $1
-                                  AND split_part(email, '@', 2) = split_part($1, '@', 2)
-                                  AND levenshtein(
-                                        split_part(email, '@', 1), split_part($1, '@', 1)
-                                      ) <= $2
-                                ORDER BY sim DESC
-                                LIMIT 1
-                                """,
+                            customer_row = await conn.fetchrow(
+                                "INSERT INTO customers (email, name, tier) VALUES ($1, $2, $3) RETURNING id",
                                 customer_email,
-                                EMAIL_LOCAL_MAX_DISTANCE,
+                                customer_email.split("@")[0],
+                                "starter",
                             )
-                            if fuzzy_row and fuzzy_row["sim"] >= FUZZY_THRESHOLD_DEFAULT:
-                                customer_id = fuzzy_row["id"]
-                            else:
-                                customer_row = await conn.fetchrow(
-                                    "INSERT INTO customers (email, name, tier) VALUES ($1, $2, $3) RETURNING id",
-                                    customer_email,
-                                    customer_email.split("@")[0],
-                                    "starter",
-                                )
-                                customer_id = customer_row["id"]
+                            customer_id = customer_row["id"]
 
                     # Register the email identifier so customer history resolves
                     # regardless of which channel created the ticket.
@@ -556,9 +529,10 @@ async def create_ticket(
             except asyncpg.UniqueViolationError:
                 if attempt == max_attempts - 1:
                     raise
+    raise AssertionError("unreachable: the last attempt returns or raises")
 
 
-async def get_ticket(pool: asyncpg.Pool, ticket_id: UUID) -> Optional[Dict[str, Any]]:
+async def get_ticket(pool: asyncpg.Pool, ticket_id: UUID) -> dict[str, Any] | None:
     """Get ticket with full details."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -576,7 +550,7 @@ async def get_ticket(pool: asyncpg.Pool, ticket_id: UUID) -> Optional[Dict[str, 
         return dict(row) if row else None
 
 
-async def get_ticket_by_number(pool: asyncpg.Pool, ticket_number: str) -> Optional[Dict[str, Any]]:
+async def get_ticket_by_number(pool: asyncpg.Pool, ticket_number: str) -> dict[str, Any] | None:
     """Get ticket by its human-facing TKT-… number.
 
     The success screen and tracking URL only ever carry the ticket_number, so
@@ -600,7 +574,7 @@ async def get_ticket_by_number(pool: asyncpg.Pool, ticket_number: str) -> Option
 
 async def update_ticket_status(
     pool: asyncpg.Pool, ticket_id: UUID, status: str
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Update ticket status."""
     resolved_at = datetime.now(UTC).replace(tzinfo=None) if status == "resolved" else None
 
@@ -624,11 +598,8 @@ async def update_ticket_status(
 
 
 async def list_tickets(
-    pool: asyncpg.Pool,
-    status: Optional[str] = None,
-    limit: int = 20,
-    offset: int = 0
-) -> tuple[List[Dict[str, Any]], int]:
+    pool: asyncpg.Pool, status: str | None = None, limit: int = 20, offset: int = 0
+) -> tuple[list[dict[str, Any]], int]:
     """List tickets with pagination."""
     async with pool.acquire() as conn:
         # Get total count
@@ -666,7 +637,7 @@ async def add_message(
     direction: str,
     content: str,
     channel: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Add a message to a ticket."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -686,7 +657,7 @@ async def add_message(
 
 async def get_ticket_messages(
     pool: asyncpg.Pool, ticket_id: UUID, limit: int = 50
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get messages for a ticket."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -705,7 +676,7 @@ async def get_ticket_messages(
 
 async def get_message_sentiment_history(
     pool: asyncpg.Pool, ticket_id: UUID, limit: int = 10
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get recent inbound message sentiment scores for a ticket, ordered by time."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -729,8 +700,8 @@ async def update_message_emotion_data(
     sentiment_score: float,
     emotion: str,
     urgency_score: float,
-    aspect_scores: Optional[Dict[str, float]] = None,
-) -> Optional[Dict[str, Any]]:
+    aspect_scores: dict[str, float] | None = None,
+) -> dict[str, Any] | None:
     """Update a message with full sentiment/emotion/urgency/aspect data in metadata."""
     async with pool.acquire() as conn:
         metadata_update = {
@@ -754,14 +725,35 @@ async def update_message_emotion_data(
 
 
 # Knowledge base queries
+# Ticket categories (web form: general/technical/billing/bug/feedback) are not
+# the same vocabulary as knowledge_base.category (onboarding/billing/product/
+# technical). Filtering on a ticket category with no articles, e.g. "general",
+# silently returned nothing. Only categories that exist in the KB filter;
+# anything else searches the whole KB.
+KB_CATEGORY_ALIASES: dict[str, str] = {
+    "technical": "technical",
+    "bug": "technical",
+    "billing": "billing",
+    "onboarding": "onboarding",
+    "product": "product",
+}
+
+
+def kb_category_filter(category: str | None) -> str | None:
+    """Map a ticket/agent category to a KB category, or None for no filter."""
+    if not category:
+        return None
+    return KB_CATEGORY_ALIASES.get(category.strip().lower())
+
+
 async def search_knowledge_base(
     pool: asyncpg.Pool,
-    embedding: List[float],
+    embedding: list[float],
     customer_tier: str = "starter",
-    category: Optional[str] = None,
+    category: str | None = None,
     max_results: int = 5,
-    embedding_model: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    embedding_model: str | None = None,
+) -> list[dict[str, Any]]:
     """Search knowledge base by vector similarity.
 
     ``embedding_model`` restricts the search to rows indexed by the same model
@@ -770,7 +762,29 @@ async def search_knowledge_base(
     a provider switch silently returns near-random articles at plausible-looking
     ranks. Callers should treat an empty result as "degrade to lexical search"
     rather than "no such article".
+
+    ``category`` is mapped with :func:`kb_category_filter`; if the filtered
+    search finds nothing, the search is repeated without the category.
     """
+    category = kb_category_filter(category)
+    rows = await _search_knowledge_base_vector(
+        pool, embedding, customer_tier, category, max_results, embedding_model
+    )
+    if not rows and category:
+        rows = await _search_knowledge_base_vector(
+            pool, embedding, customer_tier, None, max_results, embedding_model
+        )
+    return rows
+
+
+async def _search_knowledge_base_vector(
+    pool: asyncpg.Pool,
+    embedding: list[float],
+    customer_tier: str,
+    category: str | None,
+    max_results: int,
+    embedding_model: str | None,
+) -> list[dict[str, Any]]:
     async with pool.acquire() as conn:
         # Build query with tier filtering
         where_clause = "(kb.tier = $3 OR kb.tier = 'all')"
@@ -782,8 +796,7 @@ async def search_knowledge_base(
 
         if embedding_model:
             where_clause += (
-                " AND kb.embedding IS NOT NULL"
-                f" AND kb.embedding_model = ${len(params) + 1}"
+                " AND kb.embedding IS NOT NULL" f" AND kb.embedding_model = ${len(params) + 1}"
             )
             params.append(embedding_model)
 
@@ -805,9 +818,9 @@ async def search_knowledge_base_text(
     pool: asyncpg.Pool,
     query: str,
     customer_tier: str = "starter",
-    category: Optional[str] = None,
+    category: str | None = None,
     max_results: int = 5,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Lexical KB search used when embeddings are unavailable or incomparable.
 
     Keeps the knowledge base usable when the embedding provider is down, out of
@@ -821,7 +834,24 @@ async def search_knowledge_base_text(
     from AND to OR semantics, which keeps stemming and stopword removal while
     letting any single meaningful term hit; ILIKE and trigram matching stay as
     extra recall for short queries and misspellings.
+
+    ``category`` is mapped with :func:`kb_category_filter`; if the filtered
+    search finds nothing, the search is repeated without the category.
     """
+    category = kb_category_filter(category)
+    rows = await _search_knowledge_base_lexical(pool, query, customer_tier, category, max_results)
+    if not rows and category:
+        rows = await _search_knowledge_base_lexical(pool, query, customer_tier, None, max_results)
+    return rows
+
+
+async def _search_knowledge_base_lexical(
+    pool: asyncpg.Pool,
+    query: str,
+    customer_tier: str,
+    category: str | None,
+    max_results: int,
+) -> list[dict[str, Any]]:
     async with pool.acquire() as conn:
         where_clause = "(kb.tier = $2 OR kb.tier = 'all')"
         params = [query, customer_tier, max_results]
@@ -872,12 +902,12 @@ async def add_knowledge_base_article(
     pool: asyncpg.Pool,
     title: str,
     content: str,
-    embedding: List[float],
+    embedding: list[float],
     category: str = "general",
-    tags: Optional[List[str]] = None,
+    tags: list[str] | None = None,
     source: str = "internal",
     tier: str = "all",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Add a knowledge base article, replacing any article with the same title.
 
     knowledge_base.title carries a unique index (migration 010), so a plain
@@ -918,7 +948,7 @@ async def update_message_sentiment(
     pool: asyncpg.Pool,
     ticket_id: UUID,
     sentiment_score: float,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Update sentiment score on the latest inbound message for a ticket."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -941,16 +971,110 @@ async def update_message_sentiment(
         return dict(row) if row else None
 
 
+# Inbound processing ledger (migration 012)
+async def claim_inbound_message(
+    pool: asyncpg.Pool, message_id: str, topic: str
+) -> dict[str, Any] | None:
+    """Claim an inbound message for processing.
+
+    Returns the ledger row (status, attempts, ticket_id, created_at) when this
+    delivery should run, or None when the message is already done or dead.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO inbound_processing (message_id, topic)
+            VALUES ($1, $2)
+            ON CONFLICT (message_id) DO UPDATE
+                SET attempts = inbound_processing.attempts + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE inbound_processing.status = 'processing'
+            RETURNING status, attempts, ticket_id, created_at
+            """,
+            message_id,
+            topic,
+        )
+        return dict(row) if row else None
+
+
+async def set_inbound_ticket(pool: asyncpg.Pool, message_id: str, ticket_id: UUID) -> None:
+    """Remember the ticket a message created, so a redelivery reuses it."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE inbound_processing
+            SET ticket_id = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE message_id = $1
+            """,
+            message_id,
+            ticket_id,
+        )
+
+
+async def mark_inbound_done(pool: asyncpg.Pool, message_id: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE inbound_processing
+            SET status = 'done', last_error = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE message_id = $1
+            """,
+            message_id,
+        )
+
+
+async def record_inbound_error(
+    pool: asyncpg.Pool, message_id: str, error: str, dead: bool = False
+) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE inbound_processing
+            SET last_error = $2,
+                status = CASE WHEN $3 THEN 'dead' ELSE status END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE message_id = $1
+            """,
+            message_id,
+            error[:2000],
+            dead,
+        )
+
+
+async def has_completed_agent_run_since(
+    pool: asyncpg.Pool, ticket_id: UUID, since: datetime
+) -> bool:
+    """True if the agent successfully finished a run on this ticket since ``since``.
+
+    Runs that errored are excluded, including ones written before failed runs
+    got their own status (they carry result.status = 'failed').
+    """
+    async with pool.acquire() as conn:
+        return bool(
+            await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM agent_runs
+                    WHERE ticket_id = $1 AND status = 'completed' AND created_at >= $2
+                      AND coalesce(result->>'status', '') <> 'failed'
+                )
+                """,
+                ticket_id,
+                since,
+            )
+        )
+
+
 # Agent runs queries
 async def create_agent_run(
     pool: asyncpg.Pool,
     ticket_id: UUID,
     customer_id: UUID,
     input_message: str,
-    output_message: Optional[str] = None,
-    tool_calls: Optional[List[str]] = None,
+    output_message: str | None = None,
+    tool_calls: list[str] | None = None,
     status: str = "running",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Record an agent run."""
     tool_calls = list(tool_calls) if tool_calls else []
     async with pool.acquire() as conn:
@@ -975,16 +1099,19 @@ async def complete_agent_run(
     agent_run_id: UUID,
     output_message: str,
     tokens_used: int = 0,
-    result: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Mark agent run as completed."""
+    result: dict[str, Any] | None = None,
+    status: str = "completed",
+) -> dict[str, Any]:
+    """Finish an agent run as ``completed`` or ``failed``."""
+    if status not in ("completed", "failed"):
+        raise ValueError(f"invalid agent run status: {status}")
     result = dict(result) if result else {}
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             UPDATE agent_runs
             SET
-                status = 'completed',
+                status = $5,
                 output_message = $1,
                 tokens_used = $2,
                 result = $3,
@@ -997,13 +1124,14 @@ async def complete_agent_run(
             tokens_used,
             json.dumps(result),
             agent_run_id,
+            status,
         )
         return dict(row) if row else {}
 
 
 async def get_agent_runs(
     pool: asyncpg.Pool, ticket_id: UUID, limit: int = 10
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get agent runs for a ticket."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1027,13 +1155,12 @@ async def record_metric(
     metric_name: str,
     metric_value: float,
     metric_type: str = "gauge",
-    labels: Optional[Dict[str, str]] = None,
+    labels: dict[str, str] | None = None,
 ) -> None:
     """Record a metric."""
     if labels is None:
         labels = {}
-    if isinstance(labels, (dict, list)):
-        labels = json.dumps(labels)
+    labels_json = json.dumps(labels) if isinstance(labels, (dict, list)) else labels
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -1043,13 +1170,13 @@ async def record_metric(
             metric_name,
             metric_value,
             metric_type,
-            labels,
+            labels_json,
         )
 
 
 async def get_metrics_summary(
     pool: asyncpg.Pool, hours: int = 24, limit: int = 100
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get metrics summary for the last N hours."""
     # metrics.timestamp is TIMESTAMP WITHOUT TIME ZONE, so asyncpg rejects a
     # tz-aware cutoff ("can't subtract offset-naive and offset-aware datetimes").
@@ -1070,7 +1197,7 @@ async def get_metrics_summary(
         return [dict(row) for row in rows]
 
 
-async def get_dashboard_metrics(pool: asyncpg.Pool) -> Dict[str, Any]:
+async def get_dashboard_metrics(pool: asyncpg.Pool) -> dict[str, Any]:
     """Get aggregated metrics for dashboard."""
     async with pool.acquire() as conn:
         # Tickets by status
@@ -1079,19 +1206,15 @@ async def get_dashboard_metrics(pool: asyncpg.Pool) -> Dict[str, Any]:
         )
 
         # Avg resolution time
-        avg_resolution = await conn.fetchval(
-            """
+        avg_resolution = await conn.fetchval("""
             SELECT AVG(EXTRACT(EPOCH FROM (resolved_at - created_at))/3600) as avg_hours
             FROM tickets
             WHERE resolved_at IS NOT NULL
-            """
-        )
+            """)
 
         # Escalation rate
         total_tickets = await conn.fetchval("SELECT COUNT(*) FROM tickets")
-        escalated = await conn.fetchval(
-            "SELECT COUNT(*) FROM tickets WHERE status = 'escalated'"
-        )
+        escalated = await conn.fetchval("SELECT COUNT(*) FROM tickets WHERE status = 'escalated'")
         escalation_rate = (escalated / total_tickets * 100) if total_tickets > 0 else 0
 
         # Tickets by channel
@@ -1112,9 +1235,10 @@ async def get_dashboard_metrics(pool: asyncpg.Pool) -> Dict[str, Any]:
 # Name similarity flags a possible duplicate but never merges automatically
 # (see NAME_FUZZY_THRESHOLD). These helpers let a human resolve that flag.
 
+
 async def list_identity_review_queue(
     pool: asyncpg.Pool, limit: int = 50, offset: int = 0
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Customers flagged as possible duplicates, newest first, with their candidate."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1142,9 +1266,7 @@ async def list_identity_review_queue(
         return [dict(r) for r in rows]
 
 
-async def dismiss_identity_review(
-    pool: asyncpg.Pool, customer_id: UUID
-) -> Optional[Dict[str, Any]]:
+async def dismiss_identity_review(pool: asyncpg.Pool, customer_id: UUID) -> dict[str, Any] | None:
     """Mark a flagged customer as 'not a duplicate' without merging."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -1166,8 +1288,8 @@ async def merge_customers(
     pool: asyncpg.Pool,
     target_customer_id: UUID,
     source_customer_id: UUID,
-    reason: Optional[str] = None,
-) -> Dict[str, Any]:
+    reason: str | None = None,
+) -> dict[str, Any]:
     """
     Merge ``source`` into ``target``: the target survives, the source is deleted.
 
@@ -1214,7 +1336,7 @@ async def merge_customers(
                 target_customer_id,
             )
 
-            moved: Dict[str, int] = {}
+            moved: dict[str, int] = {}
             for table in ("tickets", "messages", "agent_runs", "customer_identifiers"):
                 status = await conn.execute(
                     f"UPDATE {table} SET customer_id = $1 WHERE customer_id = $2",

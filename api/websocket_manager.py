@@ -2,11 +2,12 @@
 
 import asyncio
 import json
-import structlog
-from typing import Dict, Set, Any
-from exceptions import sanitize_error_message
+from typing import Any
 
+import structlog
 from fastapi import WebSocket
+
+from exceptions import sanitize_error_message
 
 logger = structlog.get_logger(__name__)
 
@@ -20,7 +21,7 @@ class WebSocketManager:
     """
 
     def __init__(self) -> None:
-        self._connections: Dict[str, Set[WebSocket]] = {}
+        self._connections: dict[str, set[WebSocket]] = {}
         self._lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket, ticket_id: str) -> None:
@@ -49,14 +50,16 @@ class WebSocketManager:
             try:
                 await ws.send_text(payload)
             except Exception as e:
-                logger.warning("ws broadcast failed", ticket_id=ticket_id, error=sanitize_error_message(str(e)))
+                logger.warning(
+                    "ws broadcast failed", ticket_id=ticket_id, error=sanitize_error_message(str(e))
+                )
                 stale.add(ws)
         if stale:
             async with self._lock:
-                conns = self._connections.get(ticket_id)
-                if conns:
-                    conns.difference_update(stale)
-                    if not conns:
+                live = self._connections.get(ticket_id)
+                if live:
+                    live.difference_update(stale)
+                    if not live:
                         del self._connections[ticket_id]
 
     async def broadcast_ticket_update(self, ticket_id: str, ticket_data: dict[str, Any]) -> None:

@@ -1,7 +1,8 @@
 """Prometheus metrics for system monitoring."""
 
-from prometheus_client import Counter, Histogram, Gauge
 import time
+
+from prometheus_client import Counter, Gauge, Histogram
 
 # Counter metrics
 tickets_created = Counter(
@@ -32,6 +33,19 @@ kb_searches = Counter(
     "kb_searches_total",
     "Total knowledge base searches",
     ["category", "results_count"],
+)
+
+# Knowledge base search health. Lexical fallback answers worse than vector
+# search, so it is alerted on (monitoring/alerts.yml), not just logged.
+embeddings_configured = Gauge(
+    "embeddings_configured",
+    "1 when an embedding provider is configured (GEMINI_API_KEY), else 0",
+)
+
+kb_search_lexical_fallback = Counter(
+    "kb_search_lexical_fallback_total",
+    "KB searches answered lexically instead of by vector",
+    ["reason", "surface"],
 )
 
 # Histogram metrics (latency/duration)

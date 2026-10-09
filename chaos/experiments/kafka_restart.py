@@ -18,8 +18,14 @@ class KafkaRestartExperiment(ChaosExperiment):
         kafka_container = self.config.container_names["kafka"]
         deadline = time.time() + self.config.recovery_timeout
         while time.time() < deadline:
-            code, output = self._docker("exec", kafka_container, "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092")
+            code, output = self._docker(
+                "exec",
+                kafka_container,
+                "kafka-broker-api-versions",
+                "--bootstrap-server",
+                "localhost:9092",
+            )
             if code == 0:
                 break
             time.sleep(3)
-        return self._wait_for_healthy(timeout=self.config.recovery_timeout)
+        return self._wait_for_system_and_worker()

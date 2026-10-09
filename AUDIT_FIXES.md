@@ -1,0 +1,146 @@
+# AUDIT fixes — checklist
+
+- **Audit:** `AUDIT.md`, run on `fix/known-issues` @ `5e9d39a`.
+- **Fix branch:** `fix/audit`, cut from `fix/known-issues` @ `5ca1c85` (10 commits after the audited
+  commit: Round 2 of FIX_REPORT.md plus the lint pass `24467a0`).
+- **Rules:** one commit per finding; security fixes ship with a test that reproduced the exploit
+  first (the "before" column records it failing); nothing merged.
+- **Status values:** `Open`, `Fixed (<commit>)`, `Already fixed (<commit>, re-tested)`,
+  `Not fixed — <reason>`, `Needs you — <what>`.
+
+IDs are the audit's own (`S*` security §8, `N*` not-working §4). `G*` = §5 gaps, `M*` = §6
+missing, `C*` = issues named only in the §2 category table, `R2-*` = FIX_REPORT Round 2.
+
+## Reconciliation (Step 0)
+
+Commits between the audited `5e9d39a` and `5ca1c85`, re-tested on `fix/audit` before any change:
+
+| Item | Claimed in | Re-test on `fix/audit` @ 5ca1c85 | Result |
+|---|---|---|---|
+| N1 (lint part): ruff + black red | 24467a0 | `ruff check .` → "All checks passed"; `black --check .` → 70 unchanged | Already fixed. E501 ignored with a written reason in `pyproject.toml` (black owns line length) |
+| N1 (mypy part) / N16 | this commit | `mypy . --ignore-missing-imports` → "Success: no issues found in 90 source files" (was: aborts on the duplicate module, then 46 errors) | Fixed. Added `utils/__init__.py`, excluded local-only trees in `[tool.mypy]`, fixed the 46 errors in code (no ignores, no rule changes) and removed `continue-on-error` from the CI mypy step. mypy also found a real bug: chaos `_docker` rejected extra args (0080885) |
+| R2-A operator-voice reply | fb2358e | `tests/test_customer_reply.py` 17 passed | Already fixed |
+| R2-B `general` category | 211ff9f | `tests/test_kb_category.py` (needs PG; re-run on the live stack in P0 gate) | Already fixed |
+| R2-C sentiment gate | 7ec89d9 | `python -m agent.gate_eval` → TP=20 FP=1 FN=0 TN=21, P=0.95 R=1.00 | Already fixed |
+| N12 legal stems | 7ec89d9 | `\blawsuits?\b`, `\blitigat` present | Partly fixed; billing patterns still broad (R2-4) |
+| C-uv.lock untracked | 2263e88 | `git ls-files uv.lock` tracked | Already fixed |
+| H3 live-stack tests not in CI | b50f5ad | `ci.yml` job `live-stack` present; PR #1 run green | Already fixed |
+
+All three Round 2 items (operator voice, `general`, sentiment gate) are done, so P1 #11 adds
+nothing new; their open follow-ups are R2-1…R2-8 below.
+
+## P0
+
+| ID | Sev | Finding | Status | Exploit test (before → after) |
+|---|---|---|---|---|
+| S1 | Critical | Web-form proxy `/api/tickets/[id]` attaches the master key; `..%2F` reaches any GET | Fixed (S1 commit) | `tests/test_proxy_exploits_live.py`: 10 failed (all audit URLs 200 with ticket/customer/metrics data) → 11 passed (400; own ticket via token/email 200, wrong token 404) |
+| S13 | Low | `get_ticket` exposes `agent_runs` (internal prompts, errors) | Fixed (S1 commit): customers only see `/public/tickets/*`, which drops agent_runs, customer identity, assignment and message metadata; `/tickets/{id}` stays key-only | `tests/test_ticket_tracking.py::test_valid_token_returns_redacted_view` |
+| S2 | High | Fuzzy email identity merge (`alice1@` → Alice) | Fixed (S2 commit): exact normalized email only in `get_customer_or_create_by_identifier`, `create_ticket`, `find_customer_by_name_email`, `get_customer_history`; look-alikes become a new customer with a review hint. Existing links: see "Data clean-up" below | `tests/test_identity_exact_match.py` (real PG): 6 failed → 7 passed |
+| S3 | High | LLM tools take model-supplied `ticket_id` / `customer_email` | Fixed (S3 commit): the agent's `ToolContext` is bound to the run's ticket/customer; the model is offered no ID/target parameters and no `create_ticket`, any IDs it sends are replaced, history is read by customer id, `send_response` checks ticket ownership, history `limit` capped at 50. Not yet scoped (no route reaches them): `agent/tools_executor.py`, `mcp_server.py` — see P2 | `tests/test_tool_scope.py` (real PG, scripted prompt injection): failed (Alice's ticket returned to Mallory's run) → 3 passed |
+| S4 | High | WebSocket `/ws/tickets/{id}` unauthenticated | Fixed (S4 commit): handshake needs the ticket's tracking token (`?token=`) or the master key in `X-API-Key`; otherwise closed with 1008 before accept (HTTP 403 on the wire). The tracking page passes its token and stops reconnecting on 1008 | `tests/test_websocket_auth.py`: 4 failed (sockets accepted with no/wrong credential) → 6 passed; live: no key → 403, key → accepted |
+| S5 | High | `.env.development*`, `credentials.json`, `.kilo/` baked into the image | Fixed (S5 commit): both `.dockerignore` files exclude `**/.env*` (except `*.example`), `**/*.bak`, `credentials.json`, `client_secret*.json`, `gmail_*.json/.pickle`, keys/certs, root `*.sql` dumps, `.claude/`, `.kilo/`, scratch dirs. Patterns are scoped so `channels/gmail_handler.py` and `database/migrations/*.sql` stay in. Any image built before this (local, registry, Render) still holds the old secrets: rotate them (see Secrets to rotate) | `tests/test_docker_context.py` (Docker evaluates the real ignore file against decoys): 2 failed (13 / 18 decoys copied) → 2 passed; rebuilt api/worker/kb-embed/web-form images: 0 secret files |
+| S6 | Medium | DB URL with password logged (worker, seed) | Fixed (S6 commit): new `utils/redact.redact_dsn` masks the password (keeps user/host/db); used by the worker startup log and the seed/kb-embed log. No other log call carries a credential-bearing URL (grepped). Old log lines in any aggregator still hold the password: rotate it | `tests/test_log_redaction.py`: 2 failed (password in captured startup logs) → 8 passed; live worker log now `postgresql://techflow:***@postgres:5432/techflow` |
+| N4 | High | Kafka auto-commit + swallowed exception = message loss | Fixed (N4 commit): auto-commit off; the offset is committed only after the handler succeeds or the message is written to the `dlq` topic (retries: `KAFKA_HANDLER_MAX_ATTEMPTS`, default 3, exponential backoff); if the DLQ write fails nothing is committed. Handler errors now propagate. Idempotency: new `inbound_processing` ledger (migration 012) keyed on the Kafka message id skips finished messages, reuses the ticket a dead delivery created and gives up after `INBOUND_MAX_DELIVERIES` (10); the agent publishes the reply before marking its run completed, a redelivery skips the agent if a successful run exists since the claim, failed runs are now stored as `failed`, and the sender dedups on `inbound:<message id>`. Note: the agent also emits its own `dlq` event per failed run, so one message can produce one agent DLQ event per attempt plus the consumer's final one | `tests/test_inbound_redelivery.py` (real Kafka + PG, worker SIGKILLed): kill mid-agent failed (message lost) → passes, exactly one ticket, one completed run, one reply; kill after agent passes; failed first attempt is retried and answered. `tests/test_consumer_commit.py` 8 passed; `test_notification_sender.py::test_rerun_for_same_inbound_message_is_not_sent_twice` failed → passes. Live (LLM unreachable): 3 attempts, agent re-run each time |
+| S7 | Medium | `/api/voice` proxy attaches the master key; no size cap / rate limit | Fixed (S7 commit): the web form no longer holds the master key (removed from compose and `.env.local.example`); the proxy adds no credentials and refuses bodies over the cap (Content-Length and streamed count, 413). `/webhooks/voice/message` is public but capped: body > base64(`VOICE_MAX_AUDIO_BYTES`, default 5 MB)+4 KB → 413 before parsing, no Content-Length → 411, decoded audio re-checked; `audio_url` (server-side fetch) needs the API key (403). Existing `strict_limit` (10/min/IP) stays. Not done here: per-session tokens and a global LLM/STT spend cap (shared with S8, see P1/P2); behind the proxy every browser shares the web-form IP for the limiter (see rate-limit note). Local `web-form/.env.local` still has `API_KEY_SECRET`: delete that line | `tests/test_voice_public_limits.py`: 3 failed (12 MB-class body processed, no key path) → 5 passed; live `test_proxy_exploits_live.py`: 2 failed (12 MB via proxy → 200; web-form container env had `API_KEY_SECRET`) → 14 passed. `test_security.py::test_requires_api_key` replaced by `test_audio_url_requires_api_key` (endpoint is public by design now) |
+
+### P0 gate (2026-10-09, `fix/audit` @ 7692662)
+
+- **Exploits re-run:** every P0 exploit test passes on the fixed code: S1/S7 live proxy (14), S13, S2 (7, real PG),
+  S3 (3, real PG), S4 (6), S5 (2, real Docker), S6 (8), N4 (3 real Kafka + PG redelivery, 8 commit,
+  1 sender dedup), S7 API (5).
+- **Full suite** against the live compose stack (providers mocked: every LLM/STT/Twilio/Gmail URL points at a
+  closed port): 311 passed, 0 failed, 0 skipped (`-m` all, incl. e2e/Playwright; the Docker-context test needs
+  the buildx plugin, run outside the tool sandbox).
+- **Chrome:** form submit → ticket number → "Track Your Ticket" opens `/ticket/<n>?t=<token>`, shows the
+  redacted ticket, WebSocket accepted with the token; worker processed the message once (ledger `done`, attempt 1).
+- **CI:** not recorded yet: the push of `fix/audit` was not permitted from this session (see PR checklist).
+
+## P1
+
+| ID | Sev | Finding | Status |
+|---|---|---|---|
+| N5 | High | Human `/reply` never reaches email/WhatsApp | Fixed (N5 commit): `/tickets/{id}/reply` publishes `{reply_message_id, source: human, customer_reply, channel, customer_email}` to `notifications.outbound`; a publish failure returns 503 naming the saved message instead of a silent 201. The sender delivers these under `reply:<message id>` (deduped), skips the agent operator-voice guard for them, and still skips in-app channels. Tests: `tests/test_human_reply.py` 2 failed → passed; 3 new sender tests failed → passed. Live: reply → `outbound_deliveries` row `reply:<id>` (failed only because Gmail is mocked) |
+| N6 | Medium | `/health` 200 with DB down; no liveness/readiness split | Fixed: `/livez` (process only) and `/readyz` (DB + requested Kafka, 503 when down; DB ping bounded by `READINESS_DB_TIMEOUT_SECONDS`, default 2s, because a paused DB made it hang). `/health` = `/readyz`. k8s api liveness→`/livez`, readiness→`/readyz`; Render and compose api use `/readyz`. Tests: `tests/test_health_probes.py`. Live: paused postgres → `/readyz` 503 in 2.0s, `/livez` 200, recovers on unpause. |
+| S9 | High | next@14.2.35 critical/high advisories | Fixed: next 16.4.0 (the critical advisory covers every release up to 16.3.0-preview), React 19, ESLint 9 flat config (`next lint` is gone in 16), Tailwind 4 (v3 pulls chokidar/micromatch/braces). Route `params` are async now. New lint errors fixed in code, no rule disabled. `npm audit --omit=dev`: **0**. Full `npm audit`: 5 high, all from one dev-only root, `braces` <=3.0.3 (GHSA-vfj7-8cjw-p6xm, DoS on deeply nested patterns), via `eslint-config-next`→`@next/eslint-plugin-next`→`fast-glob`→`micromatch`. 3.0.3 is the latest braces release, so there is no fix to install; it only runs at lint time on repo-controlled globs. Re-check when braces or eslint-config-next ships a fix. Lockfile regenerated with npm 10 (node 20, as in the image and CI), because npm 11's lockfile failed `npm ci` there. Live: container on 16.4.0, form submit and tokenized tracking page work in Chrome, `tests/test_proxy_exploits_live.py` 14 passed. |
+| G2 / S8 (rate limit) | Medium | In-memory per-replica limiter, keyed on proxy IP | Documented, code still open: `docs/RATE_LIMITING.md` (limits per route, Redis needed for >1 replica, why keying on raw `X-Forwarded-For` is wrong, the trusted-proxy setup that fixes it). Live: 34 requests via the web form with 34 different `X-Forwarded-For` → one bucket (`client_ip=172.20.0.10`), `404×18, 429×16`. Code: S8 row (trusted-proxy key, global budget). CAPTCHA not done. |
+| N1 | High | CI never green | Fixed locally (ruff, black, mypy all clean and blocking); CI run not yet observed (push pending) |
+| N16 | Medium | mypy aborts on duplicate module | Fixed |
+| N2 | High | CD 0/7 (uppercase GHCR name, not gated on CI, no migrations) | Fixed in the workflow, not run yet: `workflow_run` on a successful CI push to main, builds that SHA, lower-case image name, migration Job (`scripts/render_migrate.sh`) before `kubectl set image`. Deploy is opt-in via repo variable `K8S_DEPLOY=true`; needs a cluster, a `KUBE_CONFIG` secret, a `techflow-secrets` secret with `database-url`, and GHCR pull access from the cluster |
+| N3 | High | chaos.yml invalid YAML (0/7) | Fixed: the workflow parses and starts its own compose stack (providers mocked to a closed port, throwaway key) instead of probing an empty runner, writes a step summary, dumps container state on failure and tears down. Runner fixes the live run exposed: `run()` reported "passed" whenever recovery returned True even if inject had errors (05 "passed" while the reconnect failed); now any error fails it. `docker kill` counts as a manual stop so the restart policy never fired; 01/04 now SIGTERM PID 1 inside the container. 05 read the network from config (`techflow_default`, wrong) and lost it after disconnect; it now resolves it before the disconnect and checks the worker really cannot / can reach Kafka. 03 checks `/readyz` 503 (N6). 02/04/05 also wait for the worker's own healthcheck, not just API health. Tests: `tests/test_chaos_verdict.py` (5). Live (compose, mocked providers): **6/6 passed**, recovery 01 3.0s, 02 6.8s, 03 0.4s, 04 7.1s, 05 10.3s, 06 passed. GitHub (workflow_dispatch on fix/audit, run 37936331549): **6/6 passed**, same recovery times; the first run failed before the stack started because the runner's Compose needs `API_KEY_SECRET` (set in the workflow now). The weekly schedule only runs from main |
+| R2-A/B/C | — | Round 2 items | Already fixed (see reconciliation) |
+
+## P2
+
+| ID | Sev | Finding | Status |
+|---|---|---|---|
+| S8 | Medium | No body size cap; 2 MB echoed in 422; no spend cap | Fixed (S8 commit): keyless bodies over `PUBLIC_MAX_BODY_BYTES` (64 KB) → 413 in the key middleware before parsing (chunked without length → 411); 422s no longer echo `input`/`url` (both validation handlers); global `PUBLIC_LLM_BUDGET_PER_HOUR` (300) shared bucket on `/webhooks/webform` + `/webhooks/voice/message`; limiter key `client_ip()` reads `X-Forwarded-For` only from `TRUSTED_PROXIES` (right-most untrusted hop). Not done: CAPTCHA/Turnstile; `TRUSTED_PROXIES` must be set per deployment. The web form became a safe trusted proxy in X6 | `tests/test_public_abuse_limits.py`: 4 failed (2 MB → 422 with echo, 1500-char echo, no global cap, proxy bucket shared; spoofed-XFF test passed before and after) → 5 passed. Live compose: 2 MB direct → 413, 1500-char → 422 without the marker; re-run through the form on :3000 after X7 (2026-10-10): 2 MB → 413 (form's 64 KB cap), 1500-char → 422 without the marker |
+| S10 | Medium | WhatsApp signature fails open; no URL override | Fixed: `REQUIRE_TWILIO_SIGNATURE` defaults to true and is read per request, so without `TWILIO_AUTH_TOKEN` an unsigned webhook gets 403 (`false` only for local/load tests). The signature URL is `TWILIO_WHATSAPP_WEBHOOK_URL` (or the already documented, previously ignored `TWILIO_WEBHOOK_URL`), else the request URL. Tests: `tests/test_whatsapp_signature.py` 3 failed → 5 passed (unsigned forged message accepted; public-URL signature rejected behind a proxy; wrong-URL signature accepted) |
+| S11 | Medium | `/metrics` unauthenticated | Fixed: the public app no longer has `/metrics` (401 without a key, 404 with one). Metrics are served by `prometheus_client` on the internal port `METRICS_PORT` (default 9100, `0` disables), which ingress, the k8s Service, Render and the compose host mapping do not expose. Prometheus scrapes `techflow-api:9100`; k8s gets a `metrics` container port plus scrape annotations; chaos 06 checks the port from inside the container. Tests: `tests/test_metrics_exposure.py` (exploit: GET `/metrics` without a key returned 200 with all metrics). Live: host `:8000/metrics` 401, host `:9100` refused, in-container `:9100` 200, Prometheus target `techflow-api:9100` up, chaos 06 passed |
+| S12 | Low | Default creds, ports on 0.0.0.0 | Open |
+| S14 | Info | Public repo; keep secrets out; pin gitleaks | Open |
+| N7 | Medium | Web-form `/webhooks/*` rewrite → container localhost | Open |
+| N8 | Medium | Gmail mounts create root-owned dirs | Open |
+| N9 | Medium | No consumer for `escalations` etc. | Open |
+| N10 | Low | 17/22 Prometheus metrics dead, no worker metrics | Open |
+| N11 | Low | `agent_runs.duration_ms` in seconds, `model` wrong, tokens overwritten | Open |
+| N12 | Low | Billing patterns escalate every billing question | Open |
+| N13 | Low | SSRF IP-literal branch dead | Open |
+| N14 | Medium | render.yaml undeployable as written | Open |
+| N15 | Medium | k8s manifests won't deploy | Open |
+| G1 | — | Single shared key, no users/roles | Open |
+| G3 | Medium | Unbounded `audio_base64`, `hours`, `limit` | Open |
+| G4 | Medium | No consumer DLQ; DLQ payloads carry PII | Open (consumer DLQ in N4) |
+| G5 | Low | Blocking I/O in async (Gmail, gTTS) | Open |
+| G6 | Low | Hardcoded `support.techflow.com`; LLM invents URLs | Open |
+| G7 | Low | gitleaks unpinned; pre-push hook scans HEAD only | Open |
+| G8 | Info | Python ≥3.13 declared, tests pass on 3.12 | Open |
+| C1 | Low | Misleading comment `message_processor.py:90` | Open (removed with N4) |
+| C2 | Medium | Worker healthcheck `kill -0 1` | Fixed with N6: each consumer refreshes `$WORKER_HEARTBEAT_DIR/<group>` (also when idle) unless one handler call exceeds `WORKER_STALL_SECONDS` (600); `python -m utils.worker_healthcheck --max-age N` fails on any stale file. k8s worker liveness 120s / readiness 30s, compose 60s. Tests: `tests/test_worker_heartbeat.py`. Live: compose worker `healthy`, 3 heartbeat files. |
+| C3 | Low | Tests accept HTTP 500 (`tests/test_e2e.py:20,37,55`) | Open |
+| C4 | Medium | Migrations 001/004 seed demo data; two runners; no downs; 010 unbounded DELETE; no retention | Open |
+| C5 | Low | Docs: inconsistent test counts; DEPLOYMENT.md stale | Open |
+| C6 | Low | Front end: channel `web` ≠ `webform`; voice `audio/webm` only; react-hooks warnings | Open |
+| C7 | Low | Compose is a dev config (`--reload`, `.:/app`, Grafana admin/admin) | Open |
+| C8 | Medium | Worker processes one message at a time | Open |
+| M* | — | §6 "Missing" (tenant model, RBAC, backups, tracing, Sentry, SBOM, …) | Open |
+| R2-1 | Low | Reply guard is a heuristic | Open |
+| R2-2 | Low | Replies open with "Great question" | Open |
+| R2-3 | Low | `send_response` publishes a second payload shape on `notifications.outbound` | Open |
+| R2-4 | Low | = N12 billing patterns | Open |
+| X1 | Low | (found in P0 gate) uvicorn access log prints the WebSocket URL including `?token=` (tracking token) | Open |
+| X2 | Low | (found in P0 gate) when the agent falls back without `send_response` (circuit open, model answered in text) on webform/voice, the reply is published but never stored, so the tracking page shows nothing | Open |
+| X3 | Medium | (found by chaos 04) the worker ignores SIGTERM as PID 1, so `docker stop` / pod termination SIGKILLs it after the grace period (10.3s, exit 137); consumers never leave their groups | Fixed: SIGTERM/SIGINT cancel the worker tasks and the normal cleanup runs. Live: `docker stop` 0.6s, exit 0, "Worker shutdown complete" logged. Test: `tests/test_worker_shutdown.py` |
+| X4 | Medium | API image `CMD ["sh","-c","uvicorn …"]` left `sh` as PID 1, which ignores SIGTERM: k8s/`docker stop` SIGKILLed the API after the grace period (10.3s, exit 137) with requests in flight | Fixed: `exec uvicorn …` so uvicorn is PID 1. Rebuilt image, same env: PID 1 uvicorn, stop 1.3s, exit 0, "Shutting down application" logged |
+| X5 | Medium | (found by chaos 01) no compose service had a restart policy (`RestartPolicy=no`): a crashed API or worker stayed down until someone ran compose again; the baseline chaos run went 0/6 because the API never came back | Fixed: `restart: unless-stopped` on the long-running services (not the one-shot `migrate` / `kb-embed`). Live: API PID 1 SIGTERM → restart count +1, `/readyz` 200 again within seconds |
+| R2-5 | Low | Emotion stems in `sentiment_analyzer.py` end in `\b` | Open |
+| X6 | Medium | (S8 follow-up) the web form passed a client-sent `X-Forwarded-For` through (Next.js `??=`), so it could not be trusted and every browser behind it shared one bucket | Fixed (X6 commit): `web-form/client-ip.js` preload overwrites `X-Forwarded-For` with the TCP peer and drops `X-Real-IP`/`Forwarded`; route handlers forward only that header; compose pins the form to `172.20.0.250` and the API trusts only that (`TRUSTED_PROXIES`). Not done: behind another edge (Render/ingress) the form sees the edge, so browsers there still share a bucket | `web-form/tests/client-ip.test.js`: 0/3 → 3/3. CI live `tests/test_client_ip_live.py` (127.0.0.2 rotating XFF → 10×201, 429; 127.0.0.3 → 201). Live compose from two containers via :3000: A `201×10, 429`; B (spoofing A) `201`; API `client_ip=172.20.0.201` |
+| X7 | Medium | (S8 follow-up) `/webhooks/*` was a `next.config.js` rewrite to `NEXT_PUBLIC_API_URL`, frozen at build (`localhost:8000`): in compose every form submit through :3000 was a 500 ECONNREFUSED | Fixed (X7 commit): rewrite removed; `src/app/webhooks/webform/route.ts` reads the runtime `API_INTERNAL_URL` (server-side, not `NEXT_PUBLIC_*`), caps the body at 64 KB (413) and passes `Retry-After`; `submitSupportForm` posts same-origin. The WebSocket URL is still `NEXT_PUBLIC_API_URL` (browser-side, must be public) | Live :3000 before: 500. After: 201, 2 MB → 413, 1500-char → 422 without echo, 11th → 429 |
+| X8 | Medium | Missing `GEMINI_API_KEY` was silent: embeddings fell back to the chat client (no embedding models on DeepSeek, 402 on OpenRouter), KB search went lexical and `/readyz` said healthy | Fixed (X8 commit): startup logs an error and sets `embeddings_configured=0`; `/readyz` → `status: degraded, embeddings: missing` (still HTTP 200: lexical search serves, a 503 would pull every pod); every lexical fallback logs an error and counts `kb_search_lexical_fallback_total{reason,surface}`; alerts `EmbeddingsNotConfigured`, `KBSearchLexicalFallback` (`monitoring/alerts.yml`). Chat-client embeddings only with explicit `EMBEDDING_MODEL`, and never on DeepSeek. Chaos sets a dummy Gemini key so its `healthy` gate holds | `tests/test_embeddings_missing_is_loud.py`: 7 failed → 7 passed. Live (no key): `/readyz` degraded, error logs, gauge 0, both alerts firing in Prometheus |
+| X9 | Medium | Chat provider: agent example built its own OpenRouter client (`customer_success_agent.py:675`); docs/env/k8s named OpenRouter as the provider | Fixed (X9 commit): DeepSeek (`DEEPSEEK_API_KEY`, `deepseek-chat`) is primary everywhere via `chat_provider`; OpenRouter is used only if DeepSeek's key is empty and its own key is set (warning logged); k8s adds `deepseek-api-key`/`gemini-api-key` secrets, OpenRouter's is optional; CI/chaos mocks use DeepSeek vars | Live with `scripts/mock_deepseek.py` (`docker-compose.mock-llm.yml`): 33 calls, all `model=deepseek-chat` with a bearer key; form submit → worker → reply stored as outbound message |
+
+## Data clean-up (you)
+
+S2 stops new fuzzy links but does not touch existing rows. List email identifiers that
+differ from their customer's own email, review each, and move the wrong ones with
+`POST /customers/{id}/merge` or delete the identifier row:
+
+```sql
+SELECT c.id, c.email AS customer_email, ci.identifier_value AS linked_email, ci.created_at
+FROM customer_identifiers ci JOIN customers c ON c.id = ci.customer_id
+WHERE ci.identifier_type = 'email' AND lower(ci.identifier_value) <> lower(c.email)
+ORDER BY ci.created_at;
+```
+
+## Secrets to rotate (you)
+
+Anything that was in `.env*`, `credentials.json` or `gmail_*` at the time an image was built before
+d7a647c (S5) is in that image's layers; the DB password was also in worker/seed logs before b403af6 (S6).
+The web form held `API_KEY_SECRET` until 7692662 (S7). Rotate, then rebuild and redeploy:
+
+- `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY` (and `GROQ_API_KEY` / `OPENAI_API_KEY` if set)
+- Gmail OAuth client secret (`GMAIL_CLIENT_SECRET` / `credentials.json`) and revoke the refresh token in `gmail_token.json`
+- `API_KEY` / `API_KEY_SECRET` (also changes tracking tokens unless `TRACKING_TOKEN_SECRET` is set separately)
+- Database password (`POSTGRES_PASSWORD` / `DATABASE_URL`) for every environment that ran the old worker
+- Twilio `TWILIO_AUTH_TOKEN` (and the account SID's API keys if any)
+- Delete pushed images built before d7a647c from GHCR / Render
+- Locally: remove the `API_KEY_SECRET` line from `web-form/.env.local`

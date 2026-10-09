@@ -1,6 +1,6 @@
 """Response formatters for different channels."""
 
-from typing import Optional, Dict, Any
+from typing import Any
 
 
 def _word_count(text: str) -> int:
@@ -16,7 +16,7 @@ def _truncate_by_words(text: str, max_words: int) -> str:
     return " ".join(words[:max_words]) + "..."
 
 
-def truncate_for_channel(text: str, channel: str, max_chars: int = None) -> str:
+def truncate_for_channel(text: str, channel: str, max_chars: int | None = None) -> str:
     """Truncate and format text for a specific channel.
 
     Spec constraints:
@@ -42,7 +42,7 @@ def truncate_for_channel(text: str, channel: str, max_chars: int = None) -> str:
 def format_email_response(
     body: str,
     customer_name: str = "Valued Customer",
-    ticket_number: Optional[str] = None,
+    ticket_number: str | None = None,
     include_footer: bool = True,
 ) -> str:
     """Format a response for email channel."""
@@ -100,17 +100,15 @@ def format_whatsapp_response(
             messages.append(current_message)
 
         # Truncate if still too long
-        return "\n\n---\n\n".join(
-            [truncate_for_channel(msg, "whatsapp") for msg in messages]
-        )
+        return "\n\n---\n\n".join([truncate_for_channel(msg, "whatsapp") for msg in messages])
     else:
         return truncate_for_channel(text, "whatsapp", max_chars)
 
 
 def format_web_form_response(
     body: str,
-    ticket_number: Optional[str] = None,
-    tracking_url: Optional[str] = None,
+    ticket_number: str | None = None,
+    tracking_url: str | None = None,
 ) -> str:
     """Format a response for web form channel."""
     lines = []
@@ -138,7 +136,7 @@ def format_escalation_message(
     ticket_number: str,
     reason: str,
     priority: str = "high",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Format an escalation message for human support team."""
     return {
         "ticket_number": ticket_number,
@@ -146,16 +144,16 @@ def format_escalation_message(
         "reason": reason,
         "priority": priority,
         "original_message": original_message,
-        "escalation_type": "customer_request"
-        if "escalate" in original_message.lower()
-        else "system_escalation",
+        "escalation_type": (
+            "customer_request" if "escalate" in original_message.lower() else "system_escalation"
+        ),
     }
 
 
 def format_ticket_summary(
-    ticket_data: Dict[str, Any],
+    ticket_data: dict[str, Any],
     include_messages: bool = False,
-    messages: list = None,
+    messages: list | None = None,
 ) -> str:
     """Format a ticket summary for display."""
     lines = [
@@ -225,11 +223,7 @@ def sanitize_for_channel(text: str, channel: str) -> str:
 def create_channel_specific_signature(channel: str) -> str:
     """Create a channel-appropriate signature."""
     if channel == "whatsapp":
-        return (
-            "\n\n---"
-            "\n💬 TechFlow Analytics Support"
-            "\n🕐 Available 24/7"
-        )
+        return "\n\n---" "\n💬 TechFlow Analytics Support" "\n🕐 Available 24/7"
     elif channel == "email":
         return (
             "\n\n---"
@@ -246,7 +240,7 @@ def create_channel_specific_signature(channel: str) -> str:
 
 
 def add_knowledge_base_source(
-    response: str, kb_article_id: str, kb_title: str, kb_link: str = None
+    response: str, kb_article_id: str, kb_title: str, kb_link: str | None = None
 ) -> str:
     """Add knowledge base source citation to response."""
     citation = f"\n\n📚 **Source:** {kb_title}"

@@ -59,13 +59,133 @@ jobs:
 
       - name: Type check with mypy
         run: mypy . --ignore-missing-imports
-        continue-on-error: true
 
       - name: Run unit tests
         run: pytest tests -m "not slow and not integration and not e2e" -v
         env:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/specifyplus
           RUN_MODE: test
+
+  live-stack:
+    name: Backend — Live-stack tests (Kafka + API + Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Runs the tests the unit job deselects (-m "integration or e2e"): the
+    # Kafka outbound test and the Playwright API suite against a real API
+    # process. No LLM, Gmail or Twilio credentials are configured, so nothing
+    # external is called; the API's degraded paths are what get exercised.
+
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.0-pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: specifyplus
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      kafka:
+        image: apache/kafka:3.8.0
+        ports:
+          - 9092:9092
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/specifyplus
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      API_KEY: ci-e2e-key
+      # The API refuses to start without a chat provider key. This placeholder
+      # points at a closed local port, so any LLM or embedding call fails fast
+      # and the API takes its degraded path; nothing leaves the runner.
+      DEEPSEEK_API_KEY: ci-placeholder-not-a-key
+      DEEPSEEK_BASE_URL: http://127.0.0.1:9/v1
+      # The web form runs on this host and overwrites X-Forwarded-For with the
+      # browser address, so the API trusts it from 127.0.0.1 (AUDIT S8);
+      # tests/test_client_ip_live.py checks spoofing and per-client buckets.
+      TRUSTED_PROXIES: 127.0.0.1
+      E2E_CLIENT_IP_TEST: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          python -m playwright install --with-deps chromium
+
+      - name: Apply migrations
+        run: bash scripts/render_migrate.sh
+
+      - name: Wait for Kafka
+        run: |
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/localhost/9092) 2>/dev/null && exit 0
+            sleep 2
+          done
+          echo "Kafka did not open port 9092" >&2
+          exit 1
+
+      - name: Start API
+        run: |
+          nohup python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health > /dev/null && exit 0
+            sleep 2
+          done
+          cat api.log
+          exit 1
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web-form/package-lock.json
+
+      # The web form's /api/* route handlers are an attack surface of their
+      # own (AUDIT S1/S7); the proxy exploit tests need it running.
+      - name: Start web form
+        working-directory: web-form
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+          API_INTERNAL_URL: http://localhost:8000
+        run: |
+          npm ci
+          npm run build
+          nohup npm start > ../web-form.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000/ > /dev/null && exit 0
+            sleep 2
+          done
+          cat ../web-form.log
+          exit 1
+
+      - name: Run live-stack tests
+        run: pytest tests -m "integration or e2e" -v
+        env:
+          E2E_API_KEY: ${{ env.API_KEY }}
+          OUTBOUND_TEST_DATABASE_URL: ${{ env.DATABASE_URL }}
+          OUTBOUND_TEST_KAFKA: localhost:9092
+
+      - name: API log
+        if: failure()
+        run: |
+          tail -200 api.log
+          tail -100 web-form.log || true
 
   frontend:
     name: Frontend (Next.js) — Lint & Build
@@ -90,6 +210,9 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      - name: Unit tests (client-ip preload)
+        run: npm test
 
       - name: Build
         run: npm run build

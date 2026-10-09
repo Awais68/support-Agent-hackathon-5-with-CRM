@@ -1,27 +1,30 @@
 """Agent tools for TechFlow CRM Digital FTE using OpenAI SDK with real DB/Kafka integration."""
 
+import copy
 import json
 from dataclasses import dataclass
-from typing import List, Optional
-from uuid import UUID
 from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID
 
 import asyncpg
 import structlog
 from openai import AsyncOpenAI
-from exceptions import sanitize_error_message
-from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
+from agent.reply_guard import operator_voice_reason
 from database import queries as db
 from embeddings_provider import (
     EMBEDDING_CIRCUIT_BREAKER,
     EmbeddingProvider,
+    record_lexical_fallback,
     resolve_embedding_provider,
 )
+from exceptions import sanitize_error_message
 from kafka_client import (
-    KafkaProducerClient,
+    AnyKafkaProducer,
     create_escalation_message,
 )
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
 
@@ -32,15 +35,28 @@ class ToolContext:
     """Context for executing agent tools with access to DB, Kafka, and OpenAI."""
 
     db_pool: asyncpg.Pool
-    kafka_producer: KafkaProducerClient
+    kafka_producer: AnyKafkaProducer
     openai_client: AsyncOpenAI
     # Embeddings run on their own provider (see embeddings_provider). Left
-    # unset, embeddings fall back to openai_client.
-    embedding_provider: Optional[EmbeddingProvider] = None
+    # unset, KB search is lexical (logged and counted) unless EMBEDDING_MODEL
+    # opts in to embedding through openai_client.
+    embedding_provider: EmbeddingProvider | None = None
+    # The ticket this run answers. When set, the server owns these IDs: the
+    # model never sees ticket/customer parameters and any it sends are
+    # replaced (AUDIT S3), so a prompt injection cannot point a tool at
+    # another customer's ticket or history.
+    ticket_id: UUID | None = None
+    customer_id: UUID | None = None
+    customer_email: str | None = None
+    channel: str | None = None
+
+    @property
+    def bound(self) -> bool:
+        return self.ticket_id is not None and self.customer_id is not None
 
 
 # OpenAI tool schemas (proper format for chat.completions.create)
-OPENAI_TOOL_SCHEMAS = [
+OPENAI_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -60,7 +76,10 @@ OPENAI_TOOL_SCHEMAS = [
                     },
                     "category": {
                         "type": "string",
-                        "description": "Optional category filter: 'technical', 'billing', 'onboarding', 'general'",
+                        "description": (
+                            "Optional KB category filter: 'technical', 'billing', "
+                            "'onboarding' or 'product'. Omit it for general questions."
+                        ),
                     },
                     "max_results": {
                         "type": "integer",
@@ -189,7 +208,10 @@ OPENAI_TOOL_SCHEMAS = [
                     },
                     "response_body": {
                         "type": "string",
-                        "description": "The response message to send",
+                        "description": (
+                            "The exact message the customer will read, written directly "
+                            "to them (second person). Never describe what you did."
+                        ),
                     },
                     "response_type": {
                         "type": "string",
@@ -220,15 +242,13 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             category=category,
         )
 
-        provider = resolve_embedding_provider(
-            context.embedding_provider, context.openai_client
-        )
-        embedding: Optional[List[float]] = None
+        provider = resolve_embedding_provider(context.embedding_provider, context.openai_client)
+        embedding: list[float] | None = None
         degraded_reason = None
 
         if provider is None:
             degraded_reason = "No embedding provider configured"
-            logger.warning("No embedding provider, using lexical KB search", query=query)
+            record_lexical_fallback("not_configured", "agent_tool", query=query)
         else:
             _cb = get_circuit_breaker(EMBEDDING_CIRCUIT_BREAKER)
             try:
@@ -236,19 +256,20 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
                     embedding = await provider.embed(query)
             except CircuitBreakerError:
                 degraded_reason = "AI service temporarily unavailable"
-                logger.warning("Embedding circuit open, using lexical KB search", query=query)
+                record_lexical_fallback("circuit_open", "agent_tool", query=query)
             except Exception as e:
                 # An embedding outage (provider down, out of credits, bad model
                 # name) must not cost the agent its knowledge base — degrade to
                 # lexical search instead of escalating to a human.
                 degraded_reason = "AI service temporarily unavailable"
-                logger.warning(
-                    "Embedding failed, using lexical KB search",
+                record_lexical_fallback(
+                    "embedding_failed",
+                    "agent_tool",
                     query=query,
                     error=sanitize_error_message(str(e)),
                 )
 
-        if embedding is None:
+        if embedding is None or provider is None:
             results = await db.search_knowledge_base_text(
                 context.db_pool,
                 query=query,
@@ -280,8 +301,9 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
                     max_results=max_results,
                 )
                 search_mode = "text"
-                degraded_reason = (
-                    "Knowledge base not indexed for the active embedding model"
+                degraded_reason = "Knowledge base not indexed for the active embedding model"
+                record_lexical_fallback(
+                    "not_indexed", "agent_tool", query=query, embedding_model=provider.model
                 )
 
         found = len(results) > 0
@@ -297,9 +319,11 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             "found": found,
             "results": [dict(r) for r in results] if results else [],
             "search_mode": search_mode,
-            "message": f"Found {len(results)} relevant articles about '{query}' for {customer_tier} tier."
-            if found
-            else f"No articles found for '{query}'. Please escalate to human support.",
+            "message": (
+                f"Found {len(results)} relevant articles about '{query}' for {customer_tier} tier."
+                if found
+                else f"No articles found for '{query}'. Please escalate to human support."
+            ),
         }
         if degraded_reason:
             response["degraded"] = True
@@ -307,7 +331,11 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
         return response
 
     except (asyncpg.PostgresError, ConnectionError) as e:
-        logger.error("Knowledge base search failed (DB)", error=sanitize_error_message(str(e)), query=args.get("query"))
+        logger.error(
+            "Knowledge base search failed (DB)",
+            error=sanitize_error_message(str(e)),
+            query=args.get("query"),
+        )
         return {
             "found": False,
             "results": [],
@@ -315,7 +343,11 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             "error": sanitize_error_message(str(e)),
         }
     except Exception as e:
-        logger.error("Knowledge base search failed", error=sanitize_error_message(str(e)), query=args.get("query"))
+        logger.error(
+            "Knowledge base search failed",
+            error=sanitize_error_message(str(e)),
+            query=args.get("query"),
+        )
         return {
             "found": False,
             "results": [],
@@ -399,7 +431,7 @@ async def get_customer_history(args: dict, context: ToolContext) -> dict:
     """Retrieve customer's ticket history and previous interactions (cross-channel)."""
     try:
         customer_email = args.get("customer_email", "")
-        limit = args.get("limit", 10)
+        limit = _clamp_limit(args.get("limit", 10))
         include_resolved = args.get("include_resolved", True)
 
         logger.info(
@@ -408,19 +440,25 @@ async def get_customer_history(args: dict, context: ToolContext) -> dict:
             limit=limit,
         )
 
-        history = await db.get_customer_history(
-            pool=context.db_pool,
-            email=customer_email,
-            limit=limit,
-            include_resolved=include_resolved,
-        )
+        if context.bound and context.customer_id is not None:
+            history = await db.get_customer_history_by_id(
+                context.db_pool,
+                context.customer_id,
+                limit=limit,
+                include_resolved=include_resolved,
+            )
+        else:
+            history = await db.get_customer_history(
+                pool=context.db_pool,
+                email=customer_email,
+                limit=limit,
+                include_resolved=include_resolved,
+            )
 
-        if not history:
+        if not history and not context.bound:
             phone = args.get("customer_phone")
             if phone:
-                customer = await db.get_customer_by_identifier(
-                    context.db_pool, "phone", phone
-                )
+                customer = await db.get_customer_by_identifier(context.db_pool, "phone", phone)
                 if customer:
                     customer_email = customer["email"]
                     history = await db.get_customer_history(
@@ -439,9 +477,11 @@ async def get_customer_history(args: dict, context: ToolContext) -> dict:
         return {
             "ticket_count": len(history),
             "tickets": [dict(t) for t in history] if history else [],
-            "message": f"Found {len(history)} previous tickets for {customer_email}."
-            if history
-            else f"No previous tickets found for {customer_email}.",
+            "message": (
+                f"Found {len(history)} previous tickets for {customer_email}."
+                if history
+                else f"No previous tickets found for {customer_email}."
+            ),
         }
 
     except (asyncpg.PostgresError, ConnectionError) as e:
@@ -566,6 +606,21 @@ async def send_response(args: dict, context: ToolContext) -> dict:
         response_body = args.get("response_body", "")
         response_type = args.get("response_type", "informational")
 
+        # Refuse internal or empty text before it is stored or delivered; the
+        # error tells the model to rewrite it for the customer.
+        rejection = operator_voice_reason(response_body)
+        if rejection:
+            logger.warning("send_response rejected", ticket_id=ticket_id, reason=rejection)
+            return {
+                "sent": False,
+                "message_id": None,
+                "message": "Response not sent.",
+                "error": (
+                    f"response_body rejected ({rejection}). Write it directly to the "
+                    "customer in the second person; do not describe your own actions."
+                ),
+            }
+
         logger.info(
             "Sending response",
             ticket_id=ticket_id,
@@ -584,6 +639,14 @@ async def send_response(args: dict, context: ToolContext) -> dict:
             }
 
         customer_id = ticket["customer_id"]
+        if context.bound and customer_id != context.customer_id:
+            logger.warning("send_response ticket/customer mismatch", ticket_id=ticket_id)
+            return {
+                "sent": False,
+                "message_id": None,
+                "message": f"Ticket {ticket_id} not found",
+                "error": "Ticket not found",
+            }
 
         # Add message to database
         message = await db.add_message(
@@ -663,11 +726,66 @@ _TOOL_DISPATCH = {
 }
 
 
+# Arguments that name a ticket, customer or delivery target. On a bound
+# context they are hidden from the model and filled in by the server.
+_BOUND_ARGS = ("ticket_id", "customer_email", "customer_phone", "channel")
+# Tools a bound run must not call: the ticket already exists, and a new one
+# could be filed under any email the model chose.
+_UNBOUND_ONLY_TOOLS = frozenset({"create_ticket"})
+_MAX_HISTORY_LIMIT = 50
+
+
+def _clamp_limit(value) -> int:
+    try:
+        return max(1, min(int(value), _MAX_HISTORY_LIMIT))
+    except (TypeError, ValueError):
+        return 10
+
+
+def tool_schemas_for(context: ToolContext) -> list[dict]:
+    """Tool schemas to offer the model for this context.
+
+    Unbound contexts get the full schemas. Bound ones drop create_ticket and
+    every ID/target parameter, so the model has nothing to point elsewhere.
+    """
+    if not context.bound:
+        return OPENAI_TOOL_SCHEMAS
+    schemas = []
+    for schema in OPENAI_TOOL_SCHEMAS:
+        if schema["function"]["name"] in _UNBOUND_ONLY_TOOLS:
+            continue
+        schema = copy.deepcopy(schema)
+        params = schema["function"]["parameters"]
+        for key in _BOUND_ARGS:
+            params.get("properties", {}).pop(key, None)
+        if "required" in params:
+            params["required"] = [k for k in params["required"] if k not in _BOUND_ARGS]
+        schemas.append(schema)
+    return schemas
+
+
+def _bind_args(args: dict, context: ToolContext) -> dict:
+    """Replace any model-supplied IDs with the run's own."""
+    bound = {k: v for k, v in args.items() if k not in _BOUND_ARGS}
+    bound["ticket_id"] = str(context.ticket_id)
+    bound["customer_email"] = context.customer_email or ""
+    if context.channel:
+        bound["channel"] = context.channel
+    dropped = sorted(k for k in args if k in _BOUND_ARGS and args[k] != bound.get(k))
+    if dropped:
+        logger.warning("Ignoring model-supplied tool IDs", fields=dropped)
+    return bound
+
+
 async def execute_tool(name: str, args: dict, context: ToolContext) -> str:
     """Execute a tool by name and return JSON string result."""
     fn = _TOOL_DISPATCH.get(name)
     try:
-        if fn:
+        if fn and context.bound and name in _UNBOUND_ONLY_TOOLS:
+            result = {"error": f"{name} is not available while answering a ticket."}
+        elif fn:
+            if context.bound:
+                args = _bind_args(args, context)
             result = await fn(args, context)
         else:
             result = {"error": f"Unknown tool: {name}"}

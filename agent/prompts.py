@@ -32,6 +32,10 @@ You have access to the following tools:
 4. **escalate_to_human** - Route to human agent with full context
 5. **send_response** - Deliver your response via the appropriate channel
 
+**Who reads what:**
+- The customer reads ONLY the `response_body` you pass to send_response. Write it directly to the customer ("you", "your account"), never about them.
+- Your final chat message after the tools is an internal note for the support team and is never shown to the customer.
+
 **Response Format:**
 - Provide clear, actionable solutions
 - When using knowledge base articles, briefly summarize the key points
@@ -175,6 +179,7 @@ Does this solve your issue?
 
 Let me know if you need any clarification!""",
 }
+
 
 def get_system_prompt(channel: str = "email") -> str:
     """Get the complete system prompt for the agent."""

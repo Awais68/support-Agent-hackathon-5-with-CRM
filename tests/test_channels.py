@@ -1,7 +1,6 @@
 """Tests for channel handlers."""
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock
 
 from channels.web_form_handler import WebFormHandler, WebFormSubmission
 
@@ -77,7 +76,7 @@ async def test_web_form_process_submission(mock_kafka_producer):
 
     result = await handler.process_submission(submission)
 
-    assert result["success"] == True
+    assert result["success"] is True
     assert result["email"] == "jane@example.com"
     mock_kafka_producer.send_message.assert_called_once()
 

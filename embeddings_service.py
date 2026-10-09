@@ -1,17 +1,17 @@
 """Embeddings service for semantic search in knowledge base."""
 
-from typing import List, Optional
 import structlog
-from openai import AsyncOpenAI
-from openai import APIError as OpenAIAPIError, APITimeoutError, APIConnectionError
-from exceptions import sanitize_error_message
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
+from openai import APIError as OpenAIAPIError
+
 from database.queries import EMBEDDING_DIM
-from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 from embeddings_provider import (
     EMBEDDING_CIRCUIT_BREAKER,
     EmbeddingProvider,
     resolve_embedding_provider,
 )
+from exceptions import sanitize_error_message
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
 
@@ -23,7 +23,7 @@ class EmbeddingsService:
         self,
         openai_client: AsyncOpenAI,
         model: str = "",
-        embedding_provider: Optional[EmbeddingProvider] = None,
+        embedding_provider: EmbeddingProvider | None = None,
     ):
         # Embeddings run on their own provider (see embeddings_provider); an
         # explicit ``model`` still wins so callers can override it.
@@ -32,7 +32,7 @@ class EmbeddingsService:
         self.client = provider.client if provider else openai_client
         self.model = model or (provider.model if provider else "")
 
-    async def embed_text(self, text: str) -> List[float]:
+    async def embed_text(self, text: str) -> list[float]:
         """Generate embedding for a single text."""
         _cb = get_circuit_breaker(EMBEDDING_CIRCUIT_BREAKER)
         try:
@@ -46,11 +46,17 @@ class EmbeddingsService:
             logger.info("Text embedded", text_length=len(text), model=self.model)
             return embedding
 
-        except (OpenAIAPIError, APITimeoutError, APIConnectionError, CircuitBreakerError, Exception) as e:
+        except (
+            OpenAIAPIError,
+            APITimeoutError,
+            APIConnectionError,
+            CircuitBreakerError,
+            Exception,
+        ) as e:
             logger.error("Embedding generation failed", error=sanitize_error_message(str(e)))
             raise
 
-    async def embed_batch(self, texts: List[str]) -> List[List[float]]:
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for multiple texts efficiently."""
         try:
             if not texts:
@@ -72,13 +78,23 @@ class EmbeddingsService:
             )
             return embeddings
 
-        except (OpenAIAPIError, APITimeoutError, APIConnectionError, CircuitBreakerError, Exception) as e:
-            logger.error("Batch embedding failed", error=sanitize_error_message(str(e)), batch_size=len(texts))
+        except (
+            OpenAIAPIError,
+            APITimeoutError,
+            APIConnectionError,
+            CircuitBreakerError,
+            Exception,
+        ) as e:
+            logger.error(
+                "Batch embedding failed",
+                error=sanitize_error_message(str(e)),
+                batch_size=len(texts),
+            )
             raise
 
     async def embed_knowledge_base_article(
         self, title: str, content: str
-    ) -> tuple[List[float], List[float], List[float]]:
+    ) -> tuple[list[float], list[float], list[float]]:
         """Generate embeddings for KB article (title, content, combined)."""
         try:
             # Embed title
@@ -100,5 +116,7 @@ class EmbeddingsService:
             return title_embedding, content_embedding, combined_embedding
 
         except (OpenAIAPIError, APITimeoutError, APIConnectionError, Exception) as e:
-            logger.error("KB article embedding failed", error=sanitize_error_message(str(e)), title=title)
+            logger.error(
+                "KB article embedding failed", error=sanitize_error_message(str(e)), title=title
+            )
             raise

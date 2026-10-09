@@ -1,0 +1,29 @@
+# Live runs without a real DeepSeek key: the chat provider points at
+# scripts/mock_deepseek.py. Not for production.
+#   docker compose -f docker-compose.yml -f docker-compose.mock-llm.yml up -d
+services:
+  mock-deepseek:
+    image: python:3.12-slim
+    command: ["python", "/mock/mock_deepseek.py", "8089"]
+    volumes:
+      - ./scripts/mock_deepseek.py:/mock/mock_deepseek.py:ro
+    networks:
+      - techflow
+
+  api:
+    environment:
+      DEEPSEEK_API_KEY: mock-not-a-key
+      DEEPSEEK_BASE_URL: http://mock-deepseek:8089/v1
+      DEEPSEEK_MODEL: deepseek-chat
+      OPENROUTER_API_KEY: ""
+    depends_on:
+      - mock-deepseek
+
+  worker:
+    environment:
+      DEEPSEEK_API_KEY: mock-not-a-key
+      DEEPSEEK_BASE_URL: http://mock-deepseek:8089/v1
+      DEEPSEEK_MODEL: deepseek-chat
+      OPENROUTER_API_KEY: ""
+    depends_on:
+      - mock-deepseek

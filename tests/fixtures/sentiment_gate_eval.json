@@ -1,0 +1,257 @@
+{
+  "description": "Labeled eval set for the pre-processing gate (agent/pre_processing_gate.run_gate). should_escalate=true for anger, abuse, legal or refund threats, and business-critical urgency (production outage, data loss, security incident, blocked critical business process). Neutral technical questions (even with words like error/broken/failed), mild frustration and time pressure on a how-to question should NOT escalate.",
+  "messages": [
+    {
+      "id": "normal_technical-01",
+      "group": "normal_technical",
+      "text": "The Salesforce connector failed with error 401 during sync. How do I re-authenticate it?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-02",
+      "group": "normal_technical",
+      "text": "API requests are failing with 429 Too Many Requests. What are the rate limits for the growth tier?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-03",
+      "group": "normal_technical",
+      "text": "My dashboard widget shows 'Query failed: timeout'. How can I make the query faster?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-04",
+      "group": "normal_technical",
+      "text": "The CSV export is broken for reports larger than 100k rows. Is there a size limit?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-05",
+      "group": "normal_technical",
+      "text": "Getting an error 'invalid token' when calling /v1/metrics from Python. What header should I use?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-06",
+      "group": "normal_technical",
+      "text": "Anomaly detection failed to run last night. Where can I see the job logs?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-07",
+      "group": "normal_technical",
+      "text": "How do I connect a PostgreSQL database as a data source?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-08",
+      "group": "normal_technical",
+      "text": "The webhook integration returns error 500 when I test it. What payload format do you expect?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-09",
+      "group": "normal_technical",
+      "text": "Chart colors look broken in dark mode after the update. Is there a setting to fix that?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-10",
+      "group": "normal_technical",
+      "text": "Sync job failed with 'connection refused' on port 5432. Do I need to allowlist your IP addresses?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-11",
+      "group": "normal_technical",
+      "text": "Login fails with 'SSO assertion error' for new team members. How do I configure the SAML attribute mapping?",
+      "should_escalate": false
+    },
+    {
+      "id": "normal_technical-12",
+      "group": "normal_technical",
+      "text": "Scheduled report emails stopped arriving, no error shown. How can I check the schedule?",
+      "should_escalate": false
+    },
+    {
+      "id": "mildly_frustrated-01",
+      "group": "mildly_frustrated",
+      "text": "This is a bit annoying, the connector failed again this morning. Can you help me figure out why?",
+      "should_escalate": false
+    },
+    {
+      "id": "mildly_frustrated-02",
+      "group": "mildly_frustrated",
+      "text": "I've tried the setup guide twice and the sync still fails. Not sure what I'm missing.",
+      "should_escalate": false
+    },
+    {
+      "id": "mildly_frustrated-03",
+      "group": "mildly_frustrated",
+      "text": "Honestly a little frustrating that the export keeps timing out. Any workaround?",
+      "should_escalate": false
+    },
+    {
+      "id": "mildly_frustrated-04",
+      "group": "mildly_frustrated",
+      "text": "Second time this week the dashboard didn't load. Could you take a look?",
+      "should_escalate": false
+    },
+    {
+      "id": "mildly_frustrated-05",
+      "group": "mildly_frustrated",
+      "text": "I'm confused, the docs say one thing and the UI shows another. Which is correct for API keys?",
+      "should_escalate": false
+    },
+    {
+      "id": "mildly_frustrated-06",
+      "group": "mildly_frustrated",
+      "text": "Kind of disappointed the Slack integration doesn't support threads. Is it on the roadmap?",
+      "should_escalate": false
+    },
+    {
+      "id": "mildly_frustrated-07",
+      "group": "mildly_frustrated",
+      "text": "The anomaly alerts are noisy and it's getting tiresome. How do I tune sensitivity?",
+      "should_escalate": false
+    },
+    {
+      "id": "mildly_frustrated-08",
+      "group": "mildly_frustrated",
+      "text": "Still stuck on the connector error from yesterday, any update?",
+      "should_escalate": false
+    },
+    {
+      "id": "urgent_polite-01",
+      "group": "urgent_polite",
+      "text": "Hi team, our production dashboards have been down for 30 minutes and the whole company relies on them. Could you please look into it urgently?",
+      "should_escalate": true
+    },
+    {
+      "id": "urgent_polite-02",
+      "group": "urgent_polite",
+      "text": "We seem to have lost data from yesterday's import, about 40k rows are missing. Please help as soon as possible, thank you.",
+      "should_escalate": true
+    },
+    {
+      "id": "urgent_polite-03",
+      "group": "urgent_polite",
+      "text": "We noticed logins from an unknown IP on our admin account. Could you help us lock it down right away?",
+      "should_escalate": true
+    },
+    {
+      "id": "urgent_polite-04",
+      "group": "urgent_polite",
+      "text": "Our nightly sync failure is blocking the finance team's month-end close today. Could someone please check it soon?",
+      "should_escalate": true
+    },
+    {
+      "id": "urgent_polite-05",
+      "group": "urgent_polite",
+      "text": "I have a board meeting in two hours and need to know how to export the quarterly report to PDF. Could you help quickly please?",
+      "should_escalate": false
+    },
+    {
+      "id": "urgent_polite-06",
+      "group": "urgent_polite",
+      "text": "Quick question before our deadline tomorrow: how do I add a new user to the workspace?",
+      "should_escalate": false
+    },
+    {
+      "id": "angry-01",
+      "group": "angry",
+      "text": "This is absolutely unacceptable. Your product has been broken for three days and nobody has helped me!",
+      "should_escalate": true
+    },
+    {
+      "id": "angry-02",
+      "group": "angry",
+      "text": "I am furious. I've wasted an entire week on your terrible connector and it STILL doesn't work.",
+      "should_escalate": true
+    },
+    {
+      "id": "angry-03",
+      "group": "angry",
+      "text": "Worst support experience ever. How many times do I have to explain the same problem?",
+      "should_escalate": true
+    },
+    {
+      "id": "angry-04",
+      "group": "angry",
+      "text": "Your platform is a joke. Every update breaks something and I'm sick of it.",
+      "should_escalate": true
+    },
+    {
+      "id": "angry-05",
+      "group": "angry",
+      "text": "I'm really angry that my reports vanished after your update. Fix this now.",
+      "should_escalate": true
+    },
+    {
+      "id": "angry-06",
+      "group": "angry",
+      "text": "Ridiculous. Third outage this month. We pay you for reliability and get nothing.",
+      "should_escalate": true
+    },
+    {
+      "id": "abusive-01",
+      "group": "abusive",
+      "text": "You people are useless idiots. Fix your garbage software.",
+      "should_escalate": true
+    },
+    {
+      "id": "abusive-02",
+      "group": "abusive",
+      "text": "Are you stupid? I told you the problem already, read the damn ticket.",
+      "should_escalate": true
+    },
+    {
+      "id": "abusive-03",
+      "group": "abusive",
+      "text": "What a pathetic, incompetent company. Shut up and give me a real human.",
+      "should_escalate": true
+    },
+    {
+      "id": "abusive-04",
+      "group": "abusive",
+      "text": "This crap is broken again, you morons.",
+      "should_escalate": true
+    },
+    {
+      "id": "legal_refund_threat-01",
+      "group": "legal_refund_threat",
+      "text": "If this isn't fixed by Friday I'll be contacting my lawyer.",
+      "should_escalate": true
+    },
+    {
+      "id": "legal_refund_threat-02",
+      "group": "legal_refund_threat",
+      "text": "I want a full refund for this month or I'm filing a chargeback with my bank.",
+      "should_escalate": true
+    },
+    {
+      "id": "legal_refund_threat-03",
+      "group": "legal_refund_threat",
+      "text": "We are considering legal action over the data loss your outage caused.",
+      "should_escalate": true
+    },
+    {
+      "id": "legal_refund_threat-04",
+      "group": "legal_refund_threat",
+      "text": "Cancel my account and refund me immediately.",
+      "should_escalate": true
+    },
+    {
+      "id": "legal_refund_threat-05",
+      "group": "legal_refund_threat",
+      "text": "This breaches our contract SLA and we will be seeking damages.",
+      "should_escalate": true
+    },
+    {
+      "id": "legal_refund_threat-06",
+      "group": "legal_refund_threat",
+      "text": "I'll report you to the data protection regulator if my data isn't deleted.",
+      "should_escalate": true
+    }
+  ]
+}

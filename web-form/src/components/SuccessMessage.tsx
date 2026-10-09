@@ -5,12 +5,14 @@ import { useState } from 'react';
 
 interface SuccessMessageProps {
   ticketNumber: string;
+  trackingToken?: string | null;
   estimatedResponse: string;
   onNewRequest: () => void;
 }
 
 export default function SuccessMessage({
   ticketNumber,
+  trackingToken,
   estimatedResponse,
   onNewRequest,
 }: SuccessMessageProps) {
@@ -24,7 +26,10 @@ export default function SuccessMessage({
   };
 
   const handleTrackTicket = () => {
-    router.push(`/ticket/${ticketNumber}`);
+    // The tracking token is the customer's proof of access; without it the
+    // tracking page asks for the ticket's email instead.
+    const query = trackingToken ? `?t=${encodeURIComponent(trackingToken)}` : '';
+    router.push(`/ticket/${encodeURIComponent(ticketNumber)}${query}`);
   };
 
   return (
@@ -58,11 +63,11 @@ export default function SuccessMessage({
           onClick={copyToClipboard}
           className="group relative inline-block"
         >
-          <code className="text-2xl font-mono font-bold text-gray-900 bg-gray-100 px-4 py-2 rounded hover:bg-gray-200 transition-colors cursor-pointer">
+          <code className="text-2xl font-mono font-bold text-gray-900 bg-gray-100 px-4 py-2 rounded-sm hover:bg-gray-200 transition-colors cursor-pointer">
             {ticketNumber}
           </code>
           {copied && (
-            <span className="absolute -top-10 left-1/2 transform -translate-x-1/2 bg-gray-900 text-white text-xs px-2 py-1 rounded whitespace-nowrap">
+            <span className="absolute -top-10 left-1/2 transform -translate-x-1/2 bg-gray-900 text-white text-xs px-2 py-1 rounded-sm whitespace-nowrap">
               Copied!
             </span>
           )}

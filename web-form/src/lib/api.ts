@@ -14,6 +14,7 @@ export interface SubmitResponse {
   ticket_number: string;
   message: string;
   estimated_response: string;
+  tracking_token: string | null;
   tracking_url: string;
 }
 
@@ -35,7 +36,7 @@ export interface TicketDetail {
   priority: string;
   created_at: string;
   updated_at: string;
-  customer_email: string;
+  tracking_token: string | null;
   messages: Message[];
 }
 
@@ -52,10 +53,11 @@ const FormDataSchema = z.object({
 export type ValidatedFormData = z.infer<typeof FormDataSchema>;
 
 // API client functions
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export async function submitSupportForm(data: WebFormPayload): Promise<SubmitResponse> {
-  const response = await fetch(`${API_URL}/webhooks/webform`, {
+  // Same-origin route handler (src/app/webhooks/webform) that forwards to the
+  // API with the real client address; no credentials.
+  const response = await fetch('/webhooks/webform', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
@@ -69,16 +71,25 @@ export async function submitSupportForm(data: WebFormPayload): Promise<SubmitRes
   return response.json();
 }
 
-export async function getTicketStatus(ticketId: string): Promise<TicketDetail> {
-  const response = await fetch(`/api/tickets/${ticketId}`, {
-    method: 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-  });
+export interface TicketCredential {
+  token?: string | null;
+  email?: string | null;
+}
+
+export async function getTicketStatus(
+  ticketNumber: string,
+  credential: TicketCredential
+): Promise<TicketDetail> {
+  const params = new URLSearchParams();
+  if (credential.token) params.set('t', credential.token);
+  else if (credential.email) params.set('email', credential.email);
+  const response = await fetch(
+    `/api/tickets/${encodeURIComponent(ticketNumber)}?${params.toString()}`,
+    { method: 'GET', headers: { Accept: 'application/json' } }
+  );
 
   if (!response.ok) {
-    if (response.status === 404) {
+    if (response.status === 404 || response.status === 400) {
       throw new Error('Ticket not found');
     }
     const error = await response.json().catch(() => ({ message: 'Failed to fetch ticket' }));
@@ -88,9 +99,12 @@ export async function getTicketStatus(ticketId: string): Promise<TicketDetail> {
   return response.json();
 }
 
-export function connectTicketWebSocket(ticketId: string): WebSocket {
+// The API refuses the socket without the ticket's tracking token.
+export function connectTicketWebSocket(ticketId: string, trackingToken: string): WebSocket {
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-  const wsUrl = apiUrl.replace(/^http/, 'ws') + `/ws/tickets/${ticketId}`;
+  const wsUrl =
+    apiUrl.replace(/^http/, 'ws') +
+    `/ws/tickets/${encodeURIComponent(ticketId)}?token=${encodeURIComponent(trackingToken)}`;
   return new WebSocket(wsUrl);
 }
 
@@ -124,7 +138,8 @@ export interface VoiceResponse {
 export async function submitVoiceMessage(
   payload: VoiceMessagePayload
 ): Promise<VoiceResponse> {
-  const response = await fetch(`${API_URL}/webhooks/voice/message`, {
+  // Same-origin proxy that caps the body; it adds no credentials.
+  const response = await fetch('/api/voice', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

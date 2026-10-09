@@ -1,24 +1,26 @@
 """Kafka client for TechFlow CRM Digital FTE with DLQ routing and retry logic."""
 
-import json
-import os
-from datetime import UTC, datetime
-from typing import Any, Callable, Dict, Optional
-from uuid import UUID, uuid4
 import asyncio
 import inspect
+import json
+import os
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID, uuid4
 
-from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 import structlog
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from tenacity import (
     AsyncRetrying,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
 
 from exceptions import sanitize_error_message
-from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
+from utils import heartbeat
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
 
@@ -65,10 +67,10 @@ class KafkaMessage:
     def __init__(
         self,
         topic: str,
-        payload: Dict[str, Any],
-        message_id: Optional[str] = None,
-        timestamp: Optional[datetime] = None,
-        headers: Optional[Dict[str, str]] = None,
+        payload: dict[str, Any],
+        message_id: str | None = None,
+        timestamp: datetime | None = None,
+        headers: dict[str, str] | None = None,
     ):
         self.topic = topic
         self.payload = payload
@@ -78,7 +80,7 @@ class KafkaMessage:
         self.timestamp = timestamp or datetime.now(UTC)
         self.headers = headers if headers is not None else {}
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
             "message_id": self.message_id,
@@ -93,15 +95,17 @@ class KafkaMessage:
         return json.dumps(self.to_dict(), cls=JSONEncoder)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "KafkaMessage":
+    def from_dict(cls, data: dict[str, Any]) -> "KafkaMessage":
         """Create from dictionary."""
         return cls(
             topic=data["topic"],
             payload=data["payload"],
             message_id=data.get("message_id"),
-            timestamp=datetime.fromisoformat(data["timestamp"])
-            if isinstance(data.get("timestamp"), str)
-            else data.get("timestamp"),
+            timestamp=(
+                datetime.fromisoformat(data["timestamp"])
+                if isinstance(data.get("timestamp"), str)
+                else data.get("timestamp")
+            ),
             headers=data.get("headers", {}),
         )
 
@@ -116,7 +120,7 @@ class KafkaProducerClient:
 
     def __init__(self, bootstrap_servers: str):
         self.bootstrap_servers = bootstrap_servers
-        self.producer: Optional[AIOKafkaProducer] = None
+        self.producer: AIOKafkaProducer | None = None
         self.retry_policy = AsyncRetrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -128,11 +132,13 @@ class KafkaProducerClient:
         protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
         config = {"security_protocol": protocol}
         if protocol in ("SASL_PLAINTEXT", "SASL_SSL"):
-            config.update({
-                "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
-                "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
-                "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
-            })
+            config.update(
+                {
+                    "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+                    "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
+                    "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
+                }
+            )
         return config
 
     async def start(self) -> None:
@@ -153,7 +159,7 @@ class KafkaProducerClient:
             logger.info("Kafka producer stopped")
 
     async def send_message(
-        self, topic: str, payload: Dict[str, Any], key: Optional[str] = None
+        self, topic: str, payload: dict[str, Any], key: str | None = None
     ) -> str:
         """Send a message to a Kafka topic with retry logic."""
         message = KafkaMessage(topic, payload)
@@ -234,24 +240,42 @@ class NoOpKafkaProducer:
         return "noop-" + str(UUID(int=int(datetime.now().timestamp() * 1000000)))
 
 
+# Either producer; agents and tools only call send_message.
+AnyKafkaProducer = KafkaProducerClient | NoOpKafkaProducer
+
+
+class NonRetryableError(Exception):
+    """Retrying cannot help; the consumer dead-letters the message at once."""
+
+
 class KafkaConsumerClient:
-    """Async Kafka consumer with error handling."""
+    """Async Kafka consumer with at-least-once delivery.
+
+    Offsets are committed by hand, one message at a time, and only after the
+    handler succeeded or the message was dead-lettered. A crash at any point
+    before that leaves the offset uncommitted, so the message is delivered
+    again; handlers must therefore be idempotent (see inbound_processing).
+    """
 
     def __init__(self, bootstrap_servers: str, group_id: str):
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
-        self.consumer: Optional[AIOKafkaConsumer] = None
+        self.consumer: AIOKafkaConsumer | None = None
+        # Monotonic start of the handler call in flight; None while idle.
+        self._handling_since: float | None = None
 
     def _sasl_config(self) -> dict:
         """Build SASL config dict from environment variables."""
         protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
         config = {"security_protocol": protocol}
         if protocol in ("SASL_PLAINTEXT", "SASL_SSL"):
-            config.update({
-                "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
-                "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
-                "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
-            })
+            config.update(
+                {
+                    "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+                    "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
+                    "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
+                }
+            )
         return config
 
     async def start(self, topics: list[str]) -> None:
@@ -262,7 +286,9 @@ class KafkaConsumerClient:
             group_id=self.group_id,
             value_deserializer=lambda m: m.decode("utf-8"),
             auto_offset_reset="earliest",
-            enable_auto_commit=True,
+            # Committing on fetch lost every message whose handler failed or
+            # whose worker died mid-run (AUDIT N4).
+            enable_auto_commit=False,
             **self._sasl_config(),
         )
         await self.consumer.start()
@@ -283,45 +309,167 @@ class KafkaConsumerClient:
         self,
         on_message: Callable[[KafkaMessage], Any],
         timeout_ms: int = 1000,
+        dlq_producer: Any = None,
+        max_attempts: int | None = None,
+        retry_backoff_seconds: float | None = None,
     ) -> None:
-        """Consume messages from subscribed topics."""
+        """Consume messages, retrying the handler and dead-lettering failures.
+
+        Each message is tried up to ``max_attempts`` times (env
+        ``KAFKA_HANDLER_MAX_ATTEMPTS``, default 3) with exponential backoff.
+        After the last failure it is published to the DLQ via
+        ``dlq_producer``; only then is its offset committed. If the DLQ write
+        itself fails, the error propagates without committing.
+        """
         if not self.consumer:
             raise RuntimeError("Consumer not started")
+        attempts_allowed = max_attempts or int(os.getenv("KAFKA_HANDLER_MAX_ATTEMPTS", "3"))
+        backoff = (
+            retry_backoff_seconds
+            if retry_backoff_seconds is not None
+            else float(os.getenv("KAFKA_HANDLER_RETRY_BACKOFF_SECONDS", "1"))
+        )
 
+        beats = asyncio.create_task(self._heartbeat_loop())
         try:
             async for raw_message in self.consumer:
-                message = None
                 try:
                     message = KafkaMessage.from_json(raw_message.value)
-                    logger.info(
-                        "Message received",
-                        topic=message.topic,
-                        message_id=message.message_id,
-                    )
-
-                    # Call handler
-                    result = on_message(message)
-                    if inspect.iscoroutine(result) or isinstance(result, asyncio.Task):
-                        await result
-
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
                     logger.error(
                         "Failed to parse message",
                         error=str(e),
-                        raw_value=raw_message.value[:200],
+                        raw_value=str(raw_message.value)[:200],
                     )
-                except Exception as e:
-                    logger.error(
-                        "Handler error",
-                        error=sanitize_error_message(str(e)),
-                        message_topic=getattr(message, "topic", None) or "unknown",
+                    await self._dead_letter(
+                        dlq_producer,
+                        raw_message,
+                        {"raw_value": str(raw_message.value)[:10000]},
+                        f"unparseable: {e}",
+                        attempts=0,
                     )
+                    await self._commit(raw_message)
+                    continue
+
+                logger.info(
+                    "Message received",
+                    topic=message.topic,
+                    message_id=message.message_id,
+                )
+                self._handling_since = asyncio.get_running_loop().time()
+                try:
+                    error = await self._handle_with_retries(
+                        on_message, message, attempts_allowed, backoff
+                    )
+                finally:
+                    self._handling_since = None
+                if error is not None:
+                    attempts, exc = error
+                    await self._dead_letter(
+                        dlq_producer,
+                        raw_message,
+                        {"message_id": message.message_id, "payload": message.payload},
+                        sanitize_error_message(str(exc)),
+                        attempts=attempts,
+                        original_topic=message.topic,
+                    )
+                await self._commit(raw_message)
 
         except asyncio.CancelledError:
             logger.info("Consumer cancelled")
         except Exception as e:
             logger.error("Consumer error", error=sanitize_error_message(str(e)))
             raise
+        finally:
+            beats.cancel()
+
+    async def _heartbeat_loop(self) -> None:
+        """Refresh this group's heartbeat while the loop is not stuck (N6).
+
+        Runs beside the consume loop so an idle topic still beats; skips the
+        beat once one handler call has run longer than WORKER_STALL_SECONDS,
+        which lets the probe restart a hung worker.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            started = self._handling_since
+            if started is None or loop.time() - started < heartbeat.stall_seconds():
+                try:
+                    heartbeat.beat(self.group_id)
+                except OSError as e:
+                    logger.warning("Heartbeat write failed", error=str(e))
+            await asyncio.sleep(heartbeat.interval_seconds())
+
+    async def _handle_with_retries(
+        self,
+        on_message: Callable[[KafkaMessage], Any],
+        message: KafkaMessage,
+        attempts_allowed: int,
+        backoff: float,
+    ) -> tuple[int, Exception] | None:
+        """Run the handler; return (attempts, last error) if it never succeeded."""
+        for attempt in range(1, attempts_allowed + 1):
+            try:
+                result = on_message(message)
+                if inspect.iscoroutine(result) or isinstance(result, asyncio.Task):
+                    await result
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                final = isinstance(e, NonRetryableError) or attempt == attempts_allowed
+                logger.error(
+                    "Handler error",
+                    error=sanitize_error_message(str(e)),
+                    message_topic=message.topic,
+                    message_id=message.message_id,
+                    attempt=attempt,
+                    will_retry=not final,
+                )
+                if final:
+                    return attempt, e
+                if backoff:
+                    await asyncio.sleep(backoff * 2 ** (attempt - 1))
+        return None
+
+    async def _dead_letter(
+        self,
+        dlq_producer: Any,
+        raw_message: Any,
+        body: dict,
+        error: str,
+        attempts: int,
+        original_topic: str | None = None,
+    ) -> None:
+        if dlq_producer is None:
+            # Nowhere to park it: keep the offset so the message is not lost.
+            raise RuntimeError("Handler failed and no DLQ producer is configured")
+        await dlq_producer.send_message(
+            DLQ_TOPIC,
+            {
+                "original_topic": original_topic or raw_message.topic,
+                "kafka_topic": raw_message.topic,
+                "partition": raw_message.partition,
+                "offset": raw_message.offset,
+                "consumer_group": self.group_id,
+                "attempts": attempts,
+                "error": error,
+                "timestamp": datetime.now(UTC).isoformat(),
+                **body,
+            },
+        )
+        logger.warning(
+            "Message dead-lettered",
+            topic=raw_message.topic,
+            offset=raw_message.offset,
+            attempts=attempts,
+        )
+
+    async def _commit(self, raw_message: Any) -> None:
+        if not self.consumer:
+            raise RuntimeError("Consumer not started")
+        tp = TopicPartition(raw_message.topic, raw_message.partition)
+        await self.consumer.commit({tp: raw_message.offset + 1})
 
 
 def create_inbound_email_message(
@@ -329,7 +477,7 @@ def create_inbound_email_message(
     sender_name: str,
     subject: str,
     body: str,
-    message_id: Optional[str] = None,
+    message_id: str | None = None,
 ) -> KafkaMessage:
     """Create an inbound email message."""
     return KafkaMessage(
@@ -350,8 +498,8 @@ def create_inbound_whatsapp_message(
     customer_phone: str,
     customer_name: str,
     message_body: str,
-    media_url: Optional[str] = None,
-    message_id: Optional[str] = None,
+    media_url: str | None = None,
+    message_id: str | None = None,
 ) -> KafkaMessage:
     """Create an inbound WhatsApp message."""
     return KafkaMessage(
@@ -375,9 +523,9 @@ def create_inbound_webform_message(
     message_body: str,
     category: str = "general",
     priority: str = "medium",
-    customer_phone: Optional[str] = None,
-    message_id: Optional[str] = None,
-    ticket_id: Optional[str] = None,
+    customer_phone: str | None = None,
+    message_id: str | None = None,
+    ticket_id: str | None = None,
 ) -> KafkaMessage:
     """Create an inbound web form message.
 
@@ -440,7 +588,7 @@ def create_agent_processing_message(
     customer_id: str,
     input_message: str,
     channel: str,
-    message_id: Optional[str] = None,
+    message_id: str | None = None,
 ) -> KafkaMessage:
     """Create an agent processing event."""
     return KafkaMessage(
@@ -462,8 +610,8 @@ def create_escalation_message(
     customer_id: str,
     reason: str,
     priority: str = "high",
-    context: Optional[Dict[str, Any]] = None,
-    message_id: Optional[str] = None,
+    context: dict[str, Any] | None = None,
+    message_id: str | None = None,
 ) -> KafkaMessage:
     """Create an escalation event."""
     return KafkaMessage(

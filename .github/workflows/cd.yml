@@ -1,24 +1,44 @@
 name: CD
 
+# Runs only after CI finished successfully on a push to main, and builds the
+# exact commit CI tested (AUDIT N2: CD used to run on every push, in parallel
+# with CI and regardless of its result).
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
+
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_TAG: ${{ github.sha }}
+  IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
   K8S_NAMESPACE: techflow
 
 jobs:
   build-and-push:
     name: Build & Push Docker Images
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      image_base: ${{ steps.image.outputs.base }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # GHCR rejects upper-case repository names (github.repository is
+      # "Awais68/..."), which failed every CD run.
+      - name: Compute lower-case image name
+        id: image
+        run: echo "base=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -38,8 +58,8 @@ jobs:
           file: Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository }}/api:${{ env.IMAGE_TAG }}
-            ${{ env.REGISTRY }}/${{ github.repository }}/api:latest
+            ${{ steps.image.outputs.base }}/api:${{ env.IMAGE_TAG }}
+            ${{ steps.image.outputs.base }}/api:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -51,61 +71,98 @@ jobs:
           file: web-form/Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository }}/web-form:${{ env.IMAGE_TAG }}
-            ${{ env.REGISTRY }}/${{ github.repository }}/web-form:latest
+            ${{ steps.image.outputs.base }}/web-form:${{ env.IMAGE_TAG }}
+            ${{ steps.image.outputs.base }}/web-form:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # Deploying needs a cluster and a KUBE_CONFIG secret, which this repository
+  # does not have yet. The job is opt-in through the repository variable
+  # K8S_DEPLOY=true so that, until a cluster exists, CD reports the image build
+  # honestly instead of failing on a missing kubeconfig every run. Once the
+  # variable is set, a missing secret is a hard failure.
   deploy:
     name: Deploy to Kubernetes
     runs-on: ubuntu-latest
     needs: build-and-push
+    if: vars.K8S_DEPLOY == 'true'
+    environment: production
     permissions:
       contents: read
+    env:
+      API_IMAGE: ${{ needs.build-and-push.outputs.image_base }}/api:${{ github.event.workflow_run.head_sha }}
+      WEB_IMAGE: ${{ needs.build-and-push.outputs.image_base }}/web-form:${{ github.event.workflow_run.head_sha }}
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Set up kubectl
         uses: azure/setup-kubectl@v4
-        with:
-          version: latest
 
       - name: Configure kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
         run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG }}" > $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
+          if [ -z "$KUBE_CONFIG" ]; then
+            echo "::error::K8S_DEPLOY is true but the KUBE_CONFIG secret is not set"
+            exit 1
+          fi
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
 
-      - name: Update backend image
+      # Schema changes go in before any pod runs the new code. Same runner as
+      # Render's pre-deploy command and the compose `migrate` service.
+      - name: Run database migrations
         run: |
-          kubectl set image deployment/techflow-api \
-            api=${{ env.REGISTRY }}/${{ github.repository }}/api:${{ env.IMAGE_TAG }} \
-            --namespace=${{ env.K8S_NAMESPACE }} \
-            --record
+          job="techflow-migrate-${IMAGE_TAG::12}"
+          kubectl delete job "$job" -n "$K8S_NAMESPACE" --ignore-not-found
+          cat <<EOF | kubectl apply -n "$K8S_NAMESPACE" -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${job}
+            labels:
+              app: db-migrate
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 86400
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: migrate
+                    image: ${API_IMAGE}
+                    command: ["bash", "scripts/render_migrate.sh"]
+                    env:
+                      - name: DATABASE_URL
+                        valueFrom:
+                          secretKeyRef:
+                            name: techflow-secrets
+                            key: database-url
+          EOF
+          if ! kubectl wait --for=condition=complete "job/$job" -n "$K8S_NAMESPACE" --timeout=300s; then
+            kubectl logs "job/$job" -n "$K8S_NAMESPACE" || true
+            echo "::error::database migration failed; images were not rolled out"
+            exit 1
+          fi
+          kubectl logs "job/$job" -n "$K8S_NAMESPACE"
 
-      - name: Update worker image
+      - name: Update backend and worker images
         run: |
-          kubectl set image deployment/techflow-worker \
-            worker=${{ env.REGISTRY }}/${{ github.repository }}/api:${{ env.IMAGE_TAG }} \
-            --namespace=${{ env.K8S_NAMESPACE }} \
-            --record
+          kubectl set image deployment/techflow-api api="$API_IMAGE" -n "$K8S_NAMESPACE"
+          kubectl set image deployment/techflow-worker worker="$API_IMAGE" -n "$K8S_NAMESPACE"
 
-      - name: Update frontend image (if exists)
+      - name: Update frontend image (if deployed)
         run: |
-          if kubectl get deployment techflow-web-form -n ${{ env.K8S_NAMESPACE }} &>/dev/null; then
-            kubectl set image deployment/techflow-web-form \
-              web-form=${{ env.REGISTRY }}/${{ github.repository }}/web-form:${{ env.IMAGE_TAG }} \
-              --namespace=${{ env.K8S_NAMESPACE }} \
-              --record
+          if kubectl get deployment techflow-web-form -n "$K8S_NAMESPACE" >/dev/null 2>&1; then
+            kubectl set image deployment/techflow-web-form web-form="$WEB_IMAGE" -n "$K8S_NAMESPACE"
           else
-            echo "Skipping frontend deployment — techflow-web-form not found in namespace ${{ env.K8S_NAMESPACE }}"
+            echo "Skipping frontend: techflow-web-form not found in namespace $K8S_NAMESPACE"
           fi
 
       - name: Verify rollout status
         run: |
-          kubectl rollout status deployment/techflow-api -n ${{ env.K8S_NAMESPACE }} --timeout=300s
-          kubectl rollout status deployment/techflow-worker -n ${{ env.K8S_NAMESPACE }} --timeout=300s
-          if kubectl get deployment techflow-web-form -n ${{ env.K8S_NAMESPACE }} &>/dev/null; then
-            kubectl rollout status deployment/techflow-web-form -n ${{ env.K8S_NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment/techflow-api -n "$K8S_NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/techflow-worker -n "$K8S_NAMESPACE" --timeout=300s
+          if kubectl get deployment techflow-web-form -n "$K8S_NAMESPACE" >/dev/null 2>&1; then
+            kubectl rollout status deployment/techflow-web-form -n "$K8S_NAMESPACE" --timeout=300s
           fi

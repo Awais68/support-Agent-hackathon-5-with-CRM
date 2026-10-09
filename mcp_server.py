@@ -1,8 +1,11 @@
 """MCP (Model Context Protocol) Server for extensible agent tools."""
 
 import json
-from typing import Any, Dict, List, Callable
+from collections.abc import Callable
+from typing import Any
+
 import structlog
+
 from exceptions import sanitize_error_message
 
 logger = structlog.get_logger(__name__)
@@ -15,7 +18,7 @@ class MCPTool:
         self,
         name: str,
         description: str,
-        parameters: Dict[str, Any],
+        parameters: dict[str, Any],
         handler: Callable,
         category: str = "general",
         version: str = "1.0.0",
@@ -27,7 +30,7 @@ class MCPTool:
         self.category = category
         self.version = version
 
-    def to_openai_format(self) -> Dict[str, Any]:
+    def to_openai_format(self) -> dict[str, Any]:
         """Convert tool to OpenAI function calling format."""
         return {
             "type": "function",
@@ -43,15 +46,13 @@ class MCPTool:
                         for name, prop in self.parameters.items()
                     },
                     "required": [
-                        name
-                        for name, prop in self.parameters.items()
-                        if prop.get("required", True)
+                        name for name, prop in self.parameters.items() if prop.get("required", True)
                     ],
                 },
             },
         }
 
-    async def execute(self, **kwargs) -> Dict[str, Any]:
+    async def execute(self, **kwargs) -> dict[str, Any]:
         """Execute the tool with given arguments."""
         try:
             result = await self.handler(**kwargs)
@@ -61,7 +62,9 @@ class MCPTool:
                 "result": result,
             }
         except Exception as e:
-            logger.error("Tool execution failed", tool=self.name, error=sanitize_error_message(str(e)))
+            logger.error(
+                "Tool execution failed", tool=self.name, error=sanitize_error_message(str(e))
+            )
             return {
                 "status": "error",
                 "tool": self.name,
@@ -73,14 +76,14 @@ class MCPServer:
     """Server managing and executing MCP tools."""
 
     def __init__(self):
-        self.tools: Dict[str, MCPTool] = {}
-        self.categories: Dict[str, List[str]] = {}
+        self.tools: dict[str, MCPTool] = {}
+        self.categories: dict[str, list[str]] = {}
 
     def register_tool(
         self,
         name: str,
         description: str,
-        parameters: Dict[str, Any],
+        parameters: dict[str, Any],
         handler: Callable,
         category: str = "general",
     ) -> None:
@@ -124,11 +127,11 @@ class MCPServer:
             return True
         return False
 
-    def get_tool(self, name: str) -> MCPTool:
+    def get_tool(self, name: str) -> MCPTool | None:
         """Get a tool by name."""
         return self.tools.get(name)
 
-    def list_tools(self, category: str = None) -> List[Dict[str, Any]]:
+    def list_tools(self, category: str | None = None) -> list[dict[str, Any]]:
         """List all available tools, optionally filtered by category."""
         tools_to_list = []
 
@@ -154,11 +157,11 @@ class MCPServer:
 
         return tools_to_list
 
-    def get_openai_tools(self) -> List[Dict[str, Any]]:
+    def get_openai_tools(self) -> list[dict[str, Any]]:
         """Get all tools in OpenAI function calling format."""
         return [tool.to_openai_format() for tool in self.tools.values()]
 
-    def get_tool_specs(self) -> Dict[str, Any]:
+    def get_tool_specs(self) -> dict[str, Any]:
         """Get detailed specifications for all tools."""
         return {
             name: {
@@ -170,7 +173,7 @@ class MCPServer:
             for name, tool in self.tools.items()
         }
 
-    async def execute_tool(self, name: str, input_params: Dict[str, Any]) -> Dict[str, Any]:
+    async def execute_tool(self, name: str, input_params: dict[str, Any]) -> dict[str, Any]:
         """Execute a tool by name with given parameters."""
         tool = self.get_tool(name)
         if not tool:

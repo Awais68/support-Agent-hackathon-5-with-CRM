@@ -26,6 +26,9 @@ spec:
       - name: worker
         image: techflow-api:latest
         imagePullPolicy: Always
+        # The image's default CMD starts the API (uvicorn). Run the Kafka
+        # consumer instead, same entrypoint as docker-compose's worker service.
+        command: ["python", "-m", "workers.message_processor"]
         env:
         - name: DATABASE_URL
           valueFrom:
@@ -37,11 +40,25 @@ spec:
             configMapKeyRef:
               name: techflow-config
               key: kafka-servers
+        - name: DEEPSEEK_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: techflow-secrets
+              key: deepseek-api-key
+        - name: DEEPSEEK_MODEL
+          value: "deepseek-chat"
+        - name: GEMINI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: techflow-secrets
+              key: gemini-api-key
+        # Optional chat fallback, used only when DEEPSEEK_API_KEY is empty.
         - name: OPENROUTER_API_KEY
           valueFrom:
             secretKeyRef:
               name: techflow-secrets
               key: openrouter-api-key
+              optional: true
         - name: OPENROUTER_BASE_URL
           value: "https://openrouter.ai/api/v1"
         - name: TWILIO_ACCOUNT_SID
@@ -72,8 +89,12 @@ spec:
           exec:
             command:
             - python
-            - -c
-            - "import sys; sys.exit(0)"
+            - -m
+            - utils.worker_healthcheck
+            - --max-age
+            - "120"
+          # Heartbeats: utils/heartbeat.py; a handler stuck longer than
+          # WORKER_STALL_SECONDS stops beating (AUDIT N6/C2).
           initialDelaySeconds: 30
           periodSeconds: 20
           timeoutSeconds: 5
@@ -82,8 +103,10 @@ spec:
           exec:
             command:
             - python
-            - -c
-            - "import sys; sys.exit(0)"
+            - -m
+            - utils.worker_healthcheck
+            - --max-age
+            - "30"
           initialDelaySeconds: 15
           periodSeconds: 10
           timeoutSeconds: 3

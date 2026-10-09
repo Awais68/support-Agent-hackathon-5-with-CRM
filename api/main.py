@@ -1,28 +1,42 @@
 """FastAPI application for TechFlow CRM Digital FTE."""
 
+import asyncio
+import hmac
 import os
 import re
 import traceback as tb
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 from xml.sax.saxutils import escape as xml_escape
 
 import asyncpg
 import structlog
-from env_config import load_environment
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from openai import APIError as OpenAIAPIError
 from openai import AsyncOpenAI
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import start_http_server
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from twilio.request_validator import RequestValidator
+
+from env_config import load_environment
 
 # Load .env BEFORE the first-party imports below: `uvicorn api.main:app` bypasses
 # main.py's entrypoint, and modules like api.rate_limiter read os.getenv() at
@@ -31,17 +45,24 @@ from slowapi.middleware import SlowAPIMiddleware
 load_environment()
 
 from agent.customer_success_agent import AgentContext, CustomerSuccessAgent  # noqa: E402
-from chat_provider import build_chat_client, chat_model, chat_provider_config  # noqa: E402
-from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit  # noqa: E402
+from api import tracking  # noqa: E402
+from api.rate_limiter import (  # noqa: E402
+    limiter,
+    public_llm_limit,
+    rate_limit_exceeded_handler,
+    strict_limit,
+)
 from api.websocket_manager import WebSocketManager  # noqa: E402
 from channels.voice_handler import VoiceHandler, twilio_language  # noqa: E402
 from channels.web_form_handler import WebFormHandler, WebFormSubmission  # noqa: E402
 from channels.whatsapp_handler import WhatsAppHandler  # noqa: E402
+from chat_provider import build_chat_client, chat_model, chat_provider_config  # noqa: E402
 from database import queries as db  # noqa: E402
 from embeddings_provider import (  # noqa: E402
     EMBEDDING_CIRCUIT_BREAKER,
     EmbeddingProvider,
     build_embedding_provider,
+    record_lexical_fallback,
 )
 from exceptions import (  # noqa: E402
     AppError,
@@ -51,18 +72,32 @@ from exceptions import (  # noqa: E402
     sanitize_error_message,
     to_error_response,
 )
-from kafka_client import KafkaProducerClient, NoOpKafkaProducer  # noqa: E402
+from kafka_client import (  # noqa: E402
+    NOTIFICATIONS_OUTBOUND_TOPIC,
+    KafkaProducerClient,
+    NoOpKafkaProducer,
+)
 from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker  # noqa: E402
 
 logger = structlog.get_logger(__name__)
 
 
-# Fail closed on unsigned Twilio webhooks in production deployments.
-REQUIRE_TWILIO_SIGNATURE = os.getenv("REQUIRE_TWILIO_SIGNATURE", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+def require_twilio_signature() -> bool:
+    """Fail closed on unsigned Twilio webhooks unless explicitly turned off (S10).
+
+    Without a token nothing can be verified, so an unsigned webhook would let
+    anyone post as any phone number. Only local testing should set this false.
+    """
+    return os.getenv("REQUIRE_TWILIO_SIGNATURE", "true").lower() not in ("0", "false", "no")
+
+
+def whatsapp_signature_url(request: Request) -> str:
+    """The URL Twilio signed: the public one when a proxy terminates TLS."""
+    return (
+        os.getenv("TWILIO_WHATSAPP_WEBHOOK_URL")
+        or os.getenv("TWILIO_WEBHOOK_URL")
+        or str(request.url)
+    )
 
 
 def _kafka_requested() -> bool:
@@ -75,6 +110,7 @@ class HealthResponse(BaseModel):
     status: str
     db: str
     kafka: str
+    embeddings: str
 
 
 class CreateTicketRequest(BaseModel):
@@ -116,21 +152,19 @@ class MessageResponse(BaseModel):
 
 
 # Mirrors the tickets.status CHECK constraint in database/schema.sql
-VALID_TICKET_STATUSES = frozenset(
-    {"open", "in_progress", "resolved", "escalated", "closed"}
-)
+VALID_TICKET_STATUSES = frozenset({"open", "in_progress", "resolved", "escalated", "closed"})
 
 
 class UpdateStatusRequest(BaseModel):
-    status: str = Field(..., description="New status: open, in_progress, resolved, escalated, closed")
+    status: str = Field(
+        ..., description="New status: open, in_progress, resolved, escalated, closed"
+    )
 
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
         if v not in VALID_TICKET_STATUSES:
-            raise ValueError(
-                f"status must be one of: {', '.join(sorted(VALID_TICKET_STATUSES))}"
-            )
+            raise ValueError(f"status must be one of: {', '.join(sorted(VALID_TICKET_STATUSES))}")
         return v
 
 
@@ -140,9 +174,12 @@ class ReplyRequest(BaseModel):
 
 class MergeCustomerRequest(BaseModel):
     source_customer_id: UUID = Field(
-        ..., description="Customer to absorb; its tickets move to the path customer and it is deleted"
+        ...,
+        description="Customer to absorb; its tickets move to the path customer and it is deleted",
     )
-    reason: str | None = Field(None, max_length=500, description="Why the two records are the same person")
+    reason: str | None = Field(
+        None, max_length=500, description="Why the two records are the same person"
+    )
 
 
 class MetricsResponse(BaseModel):
@@ -215,7 +252,7 @@ async def get_kafka(request: Request) -> KafkaProducerClient:
 
 
 async def get_openai(request: Request) -> AsyncOpenAI:
-    """Get the OpenRouter chat client from request state."""
+    """Get the chat client (DeepSeek, see chat_provider) from request state."""
     client = getattr(request.app.state, "openai_client", None)
     if not client:
         raise ConfigurationError(message="OpenAI client not initialized")
@@ -227,26 +264,102 @@ async def get_embedding_provider(request: Request) -> EmbeddingProvider | None:
     return getattr(request.app.state, "embedding_provider", None)
 
 
-async def verify_api_key(
-    request: Request, x_api_key: str | None = Header(None)
-) -> bool:
+def configured_api_key() -> str | None:
+    """Return the API key the server expects, or None when none is configured.
+
+    Deploy configs (docker-compose, render.yaml, k8s) set API_KEY; the .env
+    files set API_KEY_SECRET. Accept both so the key is never silently ignored.
+    """
+    return os.getenv("API_KEY") or os.getenv("API_KEY_SECRET") or None
+
+
+def _is_test_mode() -> bool:
+    """Whether the process runs in the explicit test mode (RUN_MODE=test)."""
+    return os.getenv("RUN_MODE", "").lower() == "test"
+
+
+# Customer ticket view: authorized per ticket (tracking token or email) inside
+# the handler. One path segment only, so nothing else can ride on the prefix.
+PUBLIC_TICKET_PATH_RE = re.compile(r"^/public/tickets/[^/]+$")
+
+# Voice messages come straight from the browser, so the endpoint is public
+# (no master key in the web form, AUDIT S7). It is rate limited, and the body
+# is capped before it is read: base64 of the largest accepted audio plus a
+# little room for the other JSON fields.
+VOICE_MESSAGE_PATH = "/webhooks/voice/message"
+_VOICE_JSON_OVERHEAD_BYTES = 4 * 1024
+
+
+def voice_max_audio_bytes() -> int:
+    return int(os.getenv("VOICE_MAX_AUDIO_BYTES", str(5 * 1024 * 1024)))
+
+
+def voice_max_body_bytes() -> int:
+    return (voice_max_audio_bytes() + 2) // 3 * 4 + _VOICE_JSON_OVERHEAD_BYTES
+
+
+def has_valid_api_key(headers) -> bool:
+    api_key = configured_api_key()
+    key = headers.get("X-API-Key")
+    return bool(api_key and key and hmac.compare_digest(key, api_key))
+
+
+def _voice_body_rejection(request: Request) -> JSONResponse | None:
+    """413/411 for voice bodies that are too large or of unknown size."""
+    if request.url.path != VOICE_MESSAGE_PATH or request.method != "POST":
+        return None
+    length = request.headers.get("content-length")
+    if length is None:
+        return JSONResponse(status_code=411, content={"detail": "Content-Length required"})
+    if not length.isdigit() or int(length) > voice_max_body_bytes():
+        return JSONResponse(status_code=413, content={"detail": "Voice message too large"})
+    return None
+
+
+def public_max_body_bytes() -> int:
+    return int(os.getenv("PUBLIC_MAX_BODY_BYTES", str(64 * 1024)))
+
+
+def _public_body_rejection(request: Request) -> JSONResponse | None:
+    """413/411 for keyless bodies over PUBLIC_MAX_BODY_BYTES (S8).
+
+    Without a key, a body is never read past the cap: the web form, WhatsApp
+    and public routes need a few KB. Voice has its own, larger cap.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS", "DELETE"):
+        return None
+    if request.url.path == VOICE_MESSAGE_PATH or has_valid_api_key(request.headers):
+        return None
+    length = request.headers.get("content-length")
+    if length is None:
+        if request.headers.get("transfer-encoding"):
+            return JSONResponse(status_code=411, content={"detail": "Content-Length required"})
+        return None
+    if not length.isdigit() or int(length) > public_max_body_bytes():
+        return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+    return None
+
+
+async def verify_api_key(request: Request, x_api_key: str | None = Header(None)) -> bool:
     """Verify API key for non-webhook endpoints."""
+    if PUBLIC_TICKET_PATH_RE.match(request.url.path):
+        return True
     # Skip verification for webhook, health, and metrics endpoints
     if request.url.path in [
         "/health",
-        "/metrics",
+        "/livez",
+        "/readyz",
         "/webhooks/whatsapp",
         "/webhooks/webform",
-        "/webhooks/voice/message",
+        # Authenticated by Twilio signature inside the handler, not by API key.
         "/webhooks/voice/call",
+        # Public but capped; audio_url needs the key (checked in the handler).
+        VOICE_MESSAGE_PATH,
     ]:
         return True
 
-    # Deploy configs (docker-compose, render.yaml, k8s) set API_KEY; the .env
-    # files set API_KEY_SECRET. Accept both so the key is never silently ignored.
-    api_key = os.getenv("API_KEY") or os.getenv("API_KEY_SECRET") or "test-key-12345"
-    key = request.headers.get("X-API-Key")
-    if not key or key != api_key:
+    # Fail closed: with no key configured every protected request is rejected.
+    if not has_valid_api_key(request.headers):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     return True
@@ -258,6 +371,12 @@ async def lifespan(app: FastAPI):
     """Application lifespan management."""
     # Startup
     logger.info("Initializing FastAPI application")
+
+    if not configured_api_key() and not _is_test_mode():
+        raise ConfigurationError(
+            message="API_KEY (or API_KEY_SECRET) is not set. Refusing to start "
+            "without an API key; set RUN_MODE=test only for test runs."
+        )
 
     # Initialize database
     db_url = os.getenv(
@@ -296,18 +415,21 @@ async def lifespan(app: FastAPI):
         logger.info("Kafka disabled via ENABLE_KAFKA=false — running in degraded mode")
         app.state.kafka_producer = NoOpKafkaProducer()
 
-    # Initialize the chat client: DeepSeek when DEEPSEEK_API_KEY is set,
-    # otherwise OpenRouter. Empty strings count as unset.
+    # Initialize the chat client: DeepSeek; OpenRouter only as the optional
+    # fallback when DEEPSEEK_API_KEY is empty. Empty strings count as unset.
     try:
         app.state.openai_client = build_chat_client()
     except ValueError as e:
         raise ConfigurationError(
             message=f"{e}. The agent cannot run without an AI provider key."
         ) from e
-    logger.info("Chat provider initialized", provider=chat_provider_config().name, model=chat_model())
+    logger.info(
+        "Chat provider initialized", provider=chat_provider_config().name, model=chat_model()
+    )
 
-    # Embeddings go to their own provider: OpenRouter serves chat here but has
-    # no embedding credits, so knowledge base search runs on Gemini.
+    # Embeddings go to their own provider (Gemini): DeepSeek serves no
+    # embedding models. A missing GEMINI_API_KEY is logged as an error here
+    # and shows as embeddings=missing on /readyz.
     app.state.embedding_provider = build_embedding_provider(app.state.openai_client)
 
     # Initialize WebSocket manager
@@ -317,8 +439,19 @@ async def lifespan(app: FastAPI):
     # Initialize MCP Server for extensible tools
     # NOTE: MCP server provides alternative tool execution path via Model Context Protocol
     from mcp_server import mcp_server
+
     app.state.mcp_server = mcp_server
     logger.info("MCP server initialized")
+
+    global _metrics_server
+    if _metrics_server is None:
+        try:
+            _metrics_server = start_metrics_server()
+            if _metrics_server is not None:
+                logger.info("Metrics server started", port=_metrics_server.server_port)
+        except OSError as e:
+            # Metrics are not worth refusing traffic over.
+            logger.error("Metrics server failed to start", error=str(e))
 
     yield
 
@@ -337,17 +470,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 # Rate limiting
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
@@ -358,10 +480,18 @@ app.add_middleware(SlowAPIMiddleware)
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     """Verify API key for all endpoints except webhooks and health."""
+    # CORS preflights carry no credentials by design; let CORSMiddleware
+    # answer them instead of rejecting them with a 401.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    rejection = _voice_body_rejection(request) or _public_body_rejection(request)
+    if rejection is not None:
+        return rejection
     try:
         await verify_api_key(request)
     except HTTPException as e:
         from starlette.responses import JSONResponse
+
         return JSONResponse(
             status_code=e.status_code,
             content={"detail": e.detail},
@@ -370,15 +500,80 @@ async def api_key_middleware(request: Request, call_next):
     return response
 
 
-# Health check endpoint
-@app.get("/health", response_model=HealthResponse)
+def cors_origins_from_env() -> list[str]:
+    """Parse CORS_ORIGINS (comma-separated) into an explicit origin allowlist."""
+    raw = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000")
+    origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+    if "*" in origins:
+        # A wildcard together with allow_credentials would let any site make
+        # credentialed requests; refuse it rather than guess.
+        raise ConfigurationError(
+            message="CORS_ORIGINS must list explicit origins; '*' is not allowed."
+        )
+    return origins
+
+
+# CORS is registered after the API key middleware so it wraps it: preflights
+# are answered here, and 401 responses still carry CORS headers so browsers
+# surface the real status instead of an opaque CORS error.
+cors_origins = cors_origins_from_env()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
+)
+
+
+# Health checks. /livez: the process answers (k8s liveness, never touches
+# dependencies, so a DB outage does not restart every pod). /readyz: DB and,
+# when requested, Kafka are usable; 503 otherwise so the pod is taken out of
+# rotation (AUDIT N6). /health is kept for existing callers with /readyz
+# semantics.
+@app.get("/livez", include_in_schema=False)
 @limiter.exempt
-async def health_check(request: Request, pool: asyncpg.Pool = Depends(get_db)) -> HealthResponse:
-    """Health check endpoint."""
+async def liveness_check(request: Request) -> dict[str, str]:
+    """Liveness probe: the event loop is serving requests."""
+    return {"status": "alive"}
+
+
+_pending_db_pings: set[asyncio.Task] = set()
+
+
+async def _db_select_one(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.fetchval("SELECT 1")
+
+
+async def _ping_db(pool: asyncpg.Pool, timeout: float) -> None:
+    """SELECT 1 that answers within ``timeout`` even if the DB is unresponsive.
+
+    asyncio.timeout around pool.acquire() is not enough: on cancellation the
+    pool resets the connection, which blocks on the same unresponsive DB. The
+    ping runs as its own task; after the timeout it is cancelled and left to
+    unwind in the background.
+    """
+    task = asyncio.create_task(_db_select_one(pool))
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        _pending_db_pings.add(task)
+        task.add_done_callback(_pending_db_pings.discard)
+        raise TimeoutError
+    task.result()
+
+
+async def _readiness(request: Request) -> JSONResponse:
     db_status = "ok"
+    pool = getattr(request.app.state, "db_pool", None)
     try:
-        async with pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
+        if pool is None:
+            raise ConfigurationError(message="Database not initialized")
+        await _ping_db(pool, float(os.getenv("READINESS_DB_TIMEOUT_SECONDS", "2")))
+    except TimeoutError:
+        logger.error("Database health check timed out")
+        db_status = "error"
     except asyncpg.PostgresError as e:
         logger.error("Database health check failed", error=sanitize_error_message(str(e)))
         db_status = "error"
@@ -391,19 +586,56 @@ async def health_check(request: Request, pool: asyncpg.Pool = Depends(get_db)) -
     else:
         kafka_status = "disabled" if not _kafka_requested() else "error"
 
-    return HealthResponse(
-        status="healthy" if db_status == "ok" else "degraded",
+    ready = db_status == "ok" and kafka_status != "error"
+    # Missing embeddings do not take the pod out of rotation (lexical search
+    # still answers), but they must not read as healthy either.
+    embeddings_status = (
+        "ok" if getattr(request.app.state, "embedding_provider", None) is not None else "missing"
+    )
+    body = HealthResponse(
+        status="healthy" if ready and embeddings_status == "ok" else "degraded",
         db=db_status,
         kafka=kafka_status,
+        embeddings=embeddings_status,
     )
+    return JSONResponse(status_code=200 if ready else 503, content=body.model_dump())
 
 
-# Prometheus metrics endpoint
-@app.get("/metrics", include_in_schema=False)
+@app.get("/readyz", response_model=HealthResponse)
 @limiter.exempt
-async def prometheus_metrics(request: Request) -> Response:
-    """Prometheus metrics endpoint."""
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+async def readiness_check(request: Request) -> JSONResponse:
+    """Readiness probe: 503 while the DB (or a requested Kafka) is down."""
+    return await _readiness(request)
+
+
+@app.get("/health", response_model=HealthResponse)
+@limiter.exempt
+async def health_check(request: Request) -> JSONResponse:
+    """Health check (same as /readyz)."""
+    return await _readiness(request)
+
+
+# Prometheus metrics are served on their own internal port, never on the
+# public app (S11): ingress, Render and the compose host mapping only expose
+# the API port, so counters and sentiment metrics stay inside the network.
+DEFAULT_METRICS_PORT = 9100
+_metrics_server: Any = None
+
+
+def start_metrics_server(port: int | None = None, addr: str = "0.0.0.0") -> Any:
+    """Start the metrics HTTP server; METRICS_PORT=0 turns it off."""
+    if port is None:
+        port = int(os.getenv("METRICS_PORT", str(DEFAULT_METRICS_PORT)))
+        if port == 0:
+            return None
+    server, _thread = start_http_server(port, addr=addr)
+    return server
+
+
+def _websocket_authorized(websocket: WebSocket, ticket_id: UUID) -> bool:
+    if tracking.verify_tracking_token(ticket_id, websocket.query_params.get("token")):
+        return True
+    return has_valid_api_key(websocket.headers)
 
 
 # WebSocket endpoint for real-time ticket updates
@@ -412,8 +644,16 @@ async def websocket_ticket(
     websocket: WebSocket,
     ticket_id: UUID,
 ):
-    """WebSocket endpoint for real-time ticket updates."""
+    """WebSocket endpoint for real-time ticket updates.
+
+    HTTP middleware does not run for WebSockets, so the check lives here: the
+    customer's tracking token (?token=) or the master key (X-API-Key header)
+    must be presented before the handshake is accepted (AUDIT S4).
+    """
     tid = str(ticket_id)
+    if not _websocket_authorized(websocket, ticket_id):
+        await websocket.close(code=1008)
+        return
     await ws_manager.connect(websocket, tid)
     try:
         while True:
@@ -522,6 +762,72 @@ async def get_ticket(
     }
 
 
+def public_web_url() -> str:
+    return os.getenv("PUBLIC_WEB_URL", "http://localhost:3000").rstrip("/")
+
+
+def _public_message(m: dict[str, Any]) -> dict[str, Any]:
+    sender = "agent" if m.get("direction") == "outbound" else "customer"
+    return {
+        "id": str(m["id"]),
+        "direction": m.get("direction"),
+        "sender_type": sender,
+        "content": m.get("content"),
+        "channel": m.get("channel"),
+        "created_at": m.get("created_at"),
+        "timestamp": m.get("created_at"),
+    }
+
+
+@app.get("/public/tickets/{ticket_number}")
+@limiter.limit("30/minute")
+async def get_public_ticket(
+    request: Request,
+    ticket_number: str,
+    token: str | None = Query(None, max_length=64),
+    email: str | None = Query(None, max_length=320),
+    x_tracking_token: str | None = Header(None, max_length=64),
+    pool: asyncpg.Pool = Depends(get_db),
+) -> dict[str, Any]:
+    """Customer-facing ticket view, no API key.
+
+    Needs the ticket's tracking token (header or ``token``) or the email the
+    ticket was filed under. Unknown ticket and bad credential both return the
+    same 404 so ticket numbers can't be enumerated. Internal fields
+    (agent_runs, customer identity, assignment, message metadata) are dropped.
+    """
+    not_found = NotFoundError(message="Ticket not found")
+    if not tracking.TICKET_NUMBER_RE.match(ticket_number):
+        raise not_found
+
+    ticket = await db.get_ticket_by_number(pool, ticket_number)
+    if not ticket:
+        raise not_found
+
+    supplied = x_tracking_token or token
+    if not (
+        tracking.verify_tracking_token(ticket["id"], supplied)
+        or tracking.email_matches(ticket.get("customer_email"), email)
+    ):
+        raise not_found
+
+    messages = await db.get_ticket_messages(pool, ticket["id"])
+    return {
+        "ticket_id": str(ticket["id"]),
+        "ticket_number": ticket["ticket_number"],
+        "subject": ticket.get("subject"),
+        "category": ticket.get("category"),
+        "priority": ticket.get("priority"),
+        "status": ticket.get("status"),
+        "channel": ticket.get("channel"),
+        "created_at": ticket.get("created_at"),
+        "updated_at": ticket.get("updated_at"),
+        "resolved_at": ticket.get("resolved_at"),
+        "tracking_token": tracking.tracking_token(ticket["id"]),
+        "messages": [_public_message(m) for m in messages],
+    }
+
+
 @app.patch("/tickets/{ticket_id}/status")
 async def update_ticket_status(
     ticket_id: UUID,
@@ -561,8 +867,14 @@ async def reply_to_ticket(
     ticket_id: UUID,
     body: ReplyRequest,
     pool: asyncpg.Pool = Depends(get_db),
+    kafka_producer: KafkaProducerClient = Depends(get_kafka),
 ) -> dict[str, Any]:
-    """Send a reply to a ticket."""
+    """Send a human agent's reply to the customer.
+
+    The reply is stored, pushed to the ticket's WebSocket, and published to
+    notifications.outbound so the sender delivers it by email/WhatsApp
+    (AUDIT N5). The sender dedups on ``reply:<message id>``.
+    """
     ticket = await db.get_ticket(pool, ticket_id)
     if not ticket:
         raise NotFoundError(message=f"Ticket {ticket_id} not found")
@@ -586,9 +898,36 @@ async def reply_to_ticket(
         },
     )
 
+    try:
+        await kafka_producer.send_message(
+            NOTIFICATIONS_OUTBOUND_TOPIC,
+            {
+                "ticket_id": str(ticket_id),
+                "customer_email": ticket.get("customer_email"),
+                "channel": ticket["channel"],
+                "customer_reply": body.message,
+                "reply_message_id": str(message["id"]),
+                "source": "human",
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+            key=str(ticket_id),
+        )
+    except Exception as e:
+        logger.error(
+            "Human reply saved but not queued for delivery",
+            ticket_id=str(ticket_id),
+            message_id=str(message["id"]),
+            error=sanitize_error_message(str(e)),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Reply {message['id']} was saved but could not be queued for delivery",
+        ) from e
+
     return {
         "message_id": str(message["id"]),
         "sent_at": message["created_at"].isoformat(),
+        "delivery": "queued",
     }
 
 
@@ -607,10 +946,12 @@ async def webhook_whatsapp(
         signature = request.headers.get("X-Twilio-Signature", "")
         params = {k: str(v) for k, v in form_data.items()}
         if handler.signature_validation_enabled:
-            if not handler.validate_webhook(signature, params=params, url=str(request.url)):
+            if not handler.validate_webhook(
+                signature, params=params, url=whatsapp_signature_url(request)
+            ):
                 logger.warning("Rejected WhatsApp webhook: invalid Twilio signature")
                 raise HTTPException(status_code=403, detail="Invalid webhook signature")
-        elif REQUIRE_TWILIO_SIGNATURE:
+        elif require_twilio_signature():
             logger.error("Rejected WhatsApp webhook: TWILIO_AUTH_TOKEN not configured")
             raise HTTPException(status_code=403, detail="Webhook signature validation unavailable")
         else:
@@ -640,6 +981,7 @@ async def webhook_whatsapp(
 
 @app.post("/webhooks/webform", response_model=dict[str, Any], status_code=201)
 @limiter.limit(strict_limit)
+@public_llm_limit
 async def webhook_webform(
     request: Request,
     body: WebFormSubmission,
@@ -700,14 +1042,16 @@ async def webhook_webform(
                 channel="webform",
                 ticket_number=ticket["ticket_number"],
             )
-            await db.add_message(
-                pool,
-                ticket_id=ticket["id"],
-                customer_id=ticket["customer_id"],
-                direction="outbound",
-                content=result["response"],
-                channel="webform",
-            )
+            # send_response already stored the reply; a blocked reply is empty.
+            if result["response"] and not result.get("reply_persisted"):
+                await db.add_message(
+                    pool,
+                    ticket_id=ticket["id"],
+                    customer_id=ticket["customer_id"],
+                    direction="outbound",
+                    content=result["response"],
+                    channel="webform",
+                )
         except Exception as e:
             logger.warning(
                 "Synchronous agent reply failed",
@@ -715,6 +1059,7 @@ async def webhook_webform(
                 email=body.email,
             )
 
+    token = tracking.tracking_token(ticket["id"])
     return {
         "ticket_number": ticket["ticket_number"],
         "message": (
@@ -723,13 +1068,26 @@ async def webhook_webform(
         "estimated_response": (
             "24 hours for Starter tier, 8 hours for Growth tier, 2 hours for Enterprise tier"
         ),
-        "tracking_url": f"https://support.techflow.com/track/{ticket['ticket_number']}",
+        "tracking_token": token,
+        "tracking_url": (
+            f"{public_web_url()}/ticket/{ticket['ticket_number']}"
+            + (f"?t={token}" if token else "")
+        ),
     }
 
 
 # ---------------------------------------------------------------------------
 # Voice channel (voice messages + phone calls)
 # ---------------------------------------------------------------------------
+VOICE_FALLBACK_REPLY = (
+    "I'm sorry, I'm having trouble right now. A human agent will call you back shortly."
+)
+VOICE_HANDOFF_REPLY = (
+    "Thanks for your patience. I've passed your request to our support team, "
+    "and a human agent will follow up with you shortly."
+)
+
+
 async def _run_voice_agent(
     pool: asyncpg.Pool,
     kafka_producer: KafkaProducerClient,
@@ -779,7 +1137,8 @@ async def _run_voice_agent(
     )
 
     return {
-        "response": result["response"],
+        # Empty when the agent's reply was blocked and the ticket escalated.
+        "response": result["response"] or VOICE_HANDOFF_REPLY,
         "ticket_id": result["ticket_id"],
         "ticket_number": ticket["ticket_number"],
     }
@@ -787,6 +1146,7 @@ async def _run_voice_agent(
 
 @app.post("/webhooks/voice/message", response_model=dict[str, Any])
 @limiter.limit(strict_limit)
+@public_llm_limit
 async def webhook_voice_message(
     request: Request,
     body: VoiceMessageRequest,
@@ -798,10 +1158,19 @@ async def webhook_voice_message(
     if not (pool and kafka_producer and openai_client):
         raise ConfigurationError(message="Infrastructure not initialized")
 
+    # audio_url makes the server fetch a remote file; only key holders may.
+    if body.audio_url and not has_valid_api_key(request.headers):
+        raise HTTPException(status_code=403, detail="audio_url requires an API key")
+
     handler = VoiceHandler(kafka_producer, openai_client=openai_client)
-    audio_bytes = await handler.resolve_audio(body.audio_base64, body.audio_url)
+    max_audio = voice_max_audio_bytes()
+    audio_bytes = await handler.resolve_audio(
+        body.audio_base64, body.audio_url, max_bytes=max_audio
+    )
     if not audio_bytes:
         raise ValidationError(message="Provide a valid audio_base64 or audio_url")
+    if len(audio_bytes) > max_audio:
+        raise HTTPException(status_code=413, detail="Voice message too large")
 
     result = await handler.handle_voice_message(
         audio_bytes=audio_bytes,
@@ -824,6 +1193,25 @@ async def webhook_voice_message(
     return result.to_dict()
 
 
+def _require_twilio_signature(request: Request, params: dict[str, str]) -> None:
+    """Reject a Twilio webhook unless its X-Twilio-Signature is valid.
+
+    Fails closed: without TWILIO_AUTH_TOKEN nothing can be verified, so the
+    request is refused. TWILIO_VOICE_WEBHOOK_URL overrides the URL used for
+    the check when a proxy terminates TLS and request.url would differ from
+    the public URL Twilio signed.
+    """
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not auth_token:
+        logger.error("Rejected Twilio voice webhook: TWILIO_AUTH_TOKEN not configured")
+        raise HTTPException(status_code=403, detail="Webhook signature validation unavailable")
+    url = os.getenv("TWILIO_VOICE_WEBHOOK_URL") or str(request.url)
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature or not RequestValidator(auth_token).validate(url, params, signature):
+        logger.warning("Rejected Twilio voice webhook: invalid signature")
+        raise HTTPException(status_code=403, detail="Invalid webhook signature")
+
+
 @app.post("/webhooks/voice/call")
 @limiter.limit(strict_limit)
 async def webhook_voice_call(request: Request) -> Response:
@@ -833,6 +1221,7 @@ async def webhook_voice_call(request: Request) -> Response:
     request, then the agent's spoken reply in the customer's own language.
     """
     form = await request.form()
+    _require_twilio_signature(request, {k: str(v) for k, v in form.items()})
     speech_result = str(form.get("SpeechResult") or "").strip()
     try:
         speech_confidence = float(str(form.get("Confidence") or 1.0))
@@ -882,10 +1271,7 @@ async def webhook_voice_call(request: Request) -> Response:
         reply = agent_result["response"]
     except Exception as e:
         logger.error("Voice call agent failed", error=sanitize_error_message(str(e)))
-        reply = (
-            "I'm sorry, I'm having trouble right now. "
-            "A human agent will call you back shortly."
-        )
+        reply = VOICE_FALLBACK_REPLY
 
     if was_translated:
         reply = await handler.translate_to_language(reply, lang)
@@ -958,7 +1344,9 @@ async def get_customer_history(
     pool: asyncpg.Pool = Depends(get_db),
 ) -> dict[str, Any]:
     """Get customer history."""
-    history = await db.get_customer_history(pool, email, limit=limit, include_resolved=include_resolved)
+    history = await db.get_customer_history(
+        pool, email, limit=limit, include_resolved=include_resolved
+    )
 
     return {
         "email": email,
@@ -1067,24 +1455,22 @@ async def search_knowledge_base(
 
     if provider is None:
         degraded_reason = "No embedding provider configured"
-        logger.warning("No embedding provider, falling back to text KB search", query=q)
+        record_lexical_fallback("not_configured", "api_search", query=q)
     else:
         try:
             async with _cb:
                 embedding = await provider.embed(q)
         except CircuitBreakerError:
             degraded_reason = "AI service temporarily unavailable"
-            logger.warning("Embedding circuit open, falling back to text KB search", query=q)
+            record_lexical_fallback("circuit_open", "api_search", query=q)
         except OpenAIAPIError as e:
             degraded_reason = "AI service temporarily unavailable"
-            logger.warning(
-                "Embedding failed, falling back to text KB search",
-                query=q,
-                error=sanitize_error_message(str(e)),
+            record_lexical_fallback(
+                "embedding_failed", "api_search", query=q, error=sanitize_error_message(str(e))
             )
 
     # Degrade to lexical search rather than failing the request outright.
-    if embedding is None:
+    if embedding is None or provider is None:
         results = await db.search_knowledge_base_text(
             pool,
             query=q,
@@ -1124,8 +1510,9 @@ async def search_knowledge_base(
             category=category,
             max_results=limit,
         )
-        logger.warning(
-            "No comparable vectors for embedding model, using text search",
+        record_lexical_fallback(
+            "not_indexed",
+            "api_search",
             query=q,
             embedding_model=provider.model,
             text_results=len(text_results) if text_results else 0,
@@ -1188,10 +1575,14 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 def _sanitize_validation_errors(errors: Sequence[Any]) -> list[dict[str, Any]]:
-    """Make Pydantic error contexts JSON-safe (exceptions aren't serializable)."""
+    """Make Pydantic errors JSON-safe and drop the submitted input.
+
+    Echoing `input` sent attacker-sized bodies (and other people's data in
+    logs) straight back (S8); the field location and message are enough.
+    """
     cleaned: list[dict[str, Any]] = []
     for err in errors:
-        item = dict(err)
+        item = {k: v for k, v in dict(err).items() if k not in ("input", "url")}
         ctx = item.get("ctx")
         if isinstance(ctx, dict):
             item["ctx"] = {
@@ -1238,7 +1629,7 @@ async def pydantic_validation_handler(request: Request, exc: PydanticValidationE
     """Handle Pydantic validation errors."""
     logger.warning(
         "Pydantic validation error",
-        errors=exc.errors(),
+        errors=_sanitize_validation_errors(exc.errors()),
         path=request.url.path,
     )
     return JSONResponse(
@@ -1246,7 +1637,7 @@ async def pydantic_validation_handler(request: Request, exc: PydanticValidationE
         content={
             "error": "VALIDATION_ERROR",
             "message": "Request validation failed",
-            "details": exc.errors(),
+            "details": _sanitize_validation_errors(exc.errors()),
         },
     )
 
@@ -1290,7 +1681,7 @@ async def connection_error_handler(request: Request, exc: ConnectionError):
 
 @app.exception_handler(OpenAIAPIError)
 async def openai_error_handler(request: Request, exc: OpenAIAPIError):
-    """Handle OpenAI/OpenRouter API errors."""
+    """Handle errors from the OpenAI-compatible chat provider."""
     logger.error(
         "OpenAI API error",
         error=sanitize_error_message(str(exc)),

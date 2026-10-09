@@ -16,7 +16,7 @@ Providers (all OpenAI-compatible, over HTTP — no extra SDKs required):
 
 - STT:  Groq Whisper (default) → OpenAI Whisper → degraded mode
 - TTS:  OpenAI TTS → gTTS (offline) → text-only (no audio)
-- NLP:  the existing OpenRouter chat client (no extra cost)
+- NLP:  the shared chat client (DeepSeek, see chat_provider) → Groq
 """
 
 import base64
@@ -33,6 +33,7 @@ import structlog
 from chat_provider import chat_model
 from exceptions import sanitize_error_message
 from kafka_client import KafkaProducerClient, create_inbound_voice_message
+from utils import safe_fetch
 from utils.circuit_breaker import get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
@@ -60,6 +61,7 @@ def _confidence_threshold() -> float:
         return float(os.getenv("STT_CONFIDENCE_THRESHOLD", str(DEFAULT_CONFIDENCE_THRESHOLD)))
     except ValueError:
         return DEFAULT_CONFIDENCE_THRESHOLD
+
 
 _VOICE_SUBJECT_RE = re.compile(r"^[+\d\s\-().ext]+$")
 
@@ -258,7 +260,7 @@ class VoiceHandler:
         return max(0.0, min(1.0, 1.0 - abs(avg) / 1.5))
 
     # ------------------------------------------------------------------
-    # Language detection + translation (NLP via OpenRouter → Groq fallback)
+    # Language detection + translation (NLP via the chat provider → Groq fallback)
     # ------------------------------------------------------------------
     async def _llm_completion(
         self,
@@ -267,7 +269,7 @@ class VoiceHandler:
         max_tokens: int = 500,
         json_mode: bool = False,
     ) -> str | None:
-        """Run an LLM completion through OpenRouter, falling back to Groq.
+        """Run an LLM completion through the chat provider, falling back to Groq.
 
         Returns the raw content string, or ``None`` when no provider works so
         callers can degrade gracefully.
@@ -292,7 +294,7 @@ class VoiceHandler:
                 return content.strip() if isinstance(content, str) else None
             except Exception as e:
                 logger.warning(
-                    "OpenRouter completion failed, trying Groq",
+                    "Chat provider completion failed, trying Groq",
                     error=sanitize_error_message(str(e)),
                 )
 
@@ -382,9 +384,7 @@ class VoiceHandler:
     # ------------------------------------------------------------------
     # Text-to-speech
     # ------------------------------------------------------------------
-    async def synthesize(
-        self, text: str, language: str = "en"
-    ) -> tuple[str | None, str]:
+    async def synthesize(self, text: str, language: str = "en") -> tuple[str | None, str]:
         """Synthesize speech. Returns ``(audio_base64, format)``.
 
         Provider order: OpenAI TTS → gTTS (offline) → ``(None, "none")`` (text only).
@@ -465,14 +465,13 @@ class VoiceHandler:
                 logger.warning("Invalid base64 audio", error=sanitize_error_message(str(e)))
                 return None
         if audio_url:
+            # audio_url is caller-controlled: fetch it only through the SSRF
+            # guard (https + host allowlist + public IPs + size/time limits).
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.get(audio_url)
-                    resp.raise_for_status()
-                    if len(resp.content) > max_bytes:
-                        logger.warning("Audio download too large", size=len(resp.content))
-                        return None
-                    return resp.content
+                return await safe_fetch.fetch_bytes(audio_url, max_bytes=max_bytes)
+            except safe_fetch.UnsafeURLError as e:
+                logger.warning("Rejected audio_url", reason=str(e))
+                return None
             except Exception as e:
                 logger.warning("Audio download failed", error=sanitize_error_message(str(e)))
                 return None

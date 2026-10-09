@@ -3,6 +3,7 @@
 Usage:
     python -m database.seed              # Runs schema + migrations + seed data
     python -m database.seed --migrations-only  # Only run pending migrations
+    python -m database.seed --embed-kb-only    # Only embed unembedded KB rows
 
 Idempotent: safe to run multiple times.
 Uses asyncpg pool (matching database/queries.py pattern).
@@ -15,12 +16,15 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 import structlog
-from exceptions import sanitize_error_message
+
 from embeddings_provider import build_embedding_provider
 from env_config import load_environment
+from exceptions import sanitize_error_message
+from utils.redact import redact_dsn
 
 logger = structlog.get_logger(__name__)
 
@@ -99,9 +103,7 @@ async def apply_migration_file(pool: asyncpg.Pool, filepath: Path) -> None:
         await conn.execute(sql)
 
 
-async def run_pending_migrations(
-    pool: asyncpg.Pool, applied: set[str]
-) -> list[str]:
+async def run_pending_migrations(pool: asyncpg.Pool, applied: set[str]) -> list[str]:
     """Run any migration files not yet applied."""
     migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
     newly_applied = []
@@ -119,7 +121,9 @@ async def run_pending_migrations(
             newly_applied.append(mfile.name)
             logger.info("Migration applied successfully", filename=mfile.name)
         except (asyncpg.PostgresError, Exception) as e:
-            logger.error("Migration failed", filename=mfile.name, error=sanitize_error_message(str(e)))
+            logger.error(
+                "Migration failed", filename=mfile.name, error=sanitize_error_message(str(e))
+            )
             raise
 
     return newly_applied
@@ -255,7 +259,7 @@ async def backfill_knowledge_base_embeddings(pool: asyncpg.Pool) -> int:
     """
     provider = build_embedding_provider(None)
     if provider is None:
-        logger.warning(
+        logger.error(
             "No embedding provider configured — knowledge base left unembedded, "
             "semantic search will degrade to lexical"
         )
@@ -282,9 +286,7 @@ async def backfill_knowledge_base_embeddings(pool: asyncpg.Pool) -> int:
         # Chunked so a large knowledge base does not go out in one request.
         for start in range(0, len(rows), EMBED_BATCH_SIZE):
             chunk = rows[start : start + EMBED_BATCH_SIZE]
-            vectors = await provider.embed_many(
-                [f"{r['title']}\n\n{r['content']}" for r in chunk]
-            )
+            vectors = await provider.embed_many([f"{r['title']}\n\n{r['content']}" for r in chunk])
             # Cast explicitly rather than relying on the pgvector codec, which is
             # registered on a single pooled connection and may not be this one.
             # Store the model alongside the vector: a later provider switch must
@@ -292,10 +294,7 @@ async def backfill_knowledge_base_embeddings(pool: asyncpg.Pool) -> int:
             await conn.executemany(
                 "UPDATE knowledge_base SET embedding = $2::vector, "
                 "embedding_model = $3 WHERE id = $1",
-                [
-                    (r["id"], json.dumps(v), provider.model)
-                    for r, v in zip(chunk, vectors)
-                ],
+                [(r["id"], json.dumps(v), provider.model) for r, v in zip(chunk, vectors)],
             )
             embedded += len(chunk)
 
@@ -313,9 +312,9 @@ def parse_insert_count(result: str) -> int:
     return 0
 
 
-async def seed(pool: asyncpg.Pool) -> dict[str, any]:
+async def seed(pool: asyncpg.Pool) -> dict[str, Any]:
     """Run the full seed pipeline. Idempotent."""
-    results = {}
+    results: dict[str, Any] = {}
 
     # 1. Ensure migrations tracking table exists
     await ensure_schema_migrations_table(pool)
@@ -357,8 +356,17 @@ async def seed(pool: asyncpg.Pool) -> dict[str, any]:
 async def main() -> None:
     """Main entry point."""
     parser = argparse.ArgumentParser(description="Database seed/migration tool")
-    parser.add_argument("--migrations-only", action="store_true",
-                        help="Only run pending migrations, skip data seeding")
+    parser.add_argument(
+        "--migrations-only",
+        action="store_true",
+        help="Only run pending migrations, skip data seeding",
+    )
+    parser.add_argument(
+        "--embed-kb-only",
+        action="store_true",
+        help="Only backfill knowledge_base embeddings; assumes the "
+        "schema was migrated already (e.g. by scripts/render_migrate.sh)",
+    )
     args = parser.parse_args()
 
     load_environment()
@@ -368,7 +376,7 @@ async def main() -> None:
         "postgresql://techflow:techflow@localhost:5432/techflow",
     )
 
-    logger.info("Connecting to database", db_url=db_url)
+    logger.info("Connecting to database", db_url=redact_dsn(db_url))
     pool_min = int(os.getenv("DATABASE_POOL_MIN", "1"))
     pool_max = int(os.getenv("DATABASE_POOL_MAX", "5"))
     db_ssl = os.getenv("DATABASE_SSL", "disable")
@@ -379,14 +387,31 @@ async def main() -> None:
         ssl=db_ssl,
     )
 
+    if args.embed_kb_only:
+        try:
+            embedded = await backfill_knowledge_base_embeddings(pool)
+            logger.info("Knowledge base embedding backfill complete", articles=embedded)
+        except Exception as e:
+            # Not fatal: without vectors the agent degrades to lexical search.
+            logger.warning(
+                "Knowledge base embedding backfill failed",
+                error=sanitize_error_message(str(e)),
+            )
+        finally:
+            await pool.close()
+        return
+
     try:
         results = await seed(pool)
 
         if results.get("schema_applied"):
             logger.info("Schema files applied", files=results["schema_applied"])
         if results.get("migrations_applied"):
-            logger.info("Migrations applied", count=len(results["migrations_applied"]),
-                        files=results["migrations_applied"])
+            logger.info(
+                "Migrations applied",
+                count=len(results["migrations_applied"]),
+                files=results["migrations_applied"],
+            )
         else:
             logger.info("No pending migrations")
 
@@ -395,17 +420,19 @@ async def main() -> None:
             if any(counts.values()):
                 logger.info("Seed data inserted", counts=counts)
             else:
-                logger.info("No new seed data needed (idempotent — all data already present)",
-                            counts=counts)
+                logger.info(
+                    "No new seed data needed (idempotent — all data already present)", counts=counts
+                )
         else:
             logger.info("Migrations-only mode, skipping data seed")
 
         if results.get("kb_embedded"):
             logger.info("Knowledge base embedded", articles=results["kb_embedded"])
 
-        logger.info("Seed complete", results_summary={
-            k: v for k, v in results.items() if k != "data_counts"
-        })
+        logger.info(
+            "Seed complete",
+            results_summary={k: v for k, v in results.items() if k != "data_counts"},
+        )
     except Exception as e:
         logger.error("Seed failed", error=sanitize_error_message(str(e)))
         sys.exit(1)

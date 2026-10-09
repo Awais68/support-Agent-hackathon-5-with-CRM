@@ -66,6 +66,7 @@ export default function SupportForm() {
     return (
       <SuccessMessage
         ticketNumber={submitSuccess.ticket_number}
+        trackingToken={submitSuccess.tracking_token}
         estimatedResponse={submitSuccess.estimated_response}
         onNewRequest={() => {
           setSubmitSuccess(null);
@@ -79,7 +80,7 @@ export default function SupportForm() {
     <div className="bg-white rounded-lg shadow-lg p-6 sm:p-8">
       <h1 className="text-3xl font-bold text-gray-900 mb-2">Submit a Support Ticket</h1>
       <p className="text-gray-600 mb-8">
-        We're here to help. Fill out the form below and we'll get back to you shortly.
+        We&apos;re here to help. Fill out the form below and we&apos;ll get back to you shortly.
       </p>
 
       {submitError && (

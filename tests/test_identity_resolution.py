@@ -1,13 +1,15 @@
-"""Tests for cross-channel identity resolution via customer_identifiers table."""
-"""Tests for pg_trgm fuzzy matching identity resolution."""
+"""Tests for cross-channel identity resolution via customer_identifiers table.
 
-import pytest
+Also covers pg_trgm fuzzy matching identity resolution.
+"""
+
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
-from datetime import UTC, datetime
+
+import pytest
 
 from database import queries as db
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -18,8 +20,18 @@ class TestFuzzySearchCustomers:
     async def test_fuzzy_search_by_email_found(self, mock_db_pool):
         mock_conn = AsyncMock()
         mock_conn.fetch.return_value = [
-            {"id": UUID("11111111-1111-1111-1111-111111111111"), "email": "jon@example.com", "name": "Jon Doe", "similarity": 0.6},
-            {"id": UUID("22222222-2222-2222-2222-222222222222"), "email": "john@example.net", "name": "John Doe", "similarity": 0.35},
+            {
+                "id": UUID("11111111-1111-1111-1111-111111111111"),
+                "email": "jon@example.com",
+                "name": "Jon Doe",
+                "similarity": 0.6,
+            },
+            {
+                "id": UUID("22222222-2222-2222-2222-222222222222"),
+                "email": "john@example.net",
+                "name": "John Doe",
+                "similarity": 0.35,
+            },
         ]
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
@@ -44,7 +56,12 @@ class TestFuzzySearchCustomers:
     async def test_fuzzy_search_by_name(self, mock_db_pool):
         mock_conn = AsyncMock()
         mock_conn.fetch.return_value = [
-            {"id": UUID("11111111-1111-1111-1111-111111111111"), "name": "Jon Doe", "email": "jon@example.com", "similarity": 0.55},
+            {
+                "id": UUID("11111111-1111-1111-1111-111111111111"),
+                "name": "Jon Doe",
+                "email": "jon@example.com",
+                "similarity": 0.55,
+            },
         ]
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
@@ -57,9 +74,7 @@ class TestFuzzySearchCustomers:
 
     async def test_fuzzy_search_invalid_field(self, mock_db_pool):
         with pytest.raises(ValueError):
-            await db.fuzzy_search_customers(
-                mock_db_pool, "test", search_field="phone"
-            )
+            await db.fuzzy_search_customers(mock_db_pool, "test", search_field="phone")
 
     async def test_fuzzy_search_empty_term(self, mock_db_pool):
         mock_conn = AsyncMock()
@@ -74,7 +89,7 @@ class TestFuzzySearchCustomers:
 
 
 class TestFindCustomerByNameEmail:
-    """Test exact-then-fuzzy customer lookup."""
+    """Exact-email customer lookup (no fuzzy resolution, AUDIT S2)."""
 
     async def test_exact_email_match_returns_first(self, mock_db_pool):
         mock_conn = AsyncMock()
@@ -90,127 +105,48 @@ class TestFindCustomerByNameEmail:
         }
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        result = await db.find_customer_by_name_email(
-            mock_db_pool, "john@example.com"
-        )
+        result = await db.find_customer_by_name_email(mock_db_pool, "john@example.com")
 
         assert result is not None
         assert result["email"] == "john@example.com"
         # Should NOT have called fuzzy query
         assert mock_conn.fetchrow.call_count == 1
 
-    async def test_exact_not_found_then_fuzzy_email(self, mock_db_pool):
+    async def test_lookalike_email_is_not_returned(self, mock_db_pool):
+        """No exact match → None; a similar email is a different person (S2)."""
         mock_conn = AsyncMock()
-        mock_conn.fetchrow.side_effect = [
-            None,  # exact match → not found
-            {  # fuzzy email match → found
-                "id": UUID("11111111-1111-1111-1111-111111111111"),
-                "email": "jon@example.com",
-                "name": "Jon Doe",
-                "company": "Acme Corp",
-                "tier": "starter",
-                "created_at": datetime.now(UTC),
-                "updated_at": datetime.now(UTC),
-                "metadata": {},
-                "sim": 0.6,
-            },
-        ]
+        mock_conn.fetchrow.return_value = None
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        result = await db.find_customer_by_name_email(mock_db_pool, "john@example.com")
+
+        assert result is None
+        assert mock_conn.fetchrow.await_count == 1
+        sql, value = mock_conn.fetchrow.await_args.args
+        assert "levenshtein" not in sql and "similarity" not in sql
+        assert value == "john@example.com"
+
+    async def test_email_is_normalized(self, mock_db_pool):
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.return_value = None
+        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        await db.find_customer_by_name_email(mock_db_pool, "  John@Example.COM ")
+
+        assert mock_conn.fetchrow.await_args.args[1] == "john@example.com"
+
+    async def test_name_is_never_used_to_match(self, mock_db_pool):
+        """Same domain + similar name used to resolve to a customer; it must not."""
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.return_value = None
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
         result = await db.find_customer_by_name_email(
-            mock_db_pool, "john@example.com"
-        )
-
-        assert result is not None
-        assert result["email"] == "jon@example.com"
-
-    async def test_no_match_returns_none(self, mock_db_pool):
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.side_effect = [
-            None,  # exact match → not found
-            None,  # fuzzy email → not found
-        ]
-        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
-
-        result = await db.find_customer_by_name_email(
-            mock_db_pool, "nonexistent@example.com"
+            mock_db_pool, "john.smith@acme.com", name="John Smith", company="Acme Corp"
         )
 
         assert result is None
-
-    async def test_fuzzy_name_requires_corroboration(self, mock_db_pool):
-        """A name-only match across unrelated domains must NOT resolve to a customer."""
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.side_effect = [
-            None,  # exact email → not found
-            None,  # fuzzy email → not found
-        ]
-        mock_conn.fetch.return_value = [
-            {
-                "id": UUID("11111111-1111-1111-1111-111111111111"),
-                "email": "jsmith@other.com",
-                "name": "Jon Smith",
-                "company": "Other Inc",
-                "sim": 0.75,
-            },
-        ]
-        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
-
-        result = await db.find_customer_by_name_email(
-            mock_db_pool, "new-email@test.com", name="John Smith"
-        )
-
-        assert result is None
-
-    async def test_fuzzy_name_accepted_when_domain_matches(self, mock_db_pool):
-        """Same email domain corroborates the name, so the match is returned."""
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.side_effect = [None, None]
-        mock_conn.fetch.return_value = [
-            {
-                "id": UUID("11111111-1111-1111-1111-111111111111"),
-                "email": "jsmith@acme.com",
-                "name": "Jon Smith",
-                "company": "Acme Corp",
-                "sim": 0.75,
-            },
-        ]
-        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
-
-        result = await db.find_customer_by_name_email(
-            mock_db_pool, "john.smith@acme.com", name="John Smith"
-        )
-
-        assert result is not None
-        assert result["match_type"] == "fuzzy_name"
-
-    async def test_fuzzy_name_rejected_when_ambiguous(self, mock_db_pool):
-        """Two near-equal name candidates mean the person cannot be identified."""
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.side_effect = [None, None]
-        mock_conn.fetch.return_value = [
-            {
-                "id": UUID("11111111-1111-1111-1111-111111111111"),
-                "email": "jsmith@acme.com",
-                "name": "Jon Smith",
-                "company": "Acme Corp",
-                "sim": 0.78,
-            },
-            {
-                "id": UUID("22222222-2222-2222-2222-222222222222"),
-                "email": "j.smyth@acme.com",
-                "name": "John Smyth",
-                "company": "Acme Corp",
-                "sim": 0.76,
-            },
-        ]
-        mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
-
-        result = await db.find_customer_by_name_email(
-            mock_db_pool, "john.smith@acme.com", name="John Smith"
-        )
-
-        assert result is None
+        mock_conn.fetch.assert_not_awaited()
 
 
 class TestGetCustomerByIdentifier:
@@ -227,9 +163,7 @@ class TestGetCustomerByIdentifier:
         }
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        result = await db.get_customer_by_identifier(
-            mock_db_pool, "email", "alice@acmecorp.com"
-        )
+        result = await db.get_customer_by_identifier(mock_db_pool, "email", "alice@acmecorp.com")
 
         assert result is not None
         assert result["email"] == "alice@acmecorp.com"
@@ -244,9 +178,7 @@ class TestGetCustomerByIdentifier:
         }
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        result = await db.get_customer_by_identifier(
-            mock_db_pool, "phone", "+14155551234"
-        )
+        result = await db.get_customer_by_identifier(mock_db_pool, "phone", "+14155551234")
 
         assert result is not None
         assert result["email"] == "alice@acmecorp.com"
@@ -273,9 +205,7 @@ class TestGetCustomerByIdentifier:
         mock_conn.fetchrow.return_value = None
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        result = await db.get_customer_by_identifier(
-            mock_db_pool, "email", "nonexistent@test.com"
-        )
+        result = await db.get_customer_by_identifier(mock_db_pool, "email", "nonexistent@test.com")
 
         assert result is None
 
@@ -355,9 +285,10 @@ class TestGetCustomerOrCreateByIdentifier:
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
         mock_conn.fetchrow.side_effect = [
-            None,  # Step 1: exact match → not found
-            None,  # Step 2: fuzzy email match → not found
-            None,  # Step 3: fuzzy name match → not found
+            None,  # Step 1: exact identifier → not found
+            None,  # Step 1b: exact customers.email → not found
+            None,  # Step 2: similar email (review hint) → none
+            None,  # Step 3: similar name (review hint) → none
             {  # Step 4: INSERT customers RETURNING
                 "id": UUID("33333333-3333-3333-3333-333333333333"),
                 "email": "newuser@test.com",
@@ -378,26 +309,27 @@ class TestGetCustomerOrCreateByIdentifier:
         assert result["name"] == "New User"
         assert result["tier"] == "starter"
 
-
-    async def test_fuzzy_email_fallback_links_identifier(self, mock_db_pool):
-        """Exact lookup fails but fuzzy email matches → links identifier to matched customer."""
+    async def test_similar_email_creates_new_customer_flagged_for_review(self, mock_db_pool):
+        """alice1@ vs alice@ (S2): a new customer with a review hint, never a link."""
         mock_conn = AsyncMock()
         self._setup_conn_with_transaction(mock_conn)
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
         matched_id = UUID("66666666-6666-6666-6666-666666666666")
+        new_id = UUID("aaaaaaaa-6666-6666-6666-666666666666")
         mock_conn.fetchrow.side_effect = [
-            None,  # Step 1: exact match → not found
-            {  # Step 2: fuzzy email match → FOUND
-                "id": matched_id,
-                "email": "jon@example.com",
-                "name": "Jon Doe",
-                "company": "Acme Corp",
+            None,  # Step 1: exact identifier → not found
+            None,  # Step 1b: exact customers.email → not found
+            {"id": matched_id, "name": "Jon Doe", "sim": 0.6},  # Step 2: similar email
+            {  # Step 4: INSERT new customer
+                "id": new_id,
+                "email": "john@example.com",
+                "name": "John Doe",
+                "company": None,
                 "tier": "starter",
                 "created_at": datetime.now(UTC),
                 "updated_at": datetime.now(UTC),
                 "metadata": {},
-                "sim": 0.6,
             },
         ]
 
@@ -405,9 +337,13 @@ class TestGetCustomerOrCreateByIdentifier:
             mock_db_pool, "email", "john@example.com", name="John Doe"
         )
 
-        assert result["id"] == matched_id
-        # Should have linked the new identifier to existing customer
-        mock_conn.execute.assert_called_once()
+        assert result["id"] == new_id
+        metadata_json = mock_conn.fetchrow.await_args_list[-1].args[-1]
+        assert str(matched_id) in metadata_json
+        assert "needs_identity_review" in metadata_json
+        # Nothing was linked to the similar customer.
+        for call in mock_conn.execute.await_args_list:
+            assert matched_id not in call.args
 
     async def test_name_match_never_links_identifier(self, mock_db_pool):
         """A similar name must create a NEW customer flagged for review, not link."""
@@ -418,8 +354,9 @@ class TestGetCustomerOrCreateByIdentifier:
         candidate_id = UUID("77777777-7777-7777-7777-777777777777")
         new_id = UUID("aaaaaaaa-7777-7777-7777-777777777777")
         mock_conn.fetchrow.side_effect = [
-            None,  # Step 1: exact match → not found
-            None,  # Step 2: fuzzy email → not found
+            None,  # Step 1: exact identifier → not found
+            None,  # Step 1b: exact customers.email → not found
+            None,  # Step 2: similar email → none
             {  # Step 3: similar name found → review flag only
                 "id": candidate_id,
                 "name": "Jon Doe",
@@ -449,20 +386,18 @@ class TestGetCustomerOrCreateByIdentifier:
         assert str(candidate_id) in metadata_json
         assert "needs_identity_review" in metadata_json
 
-    async def test_low_similarity_does_not_match(self, mock_db_pool):
-        """Fuzzy result below threshold → creates new customer."""
+    async def test_similarity_threshold_is_applied_in_sql(self, mock_db_pool):
+        """The review-hint threshold is a SQL filter, so low matches never come back."""
         mock_conn = AsyncMock()
         self._setup_conn_with_transaction(mock_conn)
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
         new_id = UUID("88888888-8888-8888-8888-888888888888")
         mock_conn.fetchrow.side_effect = [
-            None,  # Step 1: exact match → not found
-            {  # Step 2: fuzzy email match → below threshold
-                "id": UUID("99999999-9999-9999-9999-999999999999"),
-                "sim": 0.1,
-            },
-            None,  # Step 3: fuzzy name match → not found
+            None,  # Step 1: exact identifier → not found
+            None,  # Step 1b: exact customers.email → not found
+            None,  # Step 2: similar email above threshold → none
+            None,  # Step 3: similar name → none
             {  # Step 4: INSERT new customer
                 "id": new_id,
                 "email": "nobody@example.com",
@@ -476,11 +411,16 @@ class TestGetCustomerOrCreateByIdentifier:
         ]
 
         result = await db.get_customer_or_create_by_identifier(
-            mock_db_pool, "email", "nobody@example.com", name="New Person",
+            mock_db_pool,
+            "email",
+            "nobody@example.com",
+            name="New Person",
             fuzzy_threshold=0.8,
         )
 
         assert result["id"] == new_id
+        email_hint_call = mock_conn.fetchrow.await_args_list[2]
+        assert email_hint_call.args[-1] == 0.8
 
 
 class TestLinkIdentifiers:
@@ -539,9 +479,7 @@ class TestGetCustomerHistory:
         ]
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        history = await db.get_customer_history(
-            mock_db_pool, "alice@acmecorp.com", limit=10
-        )
+        history = await db.get_customer_history(mock_db_pool, "alice@acmecorp.com", limit=10)
 
         assert len(history) == 2
         channels = {h["channel"] for h in history}
@@ -553,9 +491,7 @@ class TestGetCustomerHistory:
         mock_conn.fetchval.return_value = None  # No identifier found
         mock_db_pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-        history = await db.get_customer_history(
-            mock_db_pool, "unknown@test.com", limit=10
-        )
+        history = await db.get_customer_history(mock_db_pool, "unknown@test.com", limit=10)
 
         assert history == []
 
@@ -638,9 +574,10 @@ class TestCrossChannelResolution:
         mock_conn.execute.return_value = None
 
         mock_conn.fetchrow.side_effect = [
-            None,  # Step 1: exact match → not found
-            None,  # Step 2: fuzzy email match → not found
-            None,  # Step 3: fuzzy name match → not found
+            None,  # Step 1: exact identifier → not found
+            None,  # Step 1b: exact customers.email → not found
+            None,  # Step 2: similar email → none
+            None,  # Step 3: similar name → none
             {  # Step 4: INSERT customer
                 "id": customer_id,
                 "email": "bob@startupinc.com",
@@ -677,9 +614,7 @@ class TestCrossChannelResolution:
             "metadata": {},
         }
 
-        phone_customer = await db.get_customer_by_identifier(
-            mock_pool, "phone", "+14155559876"
-        )
+        phone_customer = await db.get_customer_by_identifier(mock_pool, "phone", "+14155559876")
         assert phone_customer is not None
         assert phone_customer["id"] == customer_id
 

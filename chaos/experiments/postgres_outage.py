@@ -14,24 +14,24 @@ class PostgresOutageExperiment(ChaosExperiment):
 
         self.log("Verifying API enters degraded mode")
         import httpx
+
         deadline = time.time() + 15
         degraded_detected = False
         while time.time() < deadline:
             try:
-                r = httpx.get(f"{self.config.api_url}/health", timeout=5)
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("status") == "degraded" and data.get("db") == "error":
-                        degraded_detected = True
-                        break
+                # Readiness answers 503 with db=error while the DB is down (N6).
+                r = httpx.get(f"{self.config.api_url}/readyz", timeout=5)
+                if r.status_code == 503 and r.json().get("db") == "error":
+                    degraded_detected = True
+                    break
             except Exception:
                 pass
             time.sleep(2)
 
         if degraded_detected:
-            self.log("API correctly entered degraded mode (db:error)")
+            self.log("API correctly reports not ready (503, db:error)")
         else:
-            self.errors.append("API did not report degraded mode after Postgres outage")
+            self.errors.append("API did not report not-ready after Postgres outage")
             self.log("WARNING: API did not enter degraded mode as expected")
 
         self.log(f"Holding Postgres down for {self.config.disruption_duration}s")

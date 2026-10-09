@@ -34,9 +34,11 @@ RUN addgroup --system --gid 1001 nodejs && \
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/client-ip.js ./client-ip.js
 
 USER nextjs
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+# client-ip.js overwrites X-Forwarded-For with the TCP peer (AUDIT S8).
+CMD ["node", "--require", "./client-ip.js", "server.js"]

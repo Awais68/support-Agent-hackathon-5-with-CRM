@@ -15,6 +15,7 @@ import asyncio
 import sys
 
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionToolParam
 
 sys.path.insert(0, ".")
 
@@ -80,22 +81,26 @@ async def check_chat(model: str = "gemini-3.6-flash") -> None:
             messages=[{"role": "user", "content": "Reply with exactly one word: PONG"}],
         )
         text = (resp.choices[0].message.content or "").strip()
-        record(f"[info] chat completion ({model})", "PONG" in text.upper(), repr(text), required=False)
+        record(
+            f"[info] chat completion ({model})", "PONG" in text.upper(), repr(text), required=False
+        )
     except Exception as exc:
         record(f"[info] chat completion ({model})", False, repr(exc)[:160], required=False)
 
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "lookup_order",
-            "description": "Look up an order by id",
-            "parameters": {
-                "type": "object",
-                "properties": {"order_id": {"type": "string"}},
-                "required": ["order_id"],
+    tools: list[ChatCompletionToolParam] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_order",
+                "description": "Look up an order by id",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"order_id": {"type": "string"}},
+                    "required": ["order_id"],
+                },
             },
-        },
-    }]
+        }
+    ]
     try:
         resp = await client.chat.completions.create(
             model=model,
@@ -106,7 +111,11 @@ async def check_chat(model: str = "gemini-3.6-flash") -> None:
         record(
             f"[info] tool calling ({model})",
             bool(calls),
-            calls[0].function.arguments if calls else "no tool_calls",
+            (
+                calls[0].function.arguments
+                if calls and calls[0].type == "function"
+                else "no tool_calls"
+            ),
             required=False,
         )
     except Exception as exc:

@@ -15,7 +15,7 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from chaos.config import ChaosConfig
@@ -38,6 +38,7 @@ EXPERIMENTS = {
 
 def import_experiment(module_path: str, class_name: str):
     import importlib
+
     mod = importlib.import_module(module_path)
     return getattr(mod, class_name)
 
@@ -64,8 +65,8 @@ def run_experiment(experiment_id: str, config: ChaosConfig, is_dry_run: bool):
             "status": "dry-run",
             "recovery_time_seconds": None,
             "errors_observed": [],
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": datetime.now(UTC).isoformat(),
+            "finished_at": datetime.now(UTC).isoformat(),
             "details": {"note": "Dry run — no changes made"},
         }
 
@@ -82,23 +83,27 @@ def run_experiment(experiment_id: str, config: ChaosConfig, is_dry_run: bool):
 def main():
     parser = argparse.ArgumentParser(description="TechFlow Chaos Experiment Runner")
     parser.add_argument(
-        "--experiment", "-e",
+        "--experiment",
+        "-e",
         choices=list(EXPERIMENTS.keys()) + ["all"],
         default="all",
         help="Experiment ID to run (01-06), or 'all'",
     )
     parser.add_argument(
-        "--dry-run", "-n",
+        "--dry-run",
+        "-n",
         action="store_true",
         help="Preview actions without making changes",
     )
     parser.add_argument(
-        "--yes", "-y",
+        "--yes",
+        "-y",
         action="store_true",
         help="Skip confirmation prompt (sets TECHFLOW_CONFIRM_CHAOS=yes)",
     )
     parser.add_argument(
-        "--output", "-o",
+        "--output",
+        "-o",
         type=str,
         help="Write results JSON to file",
     )
@@ -109,6 +114,7 @@ def main():
     is_dry_run = args.dry_run or dry_run_mode()
     if args.yes:
         import os
+
         os.environ["TECHFLOW_CONFIRM_CHAOS"] = "yes"
 
     try:
@@ -133,7 +139,7 @@ def main():
         time.sleep(2)
 
     summary = {
-        "run_id": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
+        "run_id": datetime.now(UTC).strftime("%Y%m%d-%H%M%S"),
         "total": len(results),
         "passed": sum(1 for r in results if r["status"] == "passed"),
         "failed": sum(1 for r in results if r["status"] == "failed"),

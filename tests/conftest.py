@@ -1,12 +1,21 @@
 """Pytest configuration and fixtures."""
 
-import os
 import asyncio
-import pytest
+import os
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+# Explicit test mode: the API refuses to start without a key outside it, and
+# tests authenticate with this fixed, non-secret value. Set before any app
+# import so module-level config sees it.
+os.environ["RUN_MODE"] = "test"
+os.environ["API_KEY"] = "test-key-12345"
+
 from openai import AsyncOpenAI
+
 from kafka_client import KafkaProducerClient
+
 
 @pytest.fixture(scope="session")
 def event_loop():
@@ -18,7 +27,7 @@ def event_loop():
 
 @pytest.fixture
 def mock_openai_client():
-    """Mock OpenAI/OpenRouter client (handles both chat + embeddings)."""
+    """Mock OpenAI-compatible client (DeepSeek chat + embeddings)."""
     mock = MagicMock(spec=AsyncOpenAI)
     mock.chat.completions.create = AsyncMock()
     mock.embeddings.create = AsyncMock()
@@ -82,9 +91,5 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
     )
-    config.addinivalue_line(
-        "markers", "integration: marks tests as integration tests"
-    )
-    config.addinivalue_line(
-        "markers", "e2e: marks tests as end-to-end tests"
-    )
+    config.addinivalue_line("markers", "integration: marks tests as integration tests")
+    config.addinivalue_line("markers", "e2e: marks tests as end-to-end tests")

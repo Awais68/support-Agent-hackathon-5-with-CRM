@@ -28,7 +28,7 @@ services:
     plan: free
     rootDir: .
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /health
+    healthCheckPath: /readyz
     autoDeploy: true
     preDeployCommand: bash scripts/render_migrate.sh
     envVars:
@@ -52,14 +52,13 @@ services:
         sync: false
       - key: DEEPSEEK_MODEL
         value: deepseek-chat
+      # Optional chat fallback, used only when DEEPSEEK_API_KEY is empty.
       - key: OPENROUTER_API_KEY
         sync: false
       - key: OPENROUTER_BASE_URL
         value: https://openrouter.ai/api/v1
       - key: OPENAI_MODEL
         value: openai/gpt-4o
-      - key: EMBEDDING_MODEL
-        value: openai/text-embedding-3-small
       - key: API_KEY
         generateValue: true
       - key: REDIS_URL
@@ -81,8 +80,8 @@ services:
         value: auto
       - key: TTS_PROVIDER
         value: auto
-      # Knowledge base search embeds through Gemini — the OpenRouter account
-      # has no embedding credits and returns HTTP 402 on /embeddings.
+      # Knowledge base search embeds through Gemini: DeepSeek serves no
+      # embedding models. Without it /readyz reports embeddings=missing.
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_BASE_URL
@@ -136,6 +135,15 @@ services:
     healthCheckPath: /
     autoDeploy: true
     envVars:
+      # Read at runtime by the server-side routes (/webhooks/webform,
+      # /api/tickets, /api/voice). NEXT_PUBLIC_* is frozen at build, so it is
+      # only for the browser bundle. Public URL: free instances cannot
+      # receive private-network traffic.
+      - key: API_INTERNAL_URL
+        fromService:
+          type: web
+          name: techflow-api
+          property: url
       - key: NEXT_PUBLIC_API_URL
         fromService:
           type: web

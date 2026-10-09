@@ -1,7 +1,7 @@
 """Entry point for TechFlow CRM Digital FTE - supports API and worker modes."""
 
-import os
 import asyncio
+import os
 
 import uvicorn
 

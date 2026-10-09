@@ -119,7 +119,7 @@ export default function VoiceRecorder() {
         <div className="mt-6 space-y-4">
           {result.needs_clarification ? (
             <div className="error-banner">
-              <p className="font-medium">We didn't catch that clearly</p>
+              <p className="font-medium">We didn&apos;t catch that clearly</p>
               <p className="text-sm mt-1">{result.clarification_message}</p>
             </div>
           ) : (

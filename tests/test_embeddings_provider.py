@@ -1,6 +1,6 @@
 """Tests for the embedding provider split and the knowledge base fallback.
 
-These cover the failure that shipped silently: chat runs on OpenRouter, whose
+These cover the failure that shipped silently: chat ran on OpenRouter, whose
 account has no embedding credits, so every ``/embeddings`` call returned HTTP
 402 and the agent answered "escalate to human support" on every knowledge base
 lookup instead of degrading to lexical search.
@@ -23,9 +23,7 @@ from embeddings_provider import (
 
 def _mock_embeddings_client(dim: int = EMBEDDING_DIM) -> AsyncMock:
     client = AsyncMock()
-    client.embeddings.create.return_value = MagicMock(
-        data=[MagicMock(embedding=[0.1] * dim)]
-    )
+    client.embeddings.create.return_value = MagicMock(data=[MagicMock(embedding=[0.1] * dim)])
     return client
 
 
@@ -65,6 +63,8 @@ def test_empty_gemini_key_falls_back_to_chat_client(monkeypatch):
     # An exported-but-empty var is common in shell wrappers and must count as unset.
     monkeypatch.setenv("GEMINI_API_KEY", "   ")
     monkeypatch.setenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
+    # The opt-in only applies off DeepSeek (no embedding models there).
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     chat_client = MagicMock()
 
     provider = build_embedding_provider(chat_client)
@@ -152,8 +152,10 @@ async def test_tool_falls_back_to_lexical_search_when_embedding_fails(kb_row):
         embedding_provider=EmbeddingProvider(embed_client, "gemini-embedding-001"),
     )
 
-    with patch("agent.tools.db.search_knowledge_base", new_callable=AsyncMock) as vector_search, \
-         patch("agent.tools.db.search_knowledge_base_text", new_callable=AsyncMock) as text_search:
+    with (
+        patch("agent.tools.db.search_knowledge_base", new_callable=AsyncMock) as vector_search,
+        patch("agent.tools.db.search_knowledge_base_text", new_callable=AsyncMock) as text_search,
+    ):
         text_search.return_value = [kb_row]
         result = await search_knowledge_base({"query": "connector setup"}, context)
 
@@ -176,7 +178,9 @@ async def test_executor_falls_back_to_lexical_search_when_embedding_fails(kb_row
         embedding_provider=EmbeddingProvider(embed_client, "gemini-embedding-001"),
     )
 
-    with patch("agent.tools_executor.db.search_knowledge_base_text", new_callable=AsyncMock) as text_search:
+    with patch(
+        "agent.tools_executor.db.search_knowledge_base_text", new_callable=AsyncMock
+    ) as text_search:
         text_search.return_value = [kb_row]
         result = await executor.search_knowledge_base("connector setup")
 
@@ -197,9 +201,7 @@ async def test_vector_search_is_scoped_to_the_active_embedding_model(kb_row):
         db_pool=AsyncMock(),
         kafka_producer=AsyncMock(),
         openai_client=AsyncMock(),
-        embedding_provider=EmbeddingProvider(
-            _mock_embeddings_client(), "gemini-embedding-001"
-        ),
+        embedding_provider=EmbeddingProvider(_mock_embeddings_client(), "gemini-embedding-001"),
     )
 
     with patch("agent.tools.db.search_knowledge_base", new_callable=AsyncMock) as vector_search:
@@ -222,8 +224,10 @@ async def test_model_mismatch_degrades_to_lexical_search(kb_row):
         ),
     )
 
-    with patch("agent.tools.db.search_knowledge_base", new_callable=AsyncMock) as vector_search, \
-         patch("agent.tools.db.search_knowledge_base_text", new_callable=AsyncMock) as text_search:
+    with (
+        patch("agent.tools.db.search_knowledge_base", new_callable=AsyncMock) as vector_search,
+        patch("agent.tools.db.search_knowledge_base_text", new_callable=AsyncMock) as text_search,
+    ):
         vector_search.return_value = []
         text_search.return_value = [kb_row]
         result = await search_knowledge_base({"query": "connector setup"}, context)
@@ -246,8 +250,10 @@ async def test_model_mismatch_stays_degraded_when_lexical_is_empty():
         ),
     )
 
-    with patch("agent.tools.db.search_knowledge_base", new_callable=AsyncMock) as vector_search, \
-         patch("agent.tools.db.search_knowledge_base_text", new_callable=AsyncMock) as text_search:
+    with (
+        patch("agent.tools.db.search_knowledge_base", new_callable=AsyncMock) as vector_search,
+        patch("agent.tools.db.search_knowledge_base_text", new_callable=AsyncMock) as text_search,
+    ):
         vector_search.return_value = []
         text_search.return_value = []
         result = await search_knowledge_base({"query": "connector setup"}, context)
@@ -268,8 +274,14 @@ async def test_executor_degrades_on_model_mismatch(kb_row):
         ),
     )
 
-    with patch("agent.tools_executor.db.search_knowledge_base", new_callable=AsyncMock) as vector_search, \
-         patch("agent.tools_executor.db.search_knowledge_base_text", new_callable=AsyncMock) as text_search:
+    with (
+        patch(
+            "agent.tools_executor.db.search_knowledge_base", new_callable=AsyncMock
+        ) as vector_search,
+        patch(
+            "agent.tools_executor.db.search_knowledge_base_text", new_callable=AsyncMock
+        ) as text_search,
+    ):
         vector_search.return_value = []
         text_search.return_value = [kb_row]
         result = await executor.search_knowledge_base("connector setup")

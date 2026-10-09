@@ -2,16 +2,10 @@
 const nextConfig = {
   reactStrictMode: true,
   output: "standalone",
-  rewrites: async () => {
-    return {
-      beforeFiles: [
-        {
-          source: '/webhooks/:path*',
-          destination: `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/webhooks/:path*`,
-        },
-      ],
-    };
-  },
+  // No /webhooks rewrite: its destination was evaluated at build time
+  // (NEXT_PUBLIC_API_URL baked into the standalone config). The web form's
+  // only webhook goes through src/app/webhooks/webform/route.ts, which reads
+  // API_INTERNAL_URL at runtime.
 };
 
 module.exports = nextConfig;

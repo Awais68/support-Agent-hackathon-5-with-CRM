@@ -42,7 +42,7 @@ dependencies = [
     "redis[hiredis]>=5.0.0",
 
     # Monitoring
-    "prometheus-client>=0.19.0",
+    "prometheus-client>=0.20.0",
 ]
 
 [project.optional-dependencies]
@@ -51,9 +51,11 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
     "locust>=2.17.0",
-    "black>=24.1.0",
-    "ruff>=0.2.0",
-    "mypy>=1.8.0",
+    # Checkers are pinned: a new release can add rules and turn CI red with no
+    # code change. Bump them on purpose, together with the fixes they ask for.
+    "black==26.10.0",
+    "ruff==0.16.10",
+    "mypy==2.4.0",
     # E2E browser testing
     "playwright>=1.40.0",
     "pytest-playwright>=0.4.0",
@@ -61,19 +63,30 @@ dev = [
     "gtts>=2.5.0",
 ]
 
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+extend-exclude = "/(\\.kilo|web-form)/"
+
 [tool.ruff]
+extend-exclude = [".kilo", "web-form"]
 target-version = "py313"
 line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
-ignore = []
+# Line length is enforced by black; E501 would only flag long string
+# literals (SQL, prompts) that black deliberately leaves intact.
+ignore = ["E501"]
 
 [tool.ruff.format]
 quote-style = "double"
 
 [tool.mypy]
 ignore_missing_imports = true
+# Local-only trees (agent worktrees, venv, the Next.js app) are not part of
+# the Python package and contain duplicate module names.
+exclude = ['^\.kilo/', '^\.venv/', '^web-form/']
 
 [build-system]
 requires = ["hatchling"]

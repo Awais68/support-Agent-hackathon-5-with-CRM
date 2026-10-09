@@ -3,6 +3,7 @@ services:
   postgres:
     image: pgvector/pgvector:0.8.0-pg16
     container_name: techflow-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-techflow}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-techflow}
@@ -11,8 +12,6 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
-      - ./database/migrations/001_initial.sql:/docker-entrypoint-initdb.d/02-migrations.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-techflow}"]
       interval: 10s
@@ -24,6 +23,7 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: techflow-zookeeper
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -35,6 +35,7 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: techflow-kafka
+    restart: unless-stopped
     depends_on:
       - zookeeper
     environment:
@@ -55,32 +56,88 @@ services:
     networks:
       - techflow
 
+  # One-shot: applies database/schema.sql + migrations/001..NNN in order,
+  # once each (tracked in _migrations_applied), then exits. Same runner as
+  # Render's pre-deploy step. The postgres image is reused for its psql.
+  migrate:
+    image: pgvector/pgvector:0.8.0-pg16
+    container_name: techflow-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}
+    working_dir: /app
+    entrypoint: ["bash", "scripts/render_migrate.sh"]
+    volumes:
+      - ./database:/app/database:ro
+      - ./scripts/render_migrate.sh:/app/scripts/render_migrate.sh:ro
+    restart: "no"
+    networks:
+      - techflow
+
+  # One-shot: embeds knowledge_base rows that have no vector (or one from a
+  # different model) so KB vector search works on a fresh volume. Needs
+  # GEMINI_API_KEY; without it it logs an error and exits 0, and the API
+  # reports embeddings=missing and alerts on every lexical fallback.
+  kb-embed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: techflow-kb-embed
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
+    command: python -m database.seed --embed-kb-only
+    volumes:
+      - .:/app
+    restart: "no"
+    networks:
+      - techflow
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: techflow-api
+    restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      kb-embed:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # Chat: DeepSeek. OpenRouter is an optional fallback, used only when
+      # DEEPSEEK_API_KEY is empty and OPENROUTER_API_KEY is set.
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
-      API_KEY: ${API_KEY:-test-key-12345}
+      # Embeddings (KB search): Gemini.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
+      API_KEY: ${API_KEY:-${API_KEY_SECRET:?set API_KEY or API_KEY_SECRET in .env}}
       CORS_ORIGINS: http://localhost:3000,http://localhost:8000
+      # Base of the customer tracking link returned by /webhooks/webform.
+      PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
+      # Only the web form may set the client address for rate limiting: it
+      # overwrites X-Forwarded-For with the browser's address (client-ip.js).
+      # Pinned below so a container restart cannot change it (AUDIT S8).
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.20.0.250}
     ports:
       - "8000:8000"
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       - .:/app
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -92,18 +149,25 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: techflow-worker
+    restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # Chat: DeepSeek. OpenRouter is an optional fallback, used only when
+      # DEEPSEEK_API_KEY is empty and OPENROUTER_API_KEY is set.
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      # Embeddings (KB search): Gemini.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
       TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER}
@@ -115,11 +179,12 @@ services:
       - ./gmail_credentials.json:/app/gmail_credentials.json:ro
       - ./gmail_token.json:/app/gmail_token.json
     healthcheck:
-      test: ["CMD-SHELL", "kill -0 1"]
+      # Fails when a consumer loop died or is stuck (AUDIT N6/C2).
+      test: ["CMD", "python", "-m", "utils.worker_healthcheck", "--max-age", "60"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 60s
     networks:
       - techflow
 
@@ -128,23 +193,34 @@ services:
       context: ./web-form
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: http://api:8000
+        # Baked into the browser bundle, so it must be reachable from the
+        # user's browser, not just from inside the compose network.
+        NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
         NEXT_PUBLIC_COMPANY_NAME: ${COMPANY_NAME:-TechFlow Analytics}
         NEXT_PUBLIC_SUPPORT_EMAIL: ${SUPPORT_EMAIL:-support@techflow-analytics.com}
     container_name: techflow-web-form
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
       NODE_ENV: production
+      # Read at runtime by the server-side routes (/webhooks/webform,
+      # /api/tickets, /api/voice), which call the API's public endpoints over
+      # the compose network. Not NEXT_PUBLIC_*: those are frozen at build. No API key on purpose
+      # (AUDIT S7): nothing in the web form may hold the master key.
+      API_INTERNAL_URL: http://api:8000
     depends_on:
       api:
         condition: service_healthy
     networks:
-      - techflow
+      techflow:
+        # The API's TRUSTED_PROXIES entry; keep the two in sync.
+        ipv4_address: 172.20.0.250
 
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: techflow-postgres-exporter
+    restart: unless-stopped
     environment:
       DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}?sslmode=disable"
     ports:
@@ -158,10 +234,12 @@ services:
   prometheus:
     image: prom/prometheus:v2.50.1
     container_name: techflow-prometheus
+    restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -174,6 +252,7 @@ services:
   grafana:
     image: grafana/grafana:10.3.3
     container_name: techflow-grafana
+    restart: unless-stopped
     ports:
       - "3001:3000"
     environment:
@@ -196,3 +275,7 @@ volumes:
 networks:
   techflow:
     driver: bridge
+    ipam:
+      config:
+        # Fixed so the web form's pinned address (TRUSTED_PROXIES) is valid.
+        - subnet: 172.20.0.0/16

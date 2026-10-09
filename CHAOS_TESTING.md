@@ -196,7 +196,7 @@ curl -s -X POST http://localhost:8000/webhooks/webform \
   -d '{"name":"MonTest","email":"mon@test.com","subject":"Monitoring","message":"No prom test","category":"support","priority":"low"}'
 
 # Check API metrics endpoint still works
-curl -s http://localhost:8000/metrics | head -20
+docker exec techflow-api curl -s http://localhost:9100/metrics | head -20
 
 # Restore
 docker compose start prometheus
