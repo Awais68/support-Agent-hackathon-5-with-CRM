@@ -50,6 +50,7 @@ service_account*.json
 # OS
 node_modules/
 .next/
+*.tsbuildinfo
 dist/
 out/
 
