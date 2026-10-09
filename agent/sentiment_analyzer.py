@@ -163,6 +163,22 @@ _ASPECT_PATTERNS: dict[str, list[str]] = {
 }
 
 
+# Words that describe the state of the system, not the customer's mood. VADER
+# scores "error", "failed", "broken" as strongly negative, so a calm bug report
+# ("the connector failed with error 401") read as an upset customer. They are
+# neutralised before scoring; anger and abuse still carry their own valence.
+_TECHNICAL_FAILURE_TERMS = re.compile(
+    r"(?i)\b(?:errors?|fail(?:s|ed|ing|ure|ures)?|broken|break(?:s|ing)?|bugs?|issues?"
+    r"|problems?|invalid|refused|denied|rejected|timeouts?|timing out"
+    r"|crash(?:es|ed|ing)?|stuck|missing|wrong|down|stopped|lost|noisy|exceptions?)\b"
+)
+
+
+def _polarity(text: str) -> dict[str, float]:
+    """VADER scores for ``text`` with technical failure vocabulary neutralised."""
+    return _analyzer.polarity_scores(_TECHNICAL_FAILURE_TERMS.sub("thing", text))
+
+
 def _keyword_score(text: str, patterns: list[str]) -> float:
     score = 0.0
     for p in patterns:
@@ -363,7 +379,8 @@ async def analyze_sentiment(
 ) -> float:
     """Analyze sentiment of a customer message. Returns 0.0–1.0 (backward compatible).
 
-    Uses VADER's compound score normalised from [-1, 1] → [0, 1].
+    Uses VADER's compound score normalised from [-1, 1] → [0, 1], after
+    neutralising technical failure words (see ``_TECHNICAL_FAILURE_TERMS``).
     Falls back to 0.5 if the library is unavailable or parsing fails.
 
     The ``openai_client`` parameter is accepted for backward compatibility
@@ -372,7 +389,7 @@ async def analyze_sentiment(
     try:
         if _analyzer is None:
             return 0.5
-        vs = _analyzer.polarity_scores(message)
+        vs = _polarity(message)
         compound = vs.get("compound", 0.0)
         score = max(0.0, min(1.0, (compound + 1.0) / 2.0))
         return score
@@ -400,7 +417,7 @@ async def analyze_sentiment_detailed(
         if _analyzer is None:
             return SentimentDetail()
 
-        vs = _analyzer.polarity_scores(message)
+        vs = _polarity(message)
         compound = vs.get("compound", 0.0)
         neg = vs.get("neg", 0.0)
         neu = vs.get("neu", 1.0)
