@@ -3,6 +3,7 @@
 Usage:
     python -m database.seed              # Runs schema + migrations + seed data
     python -m database.seed --migrations-only  # Only run pending migrations
+    python -m database.seed --embed-kb-only    # Only embed unembedded KB rows
 
 Idempotent: safe to run multiple times.
 Uses asyncpg pool (matching database/queries.py pattern).
@@ -359,6 +360,9 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Database seed/migration tool")
     parser.add_argument("--migrations-only", action="store_true",
                         help="Only run pending migrations, skip data seeding")
+    parser.add_argument("--embed-kb-only", action="store_true",
+                        help="Only backfill knowledge_base embeddings; assumes the "
+                        "schema was migrated already (e.g. by scripts/render_migrate.sh)")
     args = parser.parse_args()
 
     load_environment()
@@ -378,6 +382,20 @@ async def main() -> None:
         max_size=pool_max,
         ssl=db_ssl,
     )
+
+    if args.embed_kb_only:
+        try:
+            embedded = await backfill_knowledge_base_embeddings(pool)
+            logger.info("Knowledge base embedding backfill complete", articles=embedded)
+        except Exception as e:
+            # Not fatal: without vectors the agent degrades to lexical search.
+            logger.warning(
+                "Knowledge base embedding backfill failed",
+                error=sanitize_error_message(str(e)),
+            )
+        finally:
+            await pool.close()
+        return
 
     try:
         results = await seed(pool)
