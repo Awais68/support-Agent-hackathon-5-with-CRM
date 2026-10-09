@@ -6,6 +6,7 @@ import re
 import traceback as tb
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 from xml.sax.saxutils import escape as xml_escape
@@ -64,7 +65,11 @@ from exceptions import (  # noqa: E402
     sanitize_error_message,
     to_error_response,
 )
-from kafka_client import KafkaProducerClient, NoOpKafkaProducer  # noqa: E402
+from kafka_client import (  # noqa: E402
+    NOTIFICATIONS_OUTBOUND_TOPIC,
+    KafkaProducerClient,
+    NoOpKafkaProducer,
+)
 from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker  # noqa: E402
 
 logger = structlog.get_logger(__name__)
@@ -738,8 +743,14 @@ async def reply_to_ticket(
     ticket_id: UUID,
     body: ReplyRequest,
     pool: asyncpg.Pool = Depends(get_db),
+    kafka_producer: KafkaProducerClient = Depends(get_kafka),
 ) -> dict[str, Any]:
-    """Send a reply to a ticket."""
+    """Send a human agent's reply to the customer.
+
+    The reply is stored, pushed to the ticket's WebSocket, and published to
+    notifications.outbound so the sender delivers it by email/WhatsApp
+    (AUDIT N5). The sender dedups on ``reply:<message id>``.
+    """
     ticket = await db.get_ticket(pool, ticket_id)
     if not ticket:
         raise NotFoundError(message=f"Ticket {ticket_id} not found")
@@ -763,9 +774,36 @@ async def reply_to_ticket(
         },
     )
 
+    try:
+        await kafka_producer.send_message(
+            NOTIFICATIONS_OUTBOUND_TOPIC,
+            {
+                "ticket_id": str(ticket_id),
+                "customer_email": ticket.get("customer_email"),
+                "channel": ticket["channel"],
+                "customer_reply": body.message,
+                "reply_message_id": str(message["id"]),
+                "source": "human",
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+            key=str(ticket_id),
+        )
+    except Exception as e:
+        logger.error(
+            "Human reply saved but not queued for delivery",
+            ticket_id=str(ticket_id),
+            message_id=str(message["id"]),
+            error=sanitize_error_message(str(e)),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Reply {message['id']} was saved but could not be queued for delivery",
+        ) from e
+
     return {
         "message_id": str(message["id"]),
         "sent_at": message["created_at"].isoformat(),
+        "delivery": "queued",
     }
 
 

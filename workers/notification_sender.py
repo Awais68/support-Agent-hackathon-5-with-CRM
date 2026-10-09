@@ -17,10 +17,13 @@ Delivery guarantees:
   agent's ``internal_note``. An empty or operator-voiced reply is not sent;
   the row is marked ``failed`` and the ticket escalated for a human.
 
-Only events carrying ``agent_run_id`` are delivered. The ``send_response``
-tool also publishes to this topic mid-run, but the agent always publishes
-the final formatted reply at the end of the same run; sending both would
-message the customer twice.
+Delivered events are the agent's final reply (``agent_run_id``) and human
+agent replies from ``POST /tickets/{id}/reply`` (``reply_message_id``, keyed
+``reply:<message id>``; AUDIT N5). The ``send_response`` tool also publishes
+to this topic mid-run, but the agent always publishes the final formatted
+reply at the end of the same run; sending both would message the customer
+twice, so tool events (neither id) are ignored. The operator-voice guard only
+applies to agent replies: a human writing in the first person is intended.
 """
 
 import asyncio
@@ -210,9 +213,10 @@ class OutboundSender:
         """Deliver one event. Returns the final status for logging/tests."""
         payload = message.payload
         agent_run_id = payload.get("agent_run_id")
+        reply_message_id = payload.get("reply_message_id")
         channel = (payload.get("channel") or "").lower()
 
-        if not agent_run_id:
+        if not agent_run_id and not reply_message_id:
             logger.debug(
                 "Outbound event superseded by final agent reply",
                 message_id=message.message_id,
@@ -227,7 +231,12 @@ class OutboundSender:
         # One reply per inbound message: after a crash the worker may re-run
         # the agent (new agent_run_id) for the same inbound message.
         source_message_id = payload.get("source_message_id")
-        key = f"inbound:{source_message_id}" if source_message_id else f"agent_run:{agent_run_id}"
+        if reply_message_id:
+            key = f"reply:{reply_message_id}"
+        elif source_message_id:
+            key = f"inbound:{source_message_id}"
+        else:
+            key = f"agent_run:{agent_run_id}"
         if not await self._claim(key, ticket_id, channel or "unknown"):
             logger.info("Outbound reply already handled", idempotency_key=key)
             return "duplicate"
@@ -236,7 +245,10 @@ class OutboundSender:
             await self._finish(key, "skipped", 0, error="in-app channel")
             return "skipped"
 
-        blocked = operator_voice_reason(payload.get("customer_reply"))
+        if reply_message_id:
+            blocked = None if (payload.get("customer_reply") or "").strip() else "empty reply"
+        else:
+            blocked = operator_voice_reason(payload.get("customer_reply"))
         if blocked:
             error = f"blocked: {blocked}"
             await self._finish(key, "failed", 0, error=error)

@@ -59,7 +59,7 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 
 | ID | Sev | Finding | Status |
 |---|---|---|---|
-| N5 | High | Human `/reply` never reaches email/WhatsApp | Open |
+| N5 | High | Human `/reply` never reaches email/WhatsApp | Fixed (N5 commit): `/tickets/{id}/reply` publishes `{reply_message_id, source: human, customer_reply, channel, customer_email}` to `notifications.outbound`; a publish failure returns 503 naming the saved message instead of a silent 201. The sender delivers these under `reply:<message id>` (deduped), skips the agent operator-voice guard for them, and still skips in-app channels. Tests: `tests/test_human_reply.py` 2 failed → passed; 3 new sender tests failed → passed. Live: reply → `outbound_deliveries` row `reply:<id>` (failed only because Gmail is mocked) |
 | N6 | Medium | `/health` 200 with DB down; no liveness/readiness split | Open |
 | S9 | High | next@14.2.35 critical/high advisories | Open |
 | G2 / S8 (rate limit) | Medium | In-memory per-replica limiter, keyed on proxy IP | Open |

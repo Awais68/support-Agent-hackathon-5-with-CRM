@@ -357,3 +357,57 @@ async def test_internal_note_is_never_delivered(pool):
     sent_body = sender._email_sender.await_args.args[2]
     assert sent_body == event.payload["customer_reply"]
     assert event.payload["internal_note"] not in sent_body
+
+
+def _human_event(ticket_id, channel="email", reply_message_id=None, reply=None) -> KafkaMessage:
+    """What POST /tickets/{id}/reply publishes (AUDIT N5)."""
+    return KafkaMessage(
+        NOTIFICATIONS_OUTBOUND_TOPIC,
+        {
+            "ticket_id": ticket_id,
+            "customer_email": "jane@example.com",
+            "channel": channel,
+            "customer_reply": reply or "Hi Jane, I've fixed the export for you.",
+            "reply_message_id": reply_message_id or str(uuid.uuid4()),
+            "source": "human",
+        },
+    )
+
+
+async def test_human_reply_is_delivered_once(pool):
+    ticket_id = await _ticket(pool)
+    sender = _sender(pool)
+    event = _human_event(ticket_id)
+
+    assert await sender.handle(event) == "sent"
+    assert await sender.handle(event) == "duplicate"
+    sender._email_sender.assert_awaited_once_with(
+        "jane@example.com", "Cannot export CSV", "Hi Jane, I've fixed the export for you."
+    )
+    async with pool.acquire() as conn:
+        status = await conn.fetchval(
+            "SELECT status FROM outbound_deliveries WHERE idempotency_key = $1",
+            f"reply:{event.payload['reply_message_id']}",
+        )
+    assert status == "sent"
+
+
+async def test_human_whatsapp_reply_goes_to_customer_phone(pool):
+    ticket_id = await _ticket(pool, phone="+15550001111")
+    sender = _sender(pool)
+
+    assert await sender.handle(_human_event(ticket_id, channel="whatsapp")) == "sent"
+    sender._whatsapp_sender.assert_awaited_once_with(
+        "+15550001111", "Hi Jane, I've fixed the export for you."
+    )
+
+
+async def test_human_reply_is_not_blocked_by_the_agent_voice_guard(pool):
+    # The guard catches the agent leaking its notes ("I've escalated...");
+    # a human operator writing in the first person is the intended message.
+    ticket_id = await _ticket(pool)
+    sender = _sender(pool)
+    reply = "I've escalated this to our billing team and they will refund you today."
+
+    assert await sender.handle(_human_event(ticket_id, reply=reply)) == "sent"
+    sender._email_sender.assert_awaited_once()
