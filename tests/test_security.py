@@ -145,3 +145,117 @@ class TestVoiceMessageAuth:
             "/webhooks/voice/message", json={"audio_base64": "AAAA"}
         )
         assert resp.status_code == 401
+
+    def test_internal_audio_url_rejected(self, infra_client):
+        resp = infra_client.post(
+            "/webhooks/voice/message",
+            json={"audio_url": "http://169.254.169.254/latest/meta-data/"},
+            headers={"X-API-Key": "test-key-12345"},
+        )
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# SSRF guard for audio_url
+# ---------------------------------------------------------------------------
+import httpx  # noqa: E402
+
+from channels.voice_handler import VoiceHandler  # noqa: E402
+from utils import safe_fetch  # noqa: E402
+
+
+def _fake_dns(monkeypatch, addr: str):
+    async def fake_getaddrinfo(self, host, port, **kwargs):
+        return [(2, 1, 6, "", (addr, port))]
+
+    monkeypatch.setattr(
+        "asyncio.base_events.BaseEventLoop.getaddrinfo", fake_getaddrinfo
+    )
+
+
+def _transport_never_called():
+    def handler(request):  # pragma: no cover - failing here is the point
+        raise AssertionError(f"unexpected outbound request to {request.url}")
+
+    return httpx.MockTransport(handler)
+
+
+class TestAudioUrlSsrf:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://169.254.169.254/latest/meta-data/",  # cloud metadata, http
+            "https://169.254.169.254/latest/meta-data/",  # IP literal
+            "https://127.0.0.1/audio.wav",
+            "https://localhost/audio.wav",  # not allowlisted
+            "https://api:8000/health",  # internal service name
+            "https://user:pw@api.twilio.com/x.wav",  # embedded credentials
+            "file:///etc/passwd",
+        ],
+    )
+    async def test_internal_or_unlisted_urls_rejected(self, url):
+        with pytest.raises(safe_fetch.UnsafeURLError):
+            await safe_fetch.fetch_bytes(
+                url, max_bytes=1024, transport=_transport_never_called()
+            )
+
+    @pytest.mark.parametrize("addr", ["10.0.0.5", "127.0.0.1", "169.254.169.254", "::1", "::ffff:192.168.1.1"])
+    async def test_allowlisted_host_resolving_to_private_ip_rejected(self, monkeypatch, addr):
+        _fake_dns(monkeypatch, addr)
+        with pytest.raises(safe_fetch.UnsafeURLError, match="non-public"):
+            await safe_fetch.fetch_bytes(
+                "https://api.twilio.com/Recordings/RE1.wav",
+                max_bytes=1024,
+                transport=_transport_never_called(),
+            )
+
+    async def test_redirect_to_internal_host_rejected(self, monkeypatch):
+        _fake_dns(monkeypatch, "54.172.60.1")
+        seen = []
+
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(302, headers={"location": "http://169.254.169.254/"})
+
+        with pytest.raises(safe_fetch.UnsafeURLError):
+            await safe_fetch.fetch_bytes(
+                "https://api.twilio.com/Recordings/RE1.wav",
+                max_bytes=1024,
+                transport=httpx.MockTransport(handler),
+            )
+        assert seen == ["https://api.twilio.com/Recordings/RE1.wav"]
+
+    async def test_oversized_body_rejected(self, monkeypatch):
+        _fake_dns(monkeypatch, "54.172.60.1")
+        transport = httpx.MockTransport(lambda r: httpx.Response(200, content=b"x" * 2048))
+        with pytest.raises(safe_fetch.UnsafeURLError, match="size"):
+            await safe_fetch.fetch_bytes(
+                "https://api.twilio.com/Recordings/RE1.wav",
+                max_bytes=1024,
+                transport=transport,
+            )
+
+    async def test_allowlisted_public_url_with_cdn_redirect_is_fetched(self, monkeypatch):
+        _fake_dns(monkeypatch, "54.172.60.1")
+
+        def handler(request):
+            if request.url.host == "api.twilio.com":
+                return httpx.Response(307, headers={"location": "https://media.twiliocdn.com/a.wav"})
+            return httpx.Response(200, content=b"RIFFdata")
+
+        body = await safe_fetch.fetch_bytes(
+            "https://api.twilio.com/Recordings/RE1.wav",
+            max_bytes=1024,
+            transport=httpx.MockTransport(handler),
+        )
+        assert body == b"RIFFdata"
+
+    async def test_resolve_audio_returns_none_for_internal_url(self):
+        assert await VoiceHandler.resolve_audio(audio_url="http://localhost:5432/") is None
+
+    def test_host_allowlist_is_env_configurable(self, monkeypatch):
+        monkeypatch.setenv("AUDIO_URL_ALLOWED_HOSTS", "*.example-cdn.com")
+        patterns = safe_fetch.allowed_hosts()
+        assert safe_fetch.host_is_allowed("media.example-cdn.com", patterns)
+        assert not safe_fetch.host_is_allowed("example-cdn.com.evil.io", patterns)
+        assert not safe_fetch.host_is_allowed("api.twilio.com", patterns)

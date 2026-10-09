@@ -33,6 +33,7 @@ import structlog
 from chat_provider import chat_model
 from exceptions import sanitize_error_message
 from kafka_client import KafkaProducerClient, create_inbound_voice_message
+from utils import safe_fetch
 from utils.circuit_breaker import get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
@@ -465,14 +466,13 @@ class VoiceHandler:
                 logger.warning("Invalid base64 audio", error=sanitize_error_message(str(e)))
                 return None
         if audio_url:
+            # audio_url is caller-controlled: fetch it only through the SSRF
+            # guard (https + host allowlist + public IPs + size/time limits).
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.get(audio_url)
-                    resp.raise_for_status()
-                    if len(resp.content) > max_bytes:
-                        logger.warning("Audio download too large", size=len(resp.content))
-                        return None
-                    return resp.content
+                return await safe_fetch.fetch_bytes(audio_url, max_bytes=max_bytes)
+            except safe_fetch.UnsafeURLError as e:
+                logger.warning("Rejected audio_url", reason=str(e))
+                return None
             except Exception as e:
                 logger.warning("Audio download failed", error=sanitize_error_message(str(e)))
                 return None
