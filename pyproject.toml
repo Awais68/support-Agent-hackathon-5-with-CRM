@@ -51,9 +51,11 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
     "locust>=2.17.0",
-    "black>=24.1.0",
-    "ruff>=0.2.0",
-    "mypy>=1.8.0",
+    # Checkers are pinned: a new release can add rules and turn CI red with no
+    # code change. Bump them on purpose, together with the fixes they ask for.
+    "black==26.10.0",
+    "ruff==0.16.10",
+    "mypy==2.4.0",
     # E2E browser testing
     "playwright>=1.40.0",
     "pytest-playwright>=0.4.0",
