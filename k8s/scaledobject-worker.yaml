@@ -48,7 +48,6 @@ spec:
   maxReplicaCount: 10
   pollingInterval: 15
   cooldownPeriod: 60
-  idleReplicaCount: 0
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
@@ -70,20 +69,38 @@ spec:
             periodSeconds: 60
           selectPolicy: Max
   triggers:
+  # One trigger per inbound topic the worker subscribes to; the HPA KEDA
+  # creates scales on the max across triggers.
   - type: kafka
     metadata:
-      bootstrapServers: kafka-0.kafka-headless.techflow.svc.cluster.local:9092,kafka-1.kafka-headless.techflow.svc.cluster.local:9092,kafka-2.kafka-headless.techflow.svc.cluster.local:9092
-      consumerGroup: techflow-worker-group
-      topic: techflow-messages
+      # Read from the worker container's env (techflow-config/kafka-servers)
+      # so KEDA watches the same brokers the worker consumes from.
+      bootstrapServersFromEnv: KAFKA_BOOTSTRAP_SERVERS
+      # Must match workers/message_processor.py (group_id + subscribed topics)
+      # and kafka_client.py topic constants.
+      consumerGroup: techflow-message-processor
+      topic: inbound.email
       lagThreshold: "100"
-      offsetResetPolicy: latest
-      partitionLimitation: "false"
-      # For multiple topics, comma-separate:
-      # topic: topic1,topic2
-      # For lag threshold per partition:
-      # lagThreshold: "50"
-      # Default: average lag across all partitions is compared
-      # allowIdleConsumers: "true"
+      # Matches the consumer's auto_offset_reset="earliest" (kafka_client.py).
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServersFromEnv: KAFKA_BOOTSTRAP_SERVERS
+      consumerGroup: techflow-message-processor
+      topic: inbound.whatsapp
+      lagThreshold: "100"
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServersFromEnv: KAFKA_BOOTSTRAP_SERVERS
+      consumerGroup: techflow-message-processor
+      topic: inbound.webform
+      lagThreshold: "100"
+      offsetResetPolicy: earliest
     authenticationRef:
       name: keda-kafka-auth
   - type: cpu
@@ -107,12 +124,13 @@ spec:
 #
 # 3. minReplicaCount: 2 — prevents zero-scale for critical workers
 #    maxReplicaCount: 10 — upper limit
-#    idleReplicaCount: 0 — only active if separate idle mode is desired
+#    No idleReplicaCount: with it set to 0, KEDA would scale the workers to
+#    zero whenever there is no lag, defeating minReplicaCount.
 #
 # 4. For PLAINTEXT Kafka (no auth), remove `authenticationRef` entirely.
 #
-# 5. Verify consumer group & topic names match your application's config.
-#    Current configmap at k8s/configmap.yaml -> kafka-servers.
+# 5. consumerGroup/topics match workers/message_processor.py; brokers come
+#    from the worker's KAFKA_BOOTSTRAP_SERVERS (k8s/configmap.yaml).
 #
 # 6. To test: produce messages to the topic and watch replica count increase:
 #    kubectl get hpa -n techflow -w
