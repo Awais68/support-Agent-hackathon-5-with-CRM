@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 class ChaosConfig:
     api_url: str = os.getenv("TECHFLOW_API_URL", "http://localhost:8000")
     api_key: str = os.getenv("TECHFLOW_API_KEY", "")
-    docker_network: str = os.getenv("TECHFLOW_DOCKER_NETWORK", "techflow_default")
+    docker_network: str = os.getenv("TECHFLOW_DOCKER_NETWORK", "")
     compose_project: str = os.getenv("TECHFLOW_COMPOSE_PROJECT", "")
 
     health_timeout: int = int(os.getenv("CHAOS_HEALTH_TIMEOUT", "60"))

@@ -1,8 +1,14 @@
-name: Chaos Engineering — Weekly Staging Run
+name: Chaos Engineering
+
+# AUDIT N3: the old workflow never parsed (a `python -c` block at column 0
+# broke the YAML, a bash `if` had no `fi`) and probed localhost:8000 on a
+# runner where nothing was running. The experiments drive Docker directly, so
+# they run against a compose stack started inside this job. All external
+# providers point at a closed port: the run spends nothing and sends nothing.
 
 on:
   schedule:
-    # Run every Monday at 03:00 UTC
+    # Every Monday at 03:00 UTC
     - cron: "0 3 * * 1"
   workflow_dispatch:
     inputs:
@@ -11,120 +17,94 @@ on:
         required: true
         default: "all"
         type: choice
-        options:
-          - all
-          - "01"
-          - "02"
-          - "03"
-          - "04"
-          - "05"
-          - "06"
-      dry_run:
-        description: "Dry run (preview without injecting failures)"
-        required: false
-        default: false
-        type: boolean
+        options: [all, "01", "02", "03", "04", "05", "06"]
 
-# SAFETY: This workflow ONLY runs on staging/deployment via environment protection rules.
-# Production environment is NEVER selected.
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos
+  cancel-in-progress: false
+
 env:
-  TECHFLOW_ENV: staging
-  TECHFLOW_CONFIRM_CHAOS: "yes"
+  TECHFLOW_ENV: ci
+  COMPOSE_PROJECT_NAME: techflow-chaos
+  TECHFLOW_COMPOSE_PROJECT: techflow-chaos
+  TECHFLOW_API_URL: http://localhost:8000
+  # Throwaway key for the job's own stack, never a real secret.
+  API_KEY: chaos-ci-key
+  TECHFLOW_API_KEY: chaos-ci-key
+  OPENROUTER_API_KEY: mock-not-a-key
+  OPENROUTER_BASE_URL: http://127.0.0.1:9/v1
+  GEMINI_API_KEY: ""
+  GEMINI_BASE_URL: http://127.0.0.1:9/v1
+  DEEPSEEK_API_KEY: ""
+  GROQ_API_KEY: ""
+  OPENAI_API_KEY: ""
+  TWILIO_ACCOUNT_SID: ""
+  TWILIO_AUTH_TOKEN: ""
+  GMAIL_CLIENT_ID: ""
+  GMAIL_CLIENT_SECRET: ""
+  ENABLE_GMAIL_POLLING: "false"
+  CHAOS_DISRUPTION_DURATION: "10"
+  CHAOS_RECOVERY_TIMEOUT: "120"
 
 jobs:
-  safety-check:
+  chaos:
     runs-on: ubuntu-latest
-    environment: staging
-    steps:
-      - name: Assert non-production environment
-        run: |
-          echo "Running chaos tests in: ${{ github.ref_name }} / ${{ github.environment }}"
-          if [ "${{ github.environment }}" = "production" ]; then
-            echo "FATAL: Chaos experiments cannot target production environment!"
-            exit 1
-          fi
-          echo "Environment safety check passed"
-
-  chaos-run:
-    needs: safety-check
-    runs-on: ubuntu-latest
-    environment: staging
-
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install httpx
-          echo "Docker and docker compose should be pre-installed on the runner"
+      - name: Install the chaos runner's dependency
+        run: pip install httpx
 
-      - name: Verify stack is healthy (pre-check)
+      - name: Start the stack
         run: |
-          echo "Checking system health before chaos injection..."
-          python -c "
-import httpx
-try:
-    r = httpx.get('http://localhost:8000/health', timeout=10)
-    data = r.json()
-    assert data.get('status') == 'healthy', f'System not healthy: {data}'
-    print(f'Pre-check passed: {data}')
-except Exception as e:
-    print(f'Pre-check failed: {e}')
-    exit(1)
-"
+          docker compose up -d --build --wait --wait-timeout 600 \
+            postgres zookeeper kafka migrate kb-embed api worker prometheus
+          curl -fsS "$TECHFLOW_API_URL/readyz"
 
       - name: Run chaos experiments
-        id: chaos
         run: |
-          EXPERIMENT="${{ github.event.inputs.experiment || 'all' }}"
-          DRY_RUN_FLAG="${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}"
-
-          RESULTS_FILE="chaos-results-${{ github.run_id }}.json"
-          python -m chaos.runner \
-            --experiment "$EXPERIMENT" \
+          python -u -m chaos.runner \
+            --experiment "${{ inputs.experiment || 'all' }}" \
             --yes \
-            $DRY_RUN_FLAG \
-            --output "$RESULTS_FILE"
+            --output chaos-results.json
 
-          echo "results_file=$RESULTS_FILE" >> $GITHUB_OUTPUT
+      - name: Summary
+        if: always()
+        run: |
+          if [ ! -f chaos-results.json ]; then
+            echo "No results file: the runner did not finish" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "| Experiment | Status | Recovery (s) | Errors |"
+            echo "|---|---|---|---|"
+            jq -r '.results[] | "| \(.experiment_name) | \(.status) | \(.recovery_time_seconds // "-") | \(.errors_observed | join("; ")) |"' chaos-results.json
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload chaos results
+      - name: Container state and logs
+        if: failure()
+        run: |
+          docker ps -a
+          docker inspect -f '{{.Name}} restarts={{.RestartCount}} exit={{.State.ExitCode}}' $(docker ps -aq)
+          docker compose logs --no-color --tail=200 api worker
+
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: chaos-results
-          path: chaos-results-${{ github.run_id }}.json
+          name: chaos-results-${{ github.run_id }}
+          path: chaos-results.json
+          if-no-files-found: ignore
           retention-days: 90
 
-      - name: Report summary
+      - name: Tear down
         if: always()
-        run: |
-          RESULTS_FILE="${{ steps.chaos.outputs.results_file }}"
-          if [ -f "$RESULTS_FILE" ]; then
-            python -c "
-import json
-with open('$RESULTS_FILE') as f:
-    data = json.load(f)
-print(f'Total: {data[\"total\"]}')
-print(f'Passed: {data[\"passed\"]}')
-print(f'Failed: {data[\"failed\"]}')
-print(f'Errors: {data[\"errors\"]}')
-for r in data['results']:
-    status_icon = '✅' if r['status'] == 'passed' else '❌' if r['status'] == 'failed' else '⚠️'
-    rt = f\" ({r['recovery_time_seconds']}s)\" if r.get('recovery_time_seconds') else ''
-    print(f'{status_icon} {r[\"experiment_name\"]}: {r[\"status\"]}{rt}')
-"
-          else:
-            echo "No results file found"
-
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "::warning::Chaos experiments failed! Check uploaded artifacts for details."
+        run: docker compose down -v --remove-orphans

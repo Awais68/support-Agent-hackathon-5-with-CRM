@@ -123,6 +123,41 @@ class ChaosExperiment(ABC):
     def _docker(self, action: str, container: str, *args: str) -> tuple[int, str]:
         return self._run_cmd(["docker", action, container, *args])
 
+    def _crash(self, container: str) -> tuple[int, str]:
+        """Make the container's main process exit, like a crash.
+
+        `docker kill` counts as a manual stop, so Docker never applies the
+        restart policy and the experiment can only fail. Signalling PID 1
+        from inside the container makes it exit on its own, which is what the
+        restart policy (compose) or the kubelet (k8s) has to recover from.
+        """
+        return self._docker(
+            "exec", container, "python", "-c", "import os, signal; os.kill(1, signal.SIGTERM)"
+        )
+
+    def _container_health(self, container: str) -> str:
+        code, output = self._docker("inspect", container, "--format", "{{.State.Health.Status}}")
+        return output.strip() if code == 0 else "missing"
+
+    def _wait_for_container_healthy(self, container: str, timeout: int | None = None) -> bool:
+        """Wait for the container's own healthcheck (the worker heartbeat probe)."""
+        timeout = timeout or self.config.recovery_timeout
+        deadline = time.time() + timeout
+        status = "unknown"
+        while time.time() < deadline:
+            status = self._container_health(container)
+            if status == "healthy":
+                return True
+            time.sleep(self.config.recovery_interval)
+        self.errors.append(f"{container} not healthy within {timeout}s (last: {status})")
+        return False
+
+    def _wait_for_system_and_worker(self) -> bool:
+        # API health alone passed even when the worker never came back.
+        return self._wait_for_healthy() and self._wait_for_container_healthy(
+            self.config.container_names["worker"]
+        )
+
     def log(self, message: str) -> None:
         ts = datetime.now(UTC).strftime("%H:%M:%S")
         print(f"[{ts}] [{self.name}] {message}")
@@ -162,9 +197,14 @@ class ChaosExperiment(ABC):
         recovered = self.verify_recovery()
         recovery_time = time.time() - recovery_start
 
-        if recovered:
+        # An error during inject means the failure was not injected or the
+        # degraded behaviour was wrong; recovering from that proves nothing.
+        if recovered and not self.errors:
             status = "passed"
             self.log(f"Recovered in {recovery_time:.1f}s")
+        elif recovered:
+            status = "failed"
+            self.log(f"Recovered, but errors were observed: {self.errors}")
         else:
             status = "failed"
             self.log(f"Did not recover within timeout ({recovery_time:.1f}s)")

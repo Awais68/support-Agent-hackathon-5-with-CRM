@@ -28,4 +28,4 @@ class KafkaRestartExperiment(ChaosExperiment):
             if code == 0:
                 break
             time.sleep(3)
-        return self._wait_for_healthy(timeout=self.config.recovery_timeout)
+        return self._wait_for_system_and_worker()
