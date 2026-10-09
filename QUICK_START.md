@@ -113,7 +113,7 @@ curl http://localhost:8000/metrics/dashboard \
 Open your browser to:
 - **Prometheus**: http://localhost:9090
 - **Grafana**: http://localhost:3000 (login: admin/admin)
-- **API Metrics**: http://localhost:8000/metrics
+- **API Metrics**: internal port 9100, scraped by Prometheus (`docker exec techflow-api curl -s http://localhost:9100/metrics`)
 
 ### Key Metrics to Watch
 
@@ -378,7 +378,7 @@ curl "http://localhost:8000/knowledge-base?q=test&limit=20" \
 ### Prometheus not collecting metrics?
 ```bash
 # Check if API is exporting metrics
-curl http://localhost:8000/metrics | head -20
+docker exec techflow-api curl -s http://localhost:9100/metrics | head -20
 
 # Verify Prometheus can scrape
 curl http://localhost:9090/api/v1/query?query=up

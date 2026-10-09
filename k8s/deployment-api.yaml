@@ -18,6 +18,10 @@ spec:
       maxUnavailable: 0
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: /metrics
       labels:
         app: api
         version: v1
@@ -29,6 +33,11 @@ spec:
         ports:
         - containerPort: 8000
           name: http
+          protocol: TCP
+        # Prometheus scrapes this pod port directly; the Service and ingress
+        # only carry 8000, so metrics are not public (S11).
+        - containerPort: 9100
+          name: metrics
           protocol: TCP
         env:
         - name: DATABASE_URL

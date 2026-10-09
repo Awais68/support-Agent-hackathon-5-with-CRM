@@ -5,7 +5,8 @@ global:
 scrape_configs:
   - job_name: "techflow-api"
     static_configs:
-      - targets: ["techflow-api:8000"]
+      # Internal metrics port (METRICS_PORT), never the public API port (S11).
+      - targets: ["techflow-api:9100"]
     metrics_path: /metrics
     scrape_interval: 15s
     scrape_timeout: 10s

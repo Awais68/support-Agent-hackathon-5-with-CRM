@@ -13,7 +13,7 @@ it behind a proxy. Code: `api/rate_limiter.py` (slowapi), decorators in
 | Strict | 10/min | `STRICT_RATE_LIMIT_PER_MINUTE` | `POST /tickets/{id}/reply`, `/webhooks/whatsapp`, `/webhooks/webform`, `/webhooks/voice/message`, `/webhooks/voice/call`, `/voice/transcribe`, `/voice/translate`, `POST /customers/{id}/merge`, `/knowledge-base/ingest` |
 | Fixed | 20/min | — | `POST /tickets` |
 | Fixed | 30/min | — | `GET /public/tickets/{number}`, `/customers/{email}/history`, `/customers/review-queue`, `POST /customers/{id}/review/dismiss` |
-| Exempt | — | — | `/health`, `/livez`, `/readyz`, `/metrics` |
+| Exempt | — | — | `/health`, `/livez`, `/readyz` (metrics are on the internal port 9100, outside the app) |
 
 The WebSocket is not rate limited. Over the limit the API answers
 `429 {"error":"RATE_LIMIT_EXCEEDED"}` with `Retry-After`.

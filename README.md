@@ -249,7 +249,7 @@ flowchart LR
 | Live ticket updates | WebSocket broadcast of `ticket_update` and `new_message` | `api/websocket_manager.py`, `web-form/src/components/TicketStatus.tsx` |
 | Rate limiting & auth | `X-API-Key` middleware; slowapi limits per IP, optionally stored in Redis | `api/main.py`, `api/rate_limiter.py` |
 | Circuit breakers | Per-service breakers, configurable with `CB_<NAME>_*` env vars | `utils/circuit_breaker.py` |
-| Metrics | Prometheus `/metrics`; DB-aggregated dashboard metrics every 300 s | `metrics.py`, `workers/metrics_collector.py`, `/metrics/*` |
+| Metrics | Prometheus on internal port 9100 (`METRICS_PORT`); DB-aggregated dashboard metrics every 300 s | `metrics.py`, `workers/metrics_collector.py`, `/metrics/*` |
 | Chaos testing | 6 docker-based experiments behind a safety guard | `chaos/` |
 | Secret scanning | gitleaks in CI plus local git hooks | `.github/workflows/secret-scan.yml`, `scripts/check-secrets.sh` |
 
@@ -495,7 +495,7 @@ Precedence (`env_config.py`): shell env > `.env.<ENVIRONMENT>` > `.env`. `ENVIRO
 ## API Endpoints
 
 All endpoints are in `api/main.py`. Every route needs the `X-API-Key` header **except** `/health`,
-`/metrics`, `/webhooks/whatsapp`, `/webhooks/webform`, `/webhooks/voice/message`,
+`/webhooks/whatsapp`, `/webhooks/webform`, `/webhooks/voice/message`,
 `/webhooks/voice/call`, and the WebSocket. The default rate limit is 100/min per IP. *Strict* means
 10/min.
 Limits are per process unless `REDIS_URL` is set, and behind the web-form proxy or an ingress
@@ -509,7 +509,7 @@ Error responses use the shape `{"error": "<CODE>", "message": "...", "details"?}
 | Method | Path | Request | Response |
 |---|---|---|---|
 | GET | `/health` | — | `{status: "healthy"\|"degraded", db: "ok"\|"error", kafka: "ok"\|"disabled"\|"error"}` |
-| GET | `/metrics` | — | Prometheus text format |
+| GET | `:9100/metrics` (internal port `METRICS_PORT`, not the API port) | — | Prometheus text format; not exposed by ingress, Render or the compose host mapping |
 | GET | `/metrics/summary` | `?hours=24` | `{period_hours, metrics, count}` |
 | GET | `/metrics/dashboard` | — | `{status_counts, avg_resolution_hours, escalation_rate_percent, channel_counts, total_tickets}` |
 

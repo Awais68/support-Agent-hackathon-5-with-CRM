@@ -6,6 +6,17 @@ from chaos.experiments.base import ChaosExperiment
 class MetricsPipelineExperiment(ChaosExperiment):
     name = "06_metrics_pipeline"
 
+    def _metrics_served(self) -> bool:
+        # Metrics are on the internal port (S11), not reachable from the host.
+        code, output = self._docker(
+            "exec",
+            self.config.container_names["api"],
+            "curl",
+            "-fsS",
+            "http://localhost:9100/metrics",
+        )
+        return code == 0 and "python_info" in output
+
     def inject(self) -> None:
         self.log(f"Stopping Prometheus container: {self.config.container_names['prometheus']}")
         code, output = self._docker("stop", self.config.container_names["prometheus"])
@@ -23,8 +34,7 @@ class MetricsPipelineExperiment(ChaosExperiment):
                 r = httpx.get(f"{self.config.api_url}/health", timeout=5)
                 if r.status_code == 200:
                     system_ok = True
-                r2 = httpx.get(f"{self.config.api_url}/metrics", timeout=5)
-                if r2.status_code == 200:
+                if self._metrics_served():
                     metrics_ok = True
                 if system_ok and metrics_ok:
                     break

@@ -85,8 +85,8 @@ curl -s http://localhost:8000/tickets \
 curl -s http://localhost:8000/customers/test@example.com/history \
   -H "X-API-Key: test-key-12345"
 
-# Metrics
-curl -s http://localhost:8000/metrics
+# Metrics (internal port, not published)
+docker exec techflow-api curl -s http://localhost:9100/metrics
 ```
 
 ### 5. View Logs
@@ -202,8 +202,8 @@ curl http://localhost:8000/health
 ### Prometheus Metrics
 
 ```bash
-kubectl port-forward -n techflow service/techflow-api 8000:8000 &
-curl http://localhost:8000/metrics
+kubectl port-forward -n techflow deployment/techflow-api 9100:9100 &
+curl http://localhost:9100/metrics
 ```
 
 ### Grafana Dashboard

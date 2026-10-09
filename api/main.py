@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from openai import APIError as OpenAIAPIError
 from openai import AsyncOpenAI
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import start_http_server
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from slowapi.errors import RateLimitExceeded
@@ -318,7 +318,6 @@ async def verify_api_key(request: Request, x_api_key: str | None = Header(None))
         "/health",
         "/livez",
         "/readyz",
-        "/metrics",
         "/webhooks/whatsapp",
         "/webhooks/webform",
         # Authenticated by Twilio signature inside the handler, not by API key.
@@ -411,6 +410,16 @@ async def lifespan(app: FastAPI):
 
     app.state.mcp_server = mcp_server
     logger.info("MCP server initialized")
+
+    global _metrics_server
+    if _metrics_server is None:
+        try:
+            _metrics_server = start_metrics_server()
+            if _metrics_server is not None:
+                logger.info("Metrics server started", port=_metrics_server.server_port)
+        except OSError as e:
+            # Metrics are not worth refusing traffic over.
+            logger.error("Metrics server failed to start", error=str(e))
 
     yield
 
@@ -568,12 +577,21 @@ async def health_check(request: Request) -> JSONResponse:
     return await _readiness(request)
 
 
-# Prometheus metrics endpoint
-@app.get("/metrics", include_in_schema=False)
-@limiter.exempt
-async def prometheus_metrics(request: Request) -> Response:
-    """Prometheus metrics endpoint."""
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+# Prometheus metrics are served on their own internal port, never on the
+# public app (S11): ingress, Render and the compose host mapping only expose
+# the API port, so counters and sentiment metrics stay inside the network.
+DEFAULT_METRICS_PORT = 9100
+_metrics_server: Any = None
+
+
+def start_metrics_server(port: int | None = None, addr: str = "0.0.0.0") -> Any:
+    """Start the metrics HTTP server; METRICS_PORT=0 turns it off."""
+    if port is None:
+        port = int(os.getenv("METRICS_PORT", str(DEFAULT_METRICS_PORT)))
+        if port == 0:
+            return None
+    server, _thread = start_http_server(port, addr=addr)
+    return server
 
 
 def _websocket_authorized(websocket: WebSocket, ticket_id: UUID) -> bool:

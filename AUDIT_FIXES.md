@@ -75,7 +75,7 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 |---|---|---|---|
 | S8 | Medium | No body size cap; 2 MB echoed in 422; no spend cap | Open |
 | S10 | Medium | WhatsApp signature fails open; no URL override | Fixed: `REQUIRE_TWILIO_SIGNATURE` defaults to true and is read per request, so without `TWILIO_AUTH_TOKEN` an unsigned webhook gets 403 (`false` only for local/load tests). The signature URL is `TWILIO_WHATSAPP_WEBHOOK_URL` (or the already documented, previously ignored `TWILIO_WEBHOOK_URL`), else the request URL. Tests: `tests/test_whatsapp_signature.py` 3 failed → 5 passed (unsigned forged message accepted; public-URL signature rejected behind a proxy; wrong-URL signature accepted) |
-| S11 | Medium | `/metrics` unauthenticated | Open |
+| S11 | Medium | `/metrics` unauthenticated | Fixed: the public app no longer has `/metrics` (401 without a key, 404 with one). Metrics are served by `prometheus_client` on the internal port `METRICS_PORT` (default 9100, `0` disables), which ingress, the k8s Service, Render and the compose host mapping do not expose. Prometheus scrapes `techflow-api:9100`; k8s gets a `metrics` container port plus scrape annotations; chaos 06 checks the port from inside the container. Tests: `tests/test_metrics_exposure.py` (exploit: GET `/metrics` without a key returned 200 with all metrics). Live: host `:8000/metrics` 401, host `:9100` refused, in-container `:9100` 200, Prometheus target `techflow-api:9100` up, chaos 06 passed |
 | S12 | Low | Default creds, ports on 0.0.0.0 | Open |
 | S14 | Info | Public repo; keep secrets out; pin gitleaks | Open |
 | N7 | Medium | Web-form `/webhooks/*` rewrite → container localhost | Open |
