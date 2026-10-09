@@ -175,7 +175,19 @@ sample of real tickets is the next step.
 
 ### CI status
 
-CI_STATUS_PLACEHOLDER
+PR [#1](https://github.com/Awais68/support-Agent-hackathon-5-with-CRM/pull/1), at 8662ed3, all green:
+
+| Check | Result |
+|---|---|
+| Backend — Lint & Test | ✅ 230 passed, 14 deselected |
+| Backend — Live-stack tests (Kafka + API + Playwright) | ✅ 14 passed (~1m47s job) |
+| Frontend — Lint & Build | ✅ |
+| Secret scan (push + PR) | ✅ |
+
+The first run had a red secret scan. gitleaks `curl-auth-header` flagged the placeholder
+`X-API-Key: local-dev-key` in a README curl example (0523db0, round 1). The example now uses
+`$API_KEY`, and `.gitleaksignore` lists that one historical fingerprint (8662ed3). History was not
+rewritten. Not merged.
 
 ### New findings (round 2, not fixed)
 
