@@ -27,6 +27,7 @@ from kafka_client import (
     KafkaProducerClient,
     NoOpKafkaProducer,
 )
+from utils.redact import redact_dsn
 from workers.metrics_collector import run_metrics_collector
 from workers.notification_sender import run_notification_sender_loop
 
@@ -301,7 +302,7 @@ async def main():
 
     logger.info(
         "Starting message processor worker",
-        db_url=db_url,
+        db_url=redact_dsn(db_url),
         kafka_bootstrap=kafka_bootstrap,
     )
 

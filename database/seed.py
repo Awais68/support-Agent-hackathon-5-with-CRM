@@ -23,6 +23,7 @@ import structlog
 from embeddings_provider import build_embedding_provider
 from env_config import load_environment
 from exceptions import sanitize_error_message
+from utils.redact import redact_dsn
 
 logger = structlog.get_logger(__name__)
 
@@ -374,7 +375,7 @@ async def main() -> None:
         "postgresql://techflow:techflow@localhost:5432/techflow",
     )
 
-    logger.info("Connecting to database", db_url=db_url)
+    logger.info("Connecting to database", db_url=redact_dsn(db_url))
     pool_min = int(os.getenv("DATABASE_POOL_MIN", "1"))
     pool_max = int(os.getenv("DATABASE_POOL_MAX", "5"))
     db_ssl = os.getenv("DATABASE_SSL", "disable")
