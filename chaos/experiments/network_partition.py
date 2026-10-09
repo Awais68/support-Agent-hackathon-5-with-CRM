@@ -10,9 +10,15 @@ class NetworkPartitionExperiment(ChaosExperiment):
         worker = self.config.container_names["worker"]
         network = self.config.docker_network
         self.log(f"Disconnecting {worker} from {network}")
-        code, output = self._run_cmd([
-            "docker", "network", "disconnect", network, worker,
-        ])
+        code, output = self._run_cmd(
+            [
+                "docker",
+                "network",
+                "disconnect",
+                network,
+                worker,
+            ]
+        )
         if code != 0:
             self.errors.append(f"docker network disconnect failed: {output}")
 
@@ -23,9 +29,15 @@ class NetworkPartitionExperiment(ChaosExperiment):
         worker = self.config.container_names["worker"]
         network = self.config.docker_network
         self.log(f"Reconnecting {worker} to {network}")
-        code, output = self._run_cmd([
-            "docker", "network", "connect", network, worker,
-        ])
+        code, output = self._run_cmd(
+            [
+                "docker",
+                "network",
+                "connect",
+                network,
+                worker,
+            ]
+        )
         if code != 0:
             self.errors.append(f"docker network connect failed: {output}")
 

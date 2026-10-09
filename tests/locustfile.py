@@ -8,13 +8,12 @@ Models all three webhook channels as weighted HttpUser tasks:
 Tracks P95 latency (<3s target) and escalation-vs-resolved ratio (<25% target).
 """
 
-import json
 import logging
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any
 
-from locust import HttpUser, events, task, between
+from locust import HttpUser, between, events, task
 
 logger = logging.getLogger(__name__)
 
@@ -23,17 +22,19 @@ logger = logging.getLogger(__name__)
 # Event-level accumulators (reset per test)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PerChannel:
     count: int = 0
     failures: int = 0
     slow_count: int = 0  # >3s
-    latencies: List[float] = field(default_factory=list)
+    latencies: list[float] = field(default_factory=list)
     escalated: int = 0
     resolved: int = 0
 
-_channel_stats: Dict[str, PerChannel] = {}
-_slow_requests: List[dict] = []
+
+_channel_stats: dict[str, PerChannel] = {}
+_slow_requests: list[dict] = []
 
 
 def _ensure(name: str) -> PerChannel:
@@ -45,6 +46,7 @@ def _ensure(name: str) -> PerChannel:
 # ---------------------------------------------------------------------------
 # Request hook – fires on every HTTP response
 # ---------------------------------------------------------------------------
+
 
 @events.request.add_listener
 def _on_request(
@@ -96,58 +98,88 @@ def _on_request(
 # channels/web_form_handler.py)
 # ---------------------------------------------------------------------------
 
-WEBFORM_SCENARIOS: List[Dict[str, str]] = [
-    {"subject": "How do I connect my data source?",
-     "message": "I'm trying to connect my PostgreSQL database to TechFlow but I can't find the connection settings. Can you help?",
-     "category": "technical"},
-    {"subject": "Billing question about duplicate charge",
-     "message": "I was charged twice this month. Can you help me get a refund for the duplicate charge?",
-     "category": "billing"},
-    {"subject": "Dashboard not loading properly",
-     "message": "The analytics dashboard has been loading for over 5 minutes. It was working fine yesterday.",
-     "category": "technical"},
-    {"subject": "Need to cancel subscription",
-     "message": "I need to cancel my subscription due to budget cuts. Please process the cancellation.",
-     "category": "billing"},
-    {"subject": "New feature request for Snowflake",
-     "message": "It would be great if you could add support for Snowflake as a data source connector.",
-     "category": "feedback"},
-    {"subject": "User permissions issue",
-     "message": "My team members can't access the reports I created. How do I set up proper permissions?",
-     "category": "technical"},
-    {"subject": "Data export problem with PDF",
-     "message": "When I try to export my dashboard as PDF, the charts are blurry. Is there a known fix?",
-     "category": "bug"},
-    {"subject": "Trial extension request",
-     "message": "We need more time to evaluate the platform. Can you extend our trial by 2 weeks?",
-     "category": "general"},
-    {"subject": "API rate limits during batch processing",
-     "message": "We're hitting API rate limits during our nightly batch processing window. Can we get a temporary increase?",
-     "category": "technical"},
-    {"subject": "Integration with Slack",
-     "message": "How do I set up Slack notifications for dashboard alerts? I followed the docs but it failed.",
-     "category": "technical"},
+WEBFORM_SCENARIOS: list[dict[str, str]] = [
+    {
+        "subject": "How do I connect my data source?",
+        "message": "I'm trying to connect my PostgreSQL database to TechFlow but I can't find the connection settings. Can you help?",
+        "category": "technical",
+    },
+    {
+        "subject": "Billing question about duplicate charge",
+        "message": "I was charged twice this month. Can you help me get a refund for the duplicate charge?",
+        "category": "billing",
+    },
+    {
+        "subject": "Dashboard not loading properly",
+        "message": "The analytics dashboard has been loading for over 5 minutes. It was working fine yesterday.",
+        "category": "technical",
+    },
+    {
+        "subject": "Need to cancel subscription",
+        "message": "I need to cancel my subscription due to budget cuts. Please process the cancellation.",
+        "category": "billing",
+    },
+    {
+        "subject": "New feature request for Snowflake",
+        "message": "It would be great if you could add support for Snowflake as a data source connector.",
+        "category": "feedback",
+    },
+    {
+        "subject": "User permissions issue",
+        "message": "My team members can't access the reports I created. How do I set up proper permissions?",
+        "category": "technical",
+    },
+    {
+        "subject": "Data export problem with PDF",
+        "message": "When I try to export my dashboard as PDF, the charts are blurry. Is there a known fix?",
+        "category": "bug",
+    },
+    {
+        "subject": "Trial extension request",
+        "message": "We need more time to evaluate the platform. Can you extend our trial by 2 weeks?",
+        "category": "general",
+    },
+    {
+        "subject": "API rate limits during batch processing",
+        "message": "We're hitting API rate limits during our nightly batch processing window. Can we get a temporary increase?",
+        "category": "technical",
+    },
+    {
+        "subject": "Integration with Slack",
+        "message": "How do I set up Slack notifications for dashboard alerts? I followed the docs but it failed.",
+        "category": "technical",
+    },
 ]
 
-GMAIL_SCENARIOS: List[Dict[str, str]] = [
-    {"subject": "Enterprise plan pricing inquiry",
-     "message": "Dear TechFlow Support,\n\nI am interested in your enterprise plan. Please provide details on data source compatibility, user management, and compliance certifications.\n\nBest regards,\nSarah Johnson\nCTO, HealthData Inc.",
-     "category": "general"},
-    {"subject": "Connector configuration failure",
-     "message": "Hello,\n\nWe've been trying to configure the Google Analytics connector for 3 days but keep getting auth errors. The error says 'token_expired' even after regenerating the API key.\n\nRegards,\nMike Chen",
-     "category": "technical"},
-    {"subject": "Data processing agreement review",
-     "message": "To Whom It May Concern,\n\nOur legal team has concerns about the data residency clause in your DPA. As a financial institution we require EU-only data storage. Please confirm compliance.\n\nSincerely,\nJames Wilson\nLegal Counsel",
-     "category": "general"},
-    {"subject": "Account downgrade request",
-     "message": "Hello Support,\n\nDue to budget cuts we need to downgrade from Professional to Starter. Please advise on feature loss and data retention.\n\nThank you,\nEmily Park",
-     "category": "general"},
-    {"subject": "Performance optimization for 50M+ row datasets",
-     "message": "Hi TechFlow Team,\n\nDashboard load times increased from 2s to 45s on datasets >50M rows. We have 15 concurrent users and 8 widgets. Please suggest optimization strategies.\n\nBest,\nDr. Alan Turing",
-     "category": "technical"},
+GMAIL_SCENARIOS: list[dict[str, str]] = [
+    {
+        "subject": "Enterprise plan pricing inquiry",
+        "message": "Dear TechFlow Support,\n\nI am interested in your enterprise plan. Please provide details on data source compatibility, user management, and compliance certifications.\n\nBest regards,\nSarah Johnson\nCTO, HealthData Inc.",
+        "category": "general",
+    },
+    {
+        "subject": "Connector configuration failure",
+        "message": "Hello,\n\nWe've been trying to configure the Google Analytics connector for 3 days but keep getting auth errors. The error says 'token_expired' even after regenerating the API key.\n\nRegards,\nMike Chen",
+        "category": "technical",
+    },
+    {
+        "subject": "Data processing agreement review",
+        "message": "To Whom It May Concern,\n\nOur legal team has concerns about the data residency clause in your DPA. As a financial institution we require EU-only data storage. Please confirm compliance.\n\nSincerely,\nJames Wilson\nLegal Counsel",
+        "category": "general",
+    },
+    {
+        "subject": "Account downgrade request",
+        "message": "Hello Support,\n\nDue to budget cuts we need to downgrade from Professional to Starter. Please advise on feature loss and data retention.\n\nThank you,\nEmily Park",
+        "category": "general",
+    },
+    {
+        "subject": "Performance optimization for 50M+ row datasets",
+        "message": "Hi TechFlow Team,\n\nDashboard load times increased from 2s to 45s on datasets >50M rows. We have 15 concurrent users and 8 widgets. Please suggest optimization strategies.\n\nBest,\nDr. Alan Turing",
+        "category": "technical",
+    },
 ]
 
-WHATSAPP_SCENARIOS: List[str] = [
+WHATSAPP_SCENARIOS: list[str] = [
     "Hey, my dashboard is broken. It shows no data since yesterday.",
     "Can I get a refund for last month? I didn't use the service at all.",
     "Your pricing is too high. Any discounts available?",
@@ -173,6 +205,7 @@ WHATSAPP_SCENARIOS: List[str] = [
 # ---------------------------------------------------------------------------
 # Locust user
 # ---------------------------------------------------------------------------
+
 
 class CRMChannelUser(HttpUser):
     """Simulates traffic across all three support channels.
@@ -272,7 +305,9 @@ class CRMChannelUser(HttpUser):
                 resp.success()
                 # WhatsApp returns {"status": "received"} — track escalations
                 # by checking the message body for escalation keywords
-                if any(kw in msg.lower() for kw in ("escalat", "legal", "sue", "lawyer", "attorney")):
+                if any(
+                    kw in msg.lower() for kw in ("escalat", "legal", "sue", "lawyer", "attorney")
+                ):
                     _ensure("whatsapp").escalated += 1
             else:
                 resp.failure(f"Unexpected status {resp.status_code}")
@@ -304,7 +339,9 @@ class CRMChannelUser(HttpUser):
             print(f"    P50 / P95 / P99  : {p50:.0f} / {p95:.0f} / {p99:.0f} ms")
             print(f"    Escalated        : {cs.escalated}")
             print(f"    Resolved         : {cs.resolved}")
-            print(f"    Escalation rate  : {escal_pct:.1f}%  {'✅' if escal_pct < 25 else '❌'} target <25%")
+            print(
+                f"    Escalation rate  : {escal_pct:.1f}%  {'✅' if escal_pct < 25 else '❌'} target <25%"
+            )
             print(f"    P95 check        : {'✅' if p95 < 3000 else '❌'} target <3000ms")
 
         if _slow_requests:

@@ -1,26 +1,29 @@
 """Gmail channel handler for TechFlow CRM Digital FTE."""
 
-import os
 import asyncio
-from typing import Dict, Any
-from email.mime.text import MIMEText
 import base64
+import os
+from email.mime.text import MIMEText
+from typing import Any
 
 import structlog
-from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from exceptions import sanitize_error_message
 
+from exceptions import sanitize_error_message
 from kafka_client import KafkaProducerClient, create_inbound_email_message
-from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 
 
 class GmailHandler:
@@ -146,9 +149,13 @@ class GmailHandler:
             logger.info("Gmail message processed and marked as read", message_id=message_id)
 
         except Exception as e:
-            logger.error("Error processing Gmail message", error=sanitize_error_message(str(e)), message_id=message_id)
+            logger.error(
+                "Error processing Gmail message",
+                error=sanitize_error_message(str(e)),
+                message_id=message_id,
+            )
 
-    def _get_message_body(self, message: Dict[str, Any]) -> str:
+    def _get_message_body(self, message: dict[str, Any]) -> str:
         """Extract body text from Gmail message."""
         try:
             if "parts" in message["payload"]:
@@ -191,7 +198,7 @@ class GmailHandler:
             logger.error("Error sending Gmail reply", error=sanitize_error_message(str(error)))
             raise
 
-    def extract_customer_info(self, message: Dict[str, Any]) -> Dict[str, str]:
+    def extract_customer_info(self, message: dict[str, Any]) -> dict[str, str]:
         """Extract customer information from Gmail message."""
         try:
             headers = {h["name"]: h["value"] for h in message["payload"]["headers"]}
@@ -216,7 +223,9 @@ async def run_gmail_polling_loop(
     try:
         await handler.authenticate()
     except Exception as e:
-        logger.warning("Gmail authentication failed, polling disabled", error=sanitize_error_message(str(e)))
+        logger.warning(
+            "Gmail authentication failed, polling disabled", error=sanitize_error_message(str(e))
+        )
         return
 
     while True:

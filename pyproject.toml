@@ -61,13 +61,21 @@ dev = [
     "gtts>=2.5.0",
 ]
 
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+extend-exclude = "/(\\.kilo|web-form)/"
+
 [tool.ruff]
+extend-exclude = [".kilo", "web-form"]
 target-version = "py313"
 line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
-ignore = []
+# Line length is enforced by black; E501 would only flag long string
+# literals (SQL, prompts) that black deliberately leaves intact.
+ignore = ["E501"]
 
 [tool.ruff.format]
 quote-style = "double"

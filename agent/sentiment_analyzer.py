@@ -13,15 +13,18 @@ Enhancements beyond VADER:
 """
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Sequence
+
 import structlog
+
 from exceptions import sanitize_error_message
 
 logger = structlog.get_logger(__name__)
 
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
     _analyzer = SentimentIntensityAnalyzer()
 except ImportError:
     logger.warning("vaderSentiment not installed — sentiment defaults to 0.5")
@@ -32,16 +35,23 @@ except ImportError:
 class SentimentDetail:
     sentiment_score: float = 0.5
     emotion: str = "neutral"
-    emotion_scores: Dict[str, float] = field(default_factory=lambda: {
-        "anger": 0.0, "frustration": 0.0, "confusion": 0.0,
-        "satisfaction": 0.0, "gratitude": 0.0, "neutral": 1.0, "mixed": 0.0,
-    })
+    emotion_scores: dict[str, float] = field(
+        default_factory=lambda: {
+            "anger": 0.0,
+            "frustration": 0.0,
+            "confusion": 0.0,
+            "satisfaction": 0.0,
+            "gratitude": 0.0,
+            "neutral": 1.0,
+            "mixed": 0.0,
+        }
+    )
     urgency_score: float = 0.0
     is_urgent: bool = False
     compound: float = 0.0
-    detail: Optional[Dict[str, float]] = None
-    aspect_scores: Dict[str, float] = field(default_factory=dict)
-    aspect_relevance: Dict[str, float] = field(default_factory=dict)
+    detail: dict[str, float] | None = None
+    aspect_scores: dict[str, float] = field(default_factory=dict)
+    aspect_relevance: dict[str, float] = field(default_factory=dict)
 
 
 # --- Emotion keyword lexicons ---
@@ -96,7 +106,7 @@ _URGENCY_PATTERNS = [
 
 # --- Aspect-based sentiment lexicons ---
 
-_ASPECT_PATTERNS: Dict[str, List[str]] = {
+_ASPECT_PATTERNS: dict[str, list[str]] = {
     "pricing": [
         r"(?i)\b(price|pricing|cost|subscription|fee|plan cost|how much)\b",
         r"(?i)\b(refund|money.back|reimburs|charge|cancel.*subscription)\b",
@@ -153,7 +163,7 @@ _ASPECT_PATTERNS: Dict[str, List[str]] = {
 }
 
 
-def _keyword_score(text: str, patterns: List[str]) -> float:
+def _keyword_score(text: str, patterns: list[str]) -> float:
     score = 0.0
     for p in patterns:
         matches = re.findall(p, text)
@@ -164,10 +174,15 @@ def _keyword_score(text: str, patterns: List[str]) -> float:
 
 def _classify_emotion(
     compound: float, neg: float, pos: float, neu: float, text: str
-) -> Dict[str, float]:
+) -> dict[str, float]:
     scores = {
-        "anger": 0.0, "frustration": 0.0, "confusion": 0.0,
-        "satisfaction": 0.0, "gratitude": 0.0, "neutral": 0.0, "mixed": 0.0,
+        "anger": 0.0,
+        "frustration": 0.0,
+        "confusion": 0.0,
+        "satisfaction": 0.0,
+        "gratitude": 0.0,
+        "neutral": 0.0,
+        "mixed": 0.0,
     }
 
     anger_kw = _keyword_score(text, _ANGER_KEYWORDS)
@@ -200,10 +215,17 @@ def _classify_emotion(
     gratitude_score = gratitude_kw * 0.8 + max(0, sentiment_bias) * 0.1
     scores["gratitude"] = min(1.0, gratitude_score)
 
-    neutral_score = max(0, 1.0 - (
-        scores["anger"] + scores["frustration"] + scores["confusion"] +
-        scores["satisfaction"] + scores["gratitude"]
-    ))
+    neutral_score = max(
+        0,
+        1.0
+        - (
+            scores["anger"]
+            + scores["frustration"]
+            + scores["confusion"]
+            + scores["satisfaction"]
+            + scores["gratitude"]
+        ),
+    )
     neutral_score = neutral_score * 0.7 + (0.3 if abs(compound) < 0.1 and neu > 0.85 else 0.0)
     scores["neutral"] = min(1.0, neutral_score)
 
@@ -214,7 +236,7 @@ def _classify_emotion(
     return scores
 
 
-def _pick_primary_emotion(emotion_scores: Dict[str, float]) -> str:
+def _pick_primary_emotion(emotion_scores: dict[str, float]) -> str:
     return max(emotion_scores, key=emotion_scores.get)
 
 
@@ -232,10 +254,11 @@ def _compute_urgency(text: str, compound: float) -> float:
 
 # --- Aspect-based sentiment ---
 
-def _analyze_aspects(text: str, compound: float) -> tuple[Dict[str, float], Dict[str, float]]:
+
+def _analyze_aspects(text: str, compound: float) -> tuple[dict[str, float], dict[str, float]]:
     """Score sentiment per aspect and return (aspect_scores, aspect_relevance)."""
-    aspect_scores: Dict[str, float] = {}
-    aspect_relevance: Dict[str, float] = {}
+    aspect_scores: dict[str, float] = {}
+    aspect_relevance: dict[str, float] = {}
 
     for aspect, patterns in _ASPECT_PATTERNS.items():
         kw_score = _keyword_score(text, patterns)
@@ -243,9 +266,31 @@ def _analyze_aspects(text: str, compound: float) -> tuple[Dict[str, float], Dict
             aspect_relevance[aspect] = kw_score
             base_sentiment = max(0.0, min(1.0, (compound + 1.0) / 2.0))
             # Adjust if keywords themselves are negative/positive
-            neg_kw = sum(1 for p in patterns if re.search(p, text) and any(
-                w in text.lower() for w in ["not", "no", "never", "can't", "won't", "broken", "bad", "wrong", "issue", "problem", "fail", "slow", "expensive", "missing", "lack"]
-            ))
+            neg_kw = sum(
+                1
+                for p in patterns
+                if re.search(p, text)
+                and any(
+                    w in text.lower()
+                    for w in [
+                        "not",
+                        "no",
+                        "never",
+                        "can't",
+                        "won't",
+                        "broken",
+                        "bad",
+                        "wrong",
+                        "issue",
+                        "problem",
+                        "fail",
+                        "slow",
+                        "expensive",
+                        "missing",
+                        "lack",
+                    ]
+                )
+            )
             if neg_kw:
                 base_sentiment = max(0.0, base_sentiment - 0.2 * neg_kw)
             aspect_scores[aspect] = max(0.0, min(1.0, base_sentiment))
@@ -258,8 +303,9 @@ def _analyze_aspects(text: str, compound: float) -> tuple[Dict[str, float], Dict
 
 # --- Sentiment trend detection ---
 
+
 def detect_sentiment_drop(
-    history: Sequence[Dict],
+    history: Sequence[dict],
     lookback: int = 3,
     drop_threshold: float = 0.15,
 ) -> tuple[bool, float, str]:
@@ -281,9 +327,9 @@ def detect_sentiment_drop(
 
     # history is newest-first: scores[0] = most recent, scores[-1] = oldest
     # If sentiment is dropping, scores[0] (newest) < scores[-1] (oldest)
-    first_score = scores[0]      # most recent turn
-    last_score = scores[-1]      # oldest turn in the window
-    total_drop = last_score - first_score   # positive = dropping
+    first_score = scores[0]  # most recent turn
+    last_score = scores[-1]  # oldest turn in the window
+    total_drop = last_score - first_score  # positive = dropping
 
     if total_drop >= drop_threshold:
         return (
@@ -310,8 +356,9 @@ def detect_sentiment_drop(
 
 # --- Public API ---
 
+
 async def analyze_sentiment(
-    openai_client: Optional[object] = None,
+    openai_client: object | None = None,
     message: str = "",
 ) -> float:
     """Analyze sentiment of a customer message. Returns 0.0–1.0 (backward compatible).
@@ -330,12 +377,16 @@ async def analyze_sentiment(
         score = max(0.0, min(1.0, (compound + 1.0) / 2.0))
         return score
     except Exception as e:
-        logger.error("Sentiment analysis failed", error=sanitize_error_message(str(e)), message_preview=message[:80])
+        logger.error(
+            "Sentiment analysis failed",
+            error=sanitize_error_message(str(e)),
+            message_preview=message[:80],
+        )
         return 0.5
 
 
 async def analyze_sentiment_detailed(
-    openai_client: Optional[object] = None,
+    openai_client: object | None = None,
     message: str = "",
 ) -> "SentimentDetail":
     """Analyze sentiment with emotion classification, urgency, and aspect scoring.
@@ -383,5 +434,9 @@ async def analyze_sentiment_detailed(
         )
 
     except Exception as e:
-        logger.error("Detailed sentiment analysis failed", error=sanitize_error_message(str(e)), message_preview=message[:80])
+        logger.error(
+            "Detailed sentiment analysis failed",
+            error=sanitize_error_message(str(e)),
+            message_preview=message[:80],
+        )
         return SentimentDetail()

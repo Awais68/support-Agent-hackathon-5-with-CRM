@@ -14,6 +14,7 @@ class PostgresOutageExperiment(ChaosExperiment):
 
         self.log("Verifying API enters degraded mode")
         import httpx
+
         deadline = time.time() + 15
         degraded_detected = False
         while time.time() < deadline:

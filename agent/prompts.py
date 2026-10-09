@@ -176,6 +176,7 @@ Does this solve your issue?
 Let me know if you need any clarification!""",
 }
 
+
 def get_system_prompt(channel: str = "email") -> str:
     """Get the complete system prompt for the agent."""
     addendum = CHANNEL_ADDENDUMS.get(channel, CHANNEL_ADDENDUMS["email"])

@@ -16,12 +16,10 @@ Environment variables:
 
 import argparse
 import asyncio
-import json
+import os
 import random
 import time
-import os
 from dataclasses import dataclass
-from typing import Optional
 
 import aiohttp
 import structlog
@@ -34,16 +32,56 @@ API_KEY = os.getenv("API_KEY", "")
 # --- Test data generators ---
 
 WEBFORM_SCENARIOS = [
-    {"subject": "How do I connect my data source?", "body": "I'm trying to connect my PostgreSQL database to TechFlow but I can't find the connection settings. Can you help?", "category": "technical"},
-    {"subject": "Billing question", "body": "I was charged twice this month. Can you help me get a refund for the duplicate charge?", "category": "billing"},
-    {"subject": "Dashboard not loading", "body": "The analytics dashboard has been loading for over 5 minutes. It was working yesterday.", "category": "technical"},
-    {"subject": "Need to cancel subscription", "body": "I need to cancel my subscription due to budget cuts. Please process the cancellation.", "category": "account"},
-    {"subject": "New feature request", "body": "It would be great if you could add support for Snowflake as a data source.", "category": "feature_request"},
-    {"subject": "User permissions issue", "body": "My team members can't access the reports I created. How do I set up proper permissions?", "category": "technical"},
-    {"subject": "Data export problem", "body": "When I try to export my dashboard as PDF, the charts are blurry. Is there a fix?", "category": "technical"},
-    {"subject": "Trial extension", "body": "We need more time to evaluate the platform. Can you extend our trial by 2 weeks?", "category": "account"},
-    {"subject": "API rate limits", "body": "We're hitting API rate limits during our batch processing window. Can we get a temporary increase?", "category": "technical"},
-    {"subject": "Integration with Slack", "body": "How do I set up Slack notifications for dashboard alerts?", "category": "technical"},
+    {
+        "subject": "How do I connect my data source?",
+        "body": "I'm trying to connect my PostgreSQL database to TechFlow but I can't find the connection settings. Can you help?",
+        "category": "technical",
+    },
+    {
+        "subject": "Billing question",
+        "body": "I was charged twice this month. Can you help me get a refund for the duplicate charge?",
+        "category": "billing",
+    },
+    {
+        "subject": "Dashboard not loading",
+        "body": "The analytics dashboard has been loading for over 5 minutes. It was working yesterday.",
+        "category": "technical",
+    },
+    {
+        "subject": "Need to cancel subscription",
+        "body": "I need to cancel my subscription due to budget cuts. Please process the cancellation.",
+        "category": "account",
+    },
+    {
+        "subject": "New feature request",
+        "body": "It would be great if you could add support for Snowflake as a data source.",
+        "category": "feature_request",
+    },
+    {
+        "subject": "User permissions issue",
+        "body": "My team members can't access the reports I created. How do I set up proper permissions?",
+        "category": "technical",
+    },
+    {
+        "subject": "Data export problem",
+        "body": "When I try to export my dashboard as PDF, the charts are blurry. Is there a fix?",
+        "category": "technical",
+    },
+    {
+        "subject": "Trial extension",
+        "body": "We need more time to evaluate the platform. Can you extend our trial by 2 weeks?",
+        "category": "account",
+    },
+    {
+        "subject": "API rate limits",
+        "body": "We're hitting API rate limits during our batch processing window. Can we get a temporary increase?",
+        "category": "technical",
+    },
+    {
+        "subject": "Integration with Slack",
+        "body": "How do I set up Slack notifications for dashboard alerts?",
+        "category": "technical",
+    },
 ]
 
 GMAIL_SCENARIOS = [
@@ -112,7 +150,9 @@ class TestResult:
     success: bool
 
 
-async def send_webform(session: aiohttp.ClientSession, base_url: str, scenario: dict, idx: int) -> TestResult:
+async def send_webform(
+    session: aiohttp.ClientSession, base_url: str, scenario: dict, idx: int
+) -> TestResult:
     """Send a web form submission."""
     payload = {
         "name": f"Web User {idx}",
@@ -137,7 +177,9 @@ async def send_webform(session: aiohttp.ClientSession, base_url: str, scenario: 
         return TestResult(channel="webform", status_code=0, latency_ms=latency, success=False)
 
 
-async def send_gmail(session: aiohttp.ClientSession, base_url: str, scenario: dict, idx: int) -> TestResult:
+async def send_gmail(
+    session: aiohttp.ClientSession, base_url: str, scenario: dict, idx: int
+) -> TestResult:
     """Simulate a Gmail message via the tickets API (Gmail is poll-based, not webhook)."""
     payload = {
         "name": f"Gmail User {idx}",
@@ -163,7 +205,9 @@ async def send_gmail(session: aiohttp.ClientSession, base_url: str, scenario: di
         return TestResult(channel="gmail", status_code=0, latency_ms=latency, success=False)
 
 
-async def send_whatsapp(session: aiohttp.ClientSession, base_url: str, body: str, idx: int) -> TestResult:
+async def send_whatsapp(
+    session: aiohttp.ClientSession, base_url: str, body: str, idx: int
+) -> TestResult:
     """Send a WhatsApp message via Twilio webhook."""
     payload = aiohttp.FormData()
     payload.add_field("From", f"whatsapp:+1555{1000 + idx:07d}")
@@ -224,7 +268,9 @@ async def run_load_test(base_url: str, total_requests: int, concurrency: int):
 
                 except Exception as e:
                     async with lock:
-                        results.append(TestResult(channel=channel, status_code=0, latency_ms=0, success=False))
+                        results.append(
+                            TestResult(channel=channel, status_code=0, latency_ms=0, success=False)
+                        )
                         errors += 1
                     logger.error("Request error", channel=channel, error=str(e))
 
@@ -268,8 +314,13 @@ async def run_load_test(base_url: str, total_requests: int, concurrency: int):
     logger.info("=" * 60)
     logger.info("LOAD TEST RESULTS")
     logger.info("=" * 60)
-    logger.info("Summary", total=len(results), errors=errors, elapsed=f"{elapsed:.1f}s",
-                throughput=f"{len(results)/elapsed:.1f} req/s")
+    logger.info(
+        "Summary",
+        total=len(results),
+        errors=errors,
+        elapsed=f"{elapsed:.1f}s",
+        throughput=f"{len(results)/elapsed:.1f} req/s",
+    )
     logger.info(f"  P50 latency: {p50:.0f}ms")
     logger.info(f"  P95 latency: {p95:.0f}ms")
     logger.info(f"  P99 latency: {p99:.0f}ms")
@@ -284,8 +335,13 @@ async def run_load_test(base_url: str, total_requests: int, concurrency: int):
 
     # Grade simulation
     escalation_count = sum(
-        1 for r in results
-        if r.success and "refund" in str(r) or "legal" in str(r) or "lawyer" in str(r) or "sue" in str(r)
+        1
+        for r in results
+        if r.success
+        and "refund" in str(r)
+        or "legal" in str(r)
+        or "lawyer" in str(r)
+        or "sue" in str(r)
     )
     logger.info(f"  Estimated escalation rate: {escalation_count/max(len(results),1)*100:.1f}%")
 
@@ -305,7 +361,9 @@ async def run_load_test(base_url: str, total_requests: int, concurrency: int):
 def main():
     parser = argparse.ArgumentParser(description="Load test for TechFlow CRM Digital FTE")
     parser.add_argument("--base-url", default="http://localhost:8000", help="Base URL of the API")
-    parser.add_argument("--requests", type=int, default=200, help="Total requests (auto-distributed)")
+    parser.add_argument(
+        "--requests", type=int, default=200, help="Total requests (auto-distributed)"
+    )
     parser.add_argument("--concurrency", type=int, default=10, help="Concurrent requests")
     args = parser.parse_args()
 

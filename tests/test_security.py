@@ -126,9 +126,7 @@ class TestVoiceCallSignature:
         from twilio.request_validator import RequestValidator
 
         monkeypatch.setenv("TWILIO_AUTH_TOKEN", TWILIO_TOKEN)
-        signature = RequestValidator(TWILIO_TOKEN).compute_signature(
-            VOICE_CALL_URL, CALL_PARAMS
-        )
+        signature = RequestValidator(TWILIO_TOKEN).compute_signature(VOICE_CALL_URL, CALL_PARAMS)
         resp = infra_client.post(
             "/webhooks/voice/call",
             data=CALL_PARAMS,
@@ -141,9 +139,7 @@ class TestVoiceCallSignature:
 
 class TestVoiceMessageAuth:
     def test_requires_api_key(self, infra_client):
-        resp = infra_client.post(
-            "/webhooks/voice/message", json={"audio_base64": "AAAA"}
-        )
+        resp = infra_client.post("/webhooks/voice/message", json={"audio_base64": "AAAA"})
         assert resp.status_code == 401
 
     def test_internal_audio_url_rejected(self, infra_client):
@@ -168,9 +164,7 @@ def _fake_dns(monkeypatch, addr: str):
     async def fake_getaddrinfo(self, host, port, **kwargs):
         return [(2, 1, 6, "", (addr, port))]
 
-    monkeypatch.setattr(
-        "asyncio.base_events.BaseEventLoop.getaddrinfo", fake_getaddrinfo
-    )
+    monkeypatch.setattr("asyncio.base_events.BaseEventLoop.getaddrinfo", fake_getaddrinfo)
 
 
 def _transport_never_called():
@@ -195,17 +189,13 @@ class TestAudioUrlSsrf:
     )
     async def test_internal_or_unlisted_urls_rejected(self, url):
         with pytest.raises(safe_fetch.UnsafeURLError):
-            await safe_fetch.fetch_bytes(
-                url, max_bytes=1024, transport=_transport_never_called()
-            )
+            await safe_fetch.fetch_bytes(url, max_bytes=1024, transport=_transport_never_called())
 
     @pytest.mark.parametrize(
         "addr",
         ["10.0.0.5", "127.0.0.1", "169.254.169.254", "::1", "::ffff:192.168.1.1"],
     )
-    async def test_allowlisted_host_resolving_to_private_ip_rejected(
-        self, monkeypatch, addr
-    ):
+    async def test_allowlisted_host_resolving_to_private_ip_rejected(self, monkeypatch, addr):
         _fake_dns(monkeypatch, addr)
         with pytest.raises(safe_fetch.UnsafeURLError, match="non-public"):
             await safe_fetch.fetch_bytes(
@@ -232,9 +222,7 @@ class TestAudioUrlSsrf:
 
     async def test_oversized_body_rejected(self, monkeypatch):
         _fake_dns(monkeypatch, "54.172.60.1")
-        transport = httpx.MockTransport(
-            lambda r: httpx.Response(200, content=b"x" * 2048)
-        )
+        transport = httpx.MockTransport(lambda r: httpx.Response(200, content=b"x" * 2048))
         with pytest.raises(safe_fetch.UnsafeURLError, match="size"):
             await safe_fetch.fetch_bytes(
                 "https://api.twilio.com/Recordings/RE1.wav",
@@ -242,9 +230,7 @@ class TestAudioUrlSsrf:
                 transport=transport,
             )
 
-    async def test_allowlisted_public_url_with_cdn_redirect_is_fetched(
-        self, monkeypatch
-    ):
+    async def test_allowlisted_public_url_with_cdn_redirect_is_fetched(self, monkeypatch):
         _fake_dns(monkeypatch, "54.172.60.1")
 
         def handler(request):
@@ -262,9 +248,7 @@ class TestAudioUrlSsrf:
         assert body == b"RIFFdata"
 
     async def test_resolve_audio_returns_none_for_internal_url(self):
-        assert (
-            await VoiceHandler.resolve_audio(audio_url="http://localhost:5432/") is None
-        )
+        assert await VoiceHandler.resolve_audio(audio_url="http://localhost:5432/") is None
 
     def test_host_allowlist_is_env_configurable(self, monkeypatch):
         monkeypatch.setenv("AUDIO_URL_ALLOWED_HOSTS", "*.example-cdn.com")

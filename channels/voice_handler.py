@@ -62,6 +62,7 @@ def _confidence_threshold() -> float:
     except ValueError:
         return DEFAULT_CONFIDENCE_THRESHOLD
 
+
 _VOICE_SUBJECT_RE = re.compile(r"^[+\d\s\-().ext]+$")
 
 
@@ -383,9 +384,7 @@ class VoiceHandler:
     # ------------------------------------------------------------------
     # Text-to-speech
     # ------------------------------------------------------------------
-    async def synthesize(
-        self, text: str, language: str = "en"
-    ) -> tuple[str | None, str]:
+    async def synthesize(self, text: str, language: str = "en") -> tuple[str | None, str]:
         """Synthesize speech. Returns ``(audio_base64, format)``.
 
         Provider order: OpenAI TTS → gTTS (offline) → ``(None, "none")`` (text only).

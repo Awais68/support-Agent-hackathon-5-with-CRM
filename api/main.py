@@ -12,8 +12,16 @@ from xml.sax.saxutils import escape as xml_escape
 
 import asyncpg
 import structlog
-from env_config import load_environment
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -26,6 +34,8 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from twilio.request_validator import RequestValidator
 
+from env_config import load_environment
+
 # Load .env BEFORE the first-party imports below: `uvicorn api.main:app` bypasses
 # main.py's entrypoint, and modules like api.rate_limiter read os.getenv() at
 # import time. Uses the shared loader so uvicorn sees the same layering
@@ -33,12 +43,12 @@ from twilio.request_validator import RequestValidator
 load_environment()
 
 from agent.customer_success_agent import AgentContext, CustomerSuccessAgent  # noqa: E402
-from chat_provider import build_chat_client, chat_model, chat_provider_config  # noqa: E402
 from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit  # noqa: E402
 from api.websocket_manager import WebSocketManager  # noqa: E402
 from channels.voice_handler import VoiceHandler, twilio_language  # noqa: E402
 from channels.web_form_handler import WebFormHandler, WebFormSubmission  # noqa: E402
 from channels.whatsapp_handler import WhatsAppHandler  # noqa: E402
+from chat_provider import build_chat_client, chat_model, chat_provider_config  # noqa: E402
 from database import queries as db  # noqa: E402
 from embeddings_provider import (  # noqa: E402
     EMBEDDING_CIRCUIT_BREAKER,
@@ -118,21 +128,19 @@ class MessageResponse(BaseModel):
 
 
 # Mirrors the tickets.status CHECK constraint in database/schema.sql
-VALID_TICKET_STATUSES = frozenset(
-    {"open", "in_progress", "resolved", "escalated", "closed"}
-)
+VALID_TICKET_STATUSES = frozenset({"open", "in_progress", "resolved", "escalated", "closed"})
 
 
 class UpdateStatusRequest(BaseModel):
-    status: str = Field(..., description="New status: open, in_progress, resolved, escalated, closed")
+    status: str = Field(
+        ..., description="New status: open, in_progress, resolved, escalated, closed"
+    )
 
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
         if v not in VALID_TICKET_STATUSES:
-            raise ValueError(
-                f"status must be one of: {', '.join(sorted(VALID_TICKET_STATUSES))}"
-            )
+            raise ValueError(f"status must be one of: {', '.join(sorted(VALID_TICKET_STATUSES))}")
         return v
 
 
@@ -142,9 +150,12 @@ class ReplyRequest(BaseModel):
 
 class MergeCustomerRequest(BaseModel):
     source_customer_id: UUID = Field(
-        ..., description="Customer to absorb; its tickets move to the path customer and it is deleted"
+        ...,
+        description="Customer to absorb; its tickets move to the path customer and it is deleted",
     )
-    reason: str | None = Field(None, max_length=500, description="Why the two records are the same person")
+    reason: str | None = Field(
+        None, max_length=500, description="Why the two records are the same person"
+    )
 
 
 class MetricsResponse(BaseModel):
@@ -243,9 +254,7 @@ def _is_test_mode() -> bool:
     return os.getenv("RUN_MODE", "").lower() == "test"
 
 
-async def verify_api_key(
-    request: Request, x_api_key: str | None = Header(None)
-) -> bool:
+async def verify_api_key(request: Request, x_api_key: str | None = Header(None)) -> bool:
     """Verify API key for non-webhook endpoints."""
     # Skip verification for webhook, health, and metrics endpoints
     if request.url.path in [
@@ -325,7 +334,9 @@ async def lifespan(app: FastAPI):
         raise ConfigurationError(
             message=f"{e}. The agent cannot run without an AI provider key."
         ) from e
-    logger.info("Chat provider initialized", provider=chat_provider_config().name, model=chat_model())
+    logger.info(
+        "Chat provider initialized", provider=chat_provider_config().name, model=chat_model()
+    )
 
     # Embeddings go to their own provider: OpenRouter serves chat here but has
     # no embedding credits, so knowledge base search runs on Gemini.
@@ -338,6 +349,7 @@ async def lifespan(app: FastAPI):
     # Initialize MCP Server for extensible tools
     # NOTE: MCP server provides alternative tool execution path via Model Context Protocol
     from mcp_server import mcp_server
+
     app.state.mcp_server = mcp_server
     logger.info("MCP server initialized")
 
@@ -376,6 +388,7 @@ async def api_key_middleware(request: Request, call_next):
         await verify_api_key(request)
     except HTTPException as e:
         from starlette.responses import JSONResponse
+
         return JSONResponse(
             status_code=e.status_code,
             content={"detail": e.detail},
@@ -943,8 +956,7 @@ async def webhook_voice_call(request: Request) -> Response:
     except Exception as e:
         logger.error("Voice call agent failed", error=sanitize_error_message(str(e)))
         reply = (
-            "I'm sorry, I'm having trouble right now. "
-            "A human agent will call you back shortly."
+            "I'm sorry, I'm having trouble right now. " "A human agent will call you back shortly."
         )
 
     if was_translated:
@@ -1018,7 +1030,9 @@ async def get_customer_history(
     pool: asyncpg.Pool = Depends(get_db),
 ) -> dict[str, Any]:
     """Get customer history."""
-    history = await db.get_customer_history(pool, email, limit=limit, include_resolved=include_resolved)
+    history = await db.get_customer_history(
+        pool, email, limit=limit, include_resolved=include_resolved
+    )
 
     return {
         "email": email,

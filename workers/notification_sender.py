@@ -90,9 +90,7 @@ class OutboundSender:
             # OAuth flow when there is no token, which would hang a container.
             # (isfile: a missing bind-mount source becomes a directory.)
             if not os.path.isfile(handler.token_file):
-                raise PermanentDeliveryError(
-                    f"Gmail token file {handler.token_file!r} not found"
-                )
+                raise PermanentDeliveryError(f"Gmail token file {handler.token_file!r} not found")
             self._email_sender = handler.send_reply
         return self._email_sender
 
@@ -154,9 +152,7 @@ class OutboundSender:
         if ticket_id is None:
             return "Your support request"
         async with self.db_pool.acquire() as conn:
-            subject = await conn.fetchval(
-                "SELECT subject FROM tickets WHERE id = $1", ticket_id
-            )
+            subject = await conn.fetchval("SELECT subject FROM tickets WHERE id = $1", ticket_id)
         return subject or "Your support request"
 
     async def _customer_phone(self, ticket_id: UUID | None) -> str:
@@ -181,9 +177,7 @@ class OutboundSender:
     # ------------------------------------------------------------------
     # Delivery
     # ------------------------------------------------------------------
-    async def _send_once(
-        self, channel: str, payload: dict, ticket_id: UUID | None
-    ) -> str | None:
+    async def _send_once(self, channel: str, payload: dict, ticket_id: UUID | None) -> str | None:
         body = payload.get("message") or payload.get("content") or ""
         if not body:
             raise PermanentDeliveryError("empty message body")
@@ -270,9 +264,7 @@ class OutboundSender:
         )
         return "sent"
 
-    async def _dead_letter(
-        self, message: KafkaMessage, error: str, attempts: int
-    ) -> None:
+    async def _dead_letter(self, message: KafkaMessage, error: str, attempts: int) -> None:
         try:
             await self.kafka_producer.send_message(
                 DLQ_TOPIC,

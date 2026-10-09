@@ -14,6 +14,7 @@ class MetricsPipelineExperiment(ChaosExperiment):
 
         self.log("Verifying API/worker continue functioning without Prometheus")
         import httpx
+
         deadline = time.time() + 15
         system_ok = False
         metrics_ok = False

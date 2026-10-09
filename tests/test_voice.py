@@ -65,11 +65,13 @@ async def test_transcribe_high_confidence_runs_agent(handler):
         mock_tr.return_value = ("I need help resetting my password", "en", False)
         mock_tts.return_value = ("AUDIOBASE64", "mp3")
 
-        agent = AsyncMock(return_value={
-            "response": "I can help with that. Check your email for a reset link.",
-            "ticket_id": "11111111-1111-1111-1111-111111111111",
-            "ticket_number": "TKT-20260101-0001",
-        })
+        agent = AsyncMock(
+            return_value={
+                "response": "I can help with that. Check your email for a reset link.",
+                "ticket_id": "11111111-1111-1111-1111-111111111111",
+                "ticket_number": "TKT-20260101-0001",
+            }
+        )
 
         result = await handler.handle_voice_message(
             audio_bytes=b"fake-audio",
@@ -106,11 +108,13 @@ async def test_non_english_round_trip_translation(handler):
         mock_tr_back.return_value = "میں آپ کی مدد کروں گا۔"
         mock_tts.return_value = ("AUDIO", "mp3")
 
-        agent = AsyncMock(return_value={
-            "response": "I will help you reset it.",
-            "ticket_id": "22222222-2222-2222-2222-222222222222",
-            "ticket_number": "TKT-20260101-0002",
-        })
+        agent = AsyncMock(
+            return_value={
+                "response": "I will help you reset it.",
+                "ticket_id": "22222222-2222-2222-2222-222222222222",
+                "ticket_number": "TKT-20260101-0002",
+            }
+        )
 
         result = await handler.handle_voice_message(
             audio_bytes=b"fake-audio",
@@ -157,9 +161,7 @@ async def test_detect_and_translate_parses_llm_json(handler):
     )
     handler.openai_client.chat.completions.create = AsyncMock(return_value=mock_resp)
 
-    english, lang, was_translated = await handler.detect_and_translate(
-        "मुझे बिलिंग में मदद चाहिए"
-    )
+    english, lang, was_translated = await handler.detect_and_translate("मुझे बिलिंग में मदद चाहिए")
 
     assert english == "I need billing help"
     assert lang == "hi"
@@ -241,9 +243,7 @@ def test_voice_translate_endpoint(api_client):
     mock_resp.choices[0].message.content = json.dumps(
         {"language": "es", "translated": "I need help", "is_english": False}
     )
-    api_client.app.state.openai_client.chat.completions.create = AsyncMock(
-        return_value=mock_resp
-    )
+    api_client.app.state.openai_client.chat.completions.create = AsyncMock(return_value=mock_resp)
 
     resp = api_client.post(
         "/voice/translate",
@@ -260,9 +260,7 @@ def test_voice_translate_endpoint(api_client):
 def test_voice_translate_to_target_language(api_client):
     mock_resp = MagicMock()
     mock_resp.choices[0].message.content = "مرحبا بك"
-    api_client.app.state.openai_client.chat.completions.create = AsyncMock(
-        return_value=mock_resp
-    )
+    api_client.app.state.openai_client.chat.completions.create = AsyncMock(return_value=mock_resp)
 
     resp = api_client.post(
         "/voice/translate",

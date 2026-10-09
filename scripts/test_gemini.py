@@ -80,22 +80,26 @@ async def check_chat(model: str = "gemini-3.6-flash") -> None:
             messages=[{"role": "user", "content": "Reply with exactly one word: PONG"}],
         )
         text = (resp.choices[0].message.content or "").strip()
-        record(f"[info] chat completion ({model})", "PONG" in text.upper(), repr(text), required=False)
+        record(
+            f"[info] chat completion ({model})", "PONG" in text.upper(), repr(text), required=False
+        )
     except Exception as exc:
         record(f"[info] chat completion ({model})", False, repr(exc)[:160], required=False)
 
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "lookup_order",
-            "description": "Look up an order by id",
-            "parameters": {
-                "type": "object",
-                "properties": {"order_id": {"type": "string"}},
-                "required": ["order_id"],
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_order",
+                "description": "Look up an order by id",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"order_id": {"type": "string"}},
+                    "required": ["order_id"],
+                },
             },
-        },
-    }]
+        }
+    ]
     try:
         resp = await client.chat.completions.create(
             model=model,

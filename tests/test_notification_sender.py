@@ -289,9 +289,7 @@ async def test_kafka_topic_message_triggers_send(pool):
     assert row["status"] == "sent"
 
 
-async def test_missing_gmail_token_fails_without_oauth_prompt(
-    pool, tmp_path, monkeypatch
-):
+async def test_missing_gmail_token_fails_without_oauth_prompt(pool, tmp_path, monkeypatch):
     # A bind-mounted token path that does not exist on the host shows up as
     # a directory; it must be a permanent failure, not an OAuth browser flow.
     monkeypatch.setenv("GMAIL_TOKEN_FILE", str(tmp_path))

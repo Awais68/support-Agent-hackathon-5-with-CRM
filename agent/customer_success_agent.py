@@ -3,33 +3,41 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
-from uuid import UUID
 from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID
 
 import asyncpg
 import structlog
-from openai import AsyncOpenAI
-from openai import APIError as OpenAIAPIError, APITimeoutError, APIConnectionError
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
+from openai import APIError as OpenAIAPIError
 
-from chat_provider import chat_model
-from agent.prompts import SYSTEM_PROMPT, CHANNEL_ADDENDUMS, CLASSIFICATION_PROMPT
-from agent.tools import OPENAI_TOOL_SCHEMAS, ToolContext, execute_tool
-from agent.formatters import format_email_response, format_whatsapp_response, format_web_form_response
-from agent.pre_processing_gate import run_gate, GateAction
+from agent.formatters import (
+    format_email_response,
+    format_web_form_response,
+    format_whatsapp_response,
+)
+from agent.pre_processing_gate import GateAction, run_gate
+from agent.prompts import CHANNEL_ADDENDUMS, CLASSIFICATION_PROMPT, SYSTEM_PROMPT
 from agent.sentiment_analyzer import detect_sentiment_drop
-from kafka_client import KafkaProducerClient
+from agent.tools import OPENAI_TOOL_SCHEMAS, ToolContext, execute_tool
+from chat_provider import chat_model
 from database import queries as db
 from embeddings_provider import EmbeddingProvider, build_embedding_provider
+from exceptions import sanitize_error_message
+from kafka_client import KafkaProducerClient
 from metrics import (
-    sentiment_score as metric_sentiment_score,
-    sentiment_emotion,
-    sentiment_urgency as metric_sentiment_urgency,
     sentiment_below_threshold,
+    sentiment_emotion,
     sentiment_high_urgency,
 )
-from exceptions import sanitize_error_message
-from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
+from metrics import (
+    sentiment_score as metric_sentiment_score,
+)
+from metrics import (
+    sentiment_urgency as metric_sentiment_urgency,
+)
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
 
@@ -43,7 +51,7 @@ class AgentContext:
     openai_client: AsyncOpenAI
     # Embeddings run on their own provider (see embeddings_provider). Left
     # unset, embeddings fall back to openai_client.
-    embedding_provider: Optional[EmbeddingProvider] = None
+    embedding_provider: EmbeddingProvider | None = None
     logger: Any = None
 
     def __post_init__(self):
@@ -79,7 +87,9 @@ class CustomerSuccessAgent:
             return content.strip() if content else "General Inquiry"
 
         except (OpenAIAPIError, APITimeoutError, APIConnectionError, CircuitBreakerError) as e:
-            self.context.logger.error("Classification failed (OpenAI)", error=sanitize_error_message(str(e)))
+            self.context.logger.error(
+                "Classification failed (OpenAI)", error=sanitize_error_message(str(e))
+            )
             return "General Inquiry"
         except Exception as e:
             self.context.logger.error("Classification failed", error=sanitize_error_message(str(e)))
@@ -93,8 +103,8 @@ class CustomerSuccessAgent:
         customer_name: str,
         message: str,
         channel: str = "email",
-        ticket_number: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        ticket_number: str | None = None,
+    ) -> dict[str, Any]:
         """Process a customer message with agent orchestration.
 
         ``ticket_number`` is the customer-facing TKT-... string. Callers that
@@ -213,12 +223,8 @@ class CustomerSuccessAgent:
                 metric_sentiment_score.labels(channel=channel, tier="all").set(
                     gate_result.sentiment_score or 0.5
                 )
-                sentiment_emotion.labels(
-                    emotion=gate_result.emotion, channel=channel
-                ).inc()
-                metric_sentiment_urgency.labels(channel=channel).set(
-                    gate_result.urgency_score
-                )
+                sentiment_emotion.labels(emotion=gate_result.emotion, channel=channel).inc()
+                metric_sentiment_urgency.labels(channel=channel).set(gate_result.urgency_score)
                 if gate_result.sentiment_score is not None and gate_result.sentiment_score < 0.3:
                     sentiment_below_threshold.labels(channel=channel).inc()
                 if gate_result.is_urgent:
@@ -232,9 +238,13 @@ class CustomerSuccessAgent:
                     reason=gate_result.reason,
                     priority=gate_result.priority,
                 )
-                aspects_str = ", ".join(
-                    f"{k}={v:.2f}" for k, v in gate_result.aspect_scores.items() if v != 0.5
-                ) if gate_result.aspect_scores else "none"
+                aspects_str = (
+                    ", ".join(
+                        f"{k}={v:.2f}" for k, v in gate_result.aspect_scores.items() if v != 0.5
+                    )
+                    if gate_result.aspect_scores
+                    else "none"
+                )
                 await self.context.kafka_producer.send_message(
                     "escalations",
                     {
@@ -303,9 +313,9 @@ class CustomerSuccessAgent:
                 ]
 
                 output_message = ""
-                MAX_TURNS = 10
+                max_turns = 10
 
-                for turn in range(MAX_TURNS):
+                for turn in range(max_turns):
                     _cb = get_circuit_breaker("openai")
                     try:
                         async with _cb:
@@ -355,11 +365,13 @@ class CustomerSuccessAgent:
                             turn=turn,
                         )
                         tool_result = await execute_tool(tool_name, tool_args, tool_context)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": tool_result,
-                        })
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": tool_result,
+                            }
+                        )
                         self.context.logger.info(
                             "Tool executed",
                             tool_name=tool_name,
@@ -372,7 +384,7 @@ class CustomerSuccessAgent:
                     self.context.logger.warning(
                         "Max turns reached in agentic loop",
                         ticket_id=str(ticket_id),
-                        max_turns=MAX_TURNS,
+                        max_turns=max_turns,
                     )
 
             # Step 7: Format response for channel

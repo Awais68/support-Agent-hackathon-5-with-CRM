@@ -62,7 +62,5 @@ def build_chat_client() -> AsyncOpenAI:
     """
     cfg = chat_provider_config()
     if not cfg.api_key:
-        raise ValueError(
-            "No chat provider key set: define DEEPSEEK_API_KEY or OPENROUTER_API_KEY"
-        )
+        raise ValueError("No chat provider key set: define DEEPSEEK_API_KEY or OPENROUTER_API_KEY")
     return AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)

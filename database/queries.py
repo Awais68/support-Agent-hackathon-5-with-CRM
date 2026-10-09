@@ -1,16 +1,15 @@
 """Async database queries for TechFlow CRM Digital FTE."""
 
-import os
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any
 from uuid import UUID
 
 import asyncpg
 import structlog
-
 
 FUZZY_THRESHOLD_DEFAULT = 0.3
 
@@ -38,9 +37,10 @@ EMBEDDING_DIM = 1536
 
 @dataclass
 class FuzzyMatchResult:
-    customer: Optional[Dict[str, Any]] = None
-    match_field: Optional[str] = None  # 'email' or 'name'
+    customer: dict[str, Any] | None = None
+    match_field: str | None = None  # 'email' or 'name'
     similarity: float = 0.0
+
 
 logger = structlog.get_logger(__name__)
 
@@ -70,7 +70,7 @@ async def fuzzy_search_customers(
     search_field: str = "email",
     threshold: float = FUZZY_THRESHOLD_DEFAULT,
     limit: int = 5,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Fuzzy search customers by name or email using pg_trgm similarity().
 
@@ -99,7 +99,7 @@ async def fuzzy_search_customers(
         return [dict(row) for row in rows]
 
 
-async def get_customer(pool: asyncpg.Pool, email: str) -> Optional[Dict[str, Any]]:
+async def get_customer(pool: asyncpg.Pool, email: str) -> dict[str, Any] | None:
     """Get customer by email."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -111,7 +111,7 @@ async def get_customer(pool: asyncpg.Pool, email: str) -> Optional[Dict[str, Any
 
 async def create_customer(
     pool: asyncpg.Pool, email: str, name: str, company: str = "", tier: str = "starter"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Create a new customer."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -133,7 +133,7 @@ async def get_customer_by_identifier(
     pool: asyncpg.Pool,
     identifier_type: str,
     identifier_value: str,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Get customer by any identifier type (email, phone, web_session)."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -154,7 +154,7 @@ async def add_customer_identifier(
     customer_id: UUID,
     identifier_type: str,
     identifier_value: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Add a new identifier to an existing customer."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -174,7 +174,7 @@ async def add_customer_identifier(
 async def link_identifiers(
     pool: asyncpg.Pool,
     customer_id: UUID,
-    identifiers: List[tuple[str, str]],
+    identifiers: list[tuple[str, str]],
 ) -> None:
     """Link multiple identifier (type, value) pairs to a customer, skipping conflicts."""
     async with pool.acquire() as conn:
@@ -198,7 +198,7 @@ async def get_customer_or_create_by_identifier(
     name: str = "Customer",
     tier: str = "starter",
     fuzzy_threshold: float = FUZZY_THRESHOLD_DEFAULT,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get a customer by identifier, with fuzzy fallback on email/name, or create new."""
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -257,7 +257,7 @@ async def get_customer_or_create_by_identifier(
             # See NAME_FUZZY_THRESHOLD: a name match cannot tell a typo apart from a
             # different person, so linking on it would silently merge two customers.
             # Record the candidate on the new row instead and let a human resolve it.
-            duplicate_hint: Dict[str, Any] = {}
+            duplicate_hint: dict[str, Any] = {}
             if name and name != "Customer":
                 candidate = await conn.fetchrow(
                     """
@@ -332,10 +332,10 @@ async def get_customer_or_create_by_identifier(
 async def find_customer_by_name_email(
     pool: asyncpg.Pool,
     email: str,
-    name: Optional[str] = None,
-    company: Optional[str] = None,
+    name: str | None = None,
+    company: str | None = None,
     fuzzy_threshold: float = FUZZY_THRESHOLD_DEFAULT,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """
     Look up a customer by email (exact first, then fuzzy), optionally by name.
 
@@ -421,9 +421,13 @@ async def find_customer_by_name_email(
 
 async def get_customer_history(
     pool: asyncpg.Pool, email: str, limit: int = 10, include_resolved: bool = True
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get customer's ticket history. Resolves customer via identifier table for cross-channel support."""
-    status_filter = "(status IN ('open', 'in_progress', 'escalated', 'closed'))" if not include_resolved else "(1=1)"
+    status_filter = (
+        "(status IN ('open', 'in_progress', 'escalated', 'closed'))"
+        if not include_resolved
+        else "(1=1)"
+    )
 
     async with pool.acquire() as conn:
         customer_id = await conn.fetchval(
@@ -465,8 +469,8 @@ async def create_ticket(
     priority: str = "medium",
     channel: str = "email",
     initial_message: str = "",
-    customer_id: Optional[UUID] = None,
-) -> Dict[str, Any]:
+    customer_id: UUID | None = None,
+) -> dict[str, Any]:
     """Create a new ticket with auto-generated ticket number."""
     max_attempts = 3
     original_customer_id = customer_id
@@ -476,7 +480,9 @@ async def create_ticket(
             customer_id = original_customer_id
             try:
                 async with conn.transaction():
-                    ticket_number = f"TKT-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+                    ticket_number = (
+                        f"TKT-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+                    )
 
                     if not customer_id:
                         customer_row = await conn.fetchrow(
@@ -558,7 +564,7 @@ async def create_ticket(
                     raise
 
 
-async def get_ticket(pool: asyncpg.Pool, ticket_id: UUID) -> Optional[Dict[str, Any]]:
+async def get_ticket(pool: asyncpg.Pool, ticket_id: UUID) -> dict[str, Any] | None:
     """Get ticket with full details."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -576,7 +582,7 @@ async def get_ticket(pool: asyncpg.Pool, ticket_id: UUID) -> Optional[Dict[str, 
         return dict(row) if row else None
 
 
-async def get_ticket_by_number(pool: asyncpg.Pool, ticket_number: str) -> Optional[Dict[str, Any]]:
+async def get_ticket_by_number(pool: asyncpg.Pool, ticket_number: str) -> dict[str, Any] | None:
     """Get ticket by its human-facing TKT-… number.
 
     The success screen and tracking URL only ever carry the ticket_number, so
@@ -600,7 +606,7 @@ async def get_ticket_by_number(pool: asyncpg.Pool, ticket_number: str) -> Option
 
 async def update_ticket_status(
     pool: asyncpg.Pool, ticket_id: UUID, status: str
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Update ticket status."""
     resolved_at = datetime.now(UTC).replace(tzinfo=None) if status == "resolved" else None
 
@@ -624,11 +630,8 @@ async def update_ticket_status(
 
 
 async def list_tickets(
-    pool: asyncpg.Pool,
-    status: Optional[str] = None,
-    limit: int = 20,
-    offset: int = 0
-) -> tuple[List[Dict[str, Any]], int]:
+    pool: asyncpg.Pool, status: str | None = None, limit: int = 20, offset: int = 0
+) -> tuple[list[dict[str, Any]], int]:
     """List tickets with pagination."""
     async with pool.acquire() as conn:
         # Get total count
@@ -666,7 +669,7 @@ async def add_message(
     direction: str,
     content: str,
     channel: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Add a message to a ticket."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -686,7 +689,7 @@ async def add_message(
 
 async def get_ticket_messages(
     pool: asyncpg.Pool, ticket_id: UUID, limit: int = 50
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get messages for a ticket."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -705,7 +708,7 @@ async def get_ticket_messages(
 
 async def get_message_sentiment_history(
     pool: asyncpg.Pool, ticket_id: UUID, limit: int = 10
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get recent inbound message sentiment scores for a ticket, ordered by time."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -729,8 +732,8 @@ async def update_message_emotion_data(
     sentiment_score: float,
     emotion: str,
     urgency_score: float,
-    aspect_scores: Optional[Dict[str, float]] = None,
-) -> Optional[Dict[str, Any]]:
+    aspect_scores: dict[str, float] | None = None,
+) -> dict[str, Any] | None:
     """Update a message with full sentiment/emotion/urgency/aspect data in metadata."""
     async with pool.acquire() as conn:
         metadata_update = {
@@ -756,12 +759,12 @@ async def update_message_emotion_data(
 # Knowledge base queries
 async def search_knowledge_base(
     pool: asyncpg.Pool,
-    embedding: List[float],
+    embedding: list[float],
     customer_tier: str = "starter",
-    category: Optional[str] = None,
+    category: str | None = None,
     max_results: int = 5,
-    embedding_model: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    embedding_model: str | None = None,
+) -> list[dict[str, Any]]:
     """Search knowledge base by vector similarity.
 
     ``embedding_model`` restricts the search to rows indexed by the same model
@@ -782,8 +785,7 @@ async def search_knowledge_base(
 
         if embedding_model:
             where_clause += (
-                " AND kb.embedding IS NOT NULL"
-                f" AND kb.embedding_model = ${len(params) + 1}"
+                " AND kb.embedding IS NOT NULL" f" AND kb.embedding_model = ${len(params) + 1}"
             )
             params.append(embedding_model)
 
@@ -805,9 +807,9 @@ async def search_knowledge_base_text(
     pool: asyncpg.Pool,
     query: str,
     customer_tier: str = "starter",
-    category: Optional[str] = None,
+    category: str | None = None,
     max_results: int = 5,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Lexical KB search used when embeddings are unavailable or incomparable.
 
     Keeps the knowledge base usable when the embedding provider is down, out of
@@ -872,12 +874,12 @@ async def add_knowledge_base_article(
     pool: asyncpg.Pool,
     title: str,
     content: str,
-    embedding: List[float],
+    embedding: list[float],
     category: str = "general",
-    tags: Optional[List[str]] = None,
+    tags: list[str] | None = None,
     source: str = "internal",
     tier: str = "all",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Add a knowledge base article, replacing any article with the same title.
 
     knowledge_base.title carries a unique index (migration 010), so a plain
@@ -918,7 +920,7 @@ async def update_message_sentiment(
     pool: asyncpg.Pool,
     ticket_id: UUID,
     sentiment_score: float,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Update sentiment score on the latest inbound message for a ticket."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -947,10 +949,10 @@ async def create_agent_run(
     ticket_id: UUID,
     customer_id: UUID,
     input_message: str,
-    output_message: Optional[str] = None,
-    tool_calls: Optional[List[str]] = None,
+    output_message: str | None = None,
+    tool_calls: list[str] | None = None,
     status: str = "running",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Record an agent run."""
     tool_calls = list(tool_calls) if tool_calls else []
     async with pool.acquire() as conn:
@@ -975,8 +977,8 @@ async def complete_agent_run(
     agent_run_id: UUID,
     output_message: str,
     tokens_used: int = 0,
-    result: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Mark agent run as completed."""
     result = dict(result) if result else {}
     async with pool.acquire() as conn:
@@ -1003,7 +1005,7 @@ async def complete_agent_run(
 
 async def get_agent_runs(
     pool: asyncpg.Pool, ticket_id: UUID, limit: int = 10
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get agent runs for a ticket."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1027,7 +1029,7 @@ async def record_metric(
     metric_name: str,
     metric_value: float,
     metric_type: str = "gauge",
-    labels: Optional[Dict[str, str]] = None,
+    labels: dict[str, str] | None = None,
 ) -> None:
     """Record a metric."""
     if labels is None:
@@ -1049,7 +1051,7 @@ async def record_metric(
 
 async def get_metrics_summary(
     pool: asyncpg.Pool, hours: int = 24, limit: int = 100
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Get metrics summary for the last N hours."""
     # metrics.timestamp is TIMESTAMP WITHOUT TIME ZONE, so asyncpg rejects a
     # tz-aware cutoff ("can't subtract offset-naive and offset-aware datetimes").
@@ -1070,7 +1072,7 @@ async def get_metrics_summary(
         return [dict(row) for row in rows]
 
 
-async def get_dashboard_metrics(pool: asyncpg.Pool) -> Dict[str, Any]:
+async def get_dashboard_metrics(pool: asyncpg.Pool) -> dict[str, Any]:
     """Get aggregated metrics for dashboard."""
     async with pool.acquire() as conn:
         # Tickets by status
@@ -1079,19 +1081,15 @@ async def get_dashboard_metrics(pool: asyncpg.Pool) -> Dict[str, Any]:
         )
 
         # Avg resolution time
-        avg_resolution = await conn.fetchval(
-            """
+        avg_resolution = await conn.fetchval("""
             SELECT AVG(EXTRACT(EPOCH FROM (resolved_at - created_at))/3600) as avg_hours
             FROM tickets
             WHERE resolved_at IS NOT NULL
-            """
-        )
+            """)
 
         # Escalation rate
         total_tickets = await conn.fetchval("SELECT COUNT(*) FROM tickets")
-        escalated = await conn.fetchval(
-            "SELECT COUNT(*) FROM tickets WHERE status = 'escalated'"
-        )
+        escalated = await conn.fetchval("SELECT COUNT(*) FROM tickets WHERE status = 'escalated'")
         escalation_rate = (escalated / total_tickets * 100) if total_tickets > 0 else 0
 
         # Tickets by channel
@@ -1112,9 +1110,10 @@ async def get_dashboard_metrics(pool: asyncpg.Pool) -> Dict[str, Any]:
 # Name similarity flags a possible duplicate but never merges automatically
 # (see NAME_FUZZY_THRESHOLD). These helpers let a human resolve that flag.
 
+
 async def list_identity_review_queue(
     pool: asyncpg.Pool, limit: int = 50, offset: int = 0
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Customers flagged as possible duplicates, newest first, with their candidate."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1142,9 +1141,7 @@ async def list_identity_review_queue(
         return [dict(r) for r in rows]
 
 
-async def dismiss_identity_review(
-    pool: asyncpg.Pool, customer_id: UUID
-) -> Optional[Dict[str, Any]]:
+async def dismiss_identity_review(pool: asyncpg.Pool, customer_id: UUID) -> dict[str, Any] | None:
     """Mark a flagged customer as 'not a duplicate' without merging."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -1166,8 +1163,8 @@ async def merge_customers(
     pool: asyncpg.Pool,
     target_customer_id: UUID,
     source_customer_id: UUID,
-    reason: Optional[str] = None,
-) -> Dict[str, Any]:
+    reason: str | None = None,
+) -> dict[str, Any]:
     """
     Merge ``source`` into ``target``: the target survives, the source is deleted.
 
@@ -1214,7 +1211,7 @@ async def merge_customers(
                 target_customer_id,
             )
 
-            moved: Dict[str, int] = {}
+            moved: dict[str, int] = {}
             for table in ("tickets", "messages", "agent_runs", "customer_identifiers"):
                 status = await conn.execute(
                     f"UPDATE {table} SET customer_id = $1 WHERE customer_id = $2",

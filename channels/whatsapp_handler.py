@@ -1,16 +1,16 @@
 """WhatsApp channel handler for TechFlow CRM Digital FTE using Twilio."""
 
-import os
-from typing import Optional, Dict, Any
-
 import asyncio
+import os
+from typing import Any
+
 import structlog
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
-from exceptions import sanitize_error_message
 
+from exceptions import sanitize_error_message
 from kafka_client import KafkaProducerClient, create_inbound_whatsapp_message
-from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
 
@@ -23,7 +23,9 @@ class WhatsAppHandler:
         self.account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         self.auth_token = os.getenv("TWILIO_AUTH_TOKEN")
         self.whatsapp_number = os.getenv("TWILIO_WHATSAPP_NUMBER")
-        self.webhook_url = os.getenv("TWILIO_WEBHOOK_URL", "http://localhost:8000/webhooks/whatsapp")
+        self.webhook_url = os.getenv(
+            "TWILIO_WEBHOOK_URL", "http://localhost:8000/webhooks/whatsapp"
+        )
 
         # Soft-fail: log warning instead of crashing if credentials are missing
         self._configured = all([self.account_sid, self.auth_token, self.whatsapp_number])
@@ -48,8 +50,8 @@ class WhatsAppHandler:
     def validate_webhook(
         self,
         signature: str,
-        params: Optional[Dict[str, Any]] = None,
-        url: Optional[str] = None,
+        params: dict[str, Any] | None = None,
+        url: str | None = None,
     ) -> bool:
         """Validate a Twilio webhook signature.
 
@@ -73,7 +75,7 @@ class WhatsAppHandler:
             logger.error("Webhook validation error", error=sanitize_error_message(str(e)))
             return False
 
-    async def parse_webhook(self, form_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def parse_webhook(self, form_data: dict[str, Any]) -> dict[str, Any] | None:
         """Parse incoming WhatsApp webhook from Twilio."""
         try:
             # Twilio sends form-encoded data
@@ -116,7 +118,7 @@ class WhatsAppHandler:
             return None
 
     async def handle_incoming_message(
-        self, from_number: str, sender_name: str, message_body: str, media_url: Optional[str] = None
+        self, from_number: str, sender_name: str, message_body: str, media_url: str | None = None
     ) -> None:
         """Handle incoming WhatsApp message."""
         try:
@@ -150,7 +152,7 @@ class WhatsAppHandler:
             )
 
     async def send_message(
-        self, to_number: str, message_body: str, media_url: Optional[str] = None
+        self, to_number: str, message_body: str, media_url: str | None = None
     ) -> str:
         """Send a message via WhatsApp."""
         if not self._configured:
@@ -209,11 +211,13 @@ class WhatsAppHandler:
             raise
 
     async def send_template_message(
-        self, to_number: str, template_sid: str, parameters: Optional[list] = None
+        self, to_number: str, template_sid: str, parameters: list | None = None
     ) -> str:
         """Send a template message via WhatsApp."""
         if not self._configured:
-            logger.warning("WhatsApp not configured, template message not sent", to_number=to_number)
+            logger.warning(
+                "WhatsApp not configured, template message not sent", to_number=to_number
+            )
             return "not-configured"
 
         try:

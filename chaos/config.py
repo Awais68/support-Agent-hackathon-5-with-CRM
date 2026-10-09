@@ -17,15 +17,17 @@ class ChaosConfig:
 
     disruption_duration: int = int(os.getenv("CHAOS_DISRUPTION_DURATION", "30"))
 
-    container_names: dict = field(default_factory=lambda: {
-        "api": "techflow-api",
-        "worker": "techflow-worker",
-        "postgres": "techflow-postgres",
-        "kafka": "techflow-kafka",
-        "zookeeper": "techflow-zookeeper",
-        "prometheus": "techflow-prometheus",
-        "grafana": "techflow-grafana",
-    })
+    container_names: dict = field(
+        default_factory=lambda: {
+            "api": "techflow-api",
+            "worker": "techflow-worker",
+            "postgres": "techflow-postgres",
+            "kafka": "techflow-kafka",
+            "zookeeper": "techflow-zookeeper",
+            "prometheus": "techflow-prometheus",
+            "grafana": "techflow-grafana",
+        }
+    )
 
     @property
     def is_production(self) -> bool:

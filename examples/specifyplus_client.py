@@ -34,17 +34,13 @@ class SpecifyPlusClient:
         self.api_key = api_key
         self.timeout = timeout
         self.session = requests.Session()
-        self.session.headers.update(
-            {"X-API-Key": api_key, "Content-Type": "application/json"}
-        )
+        self.session.headers.update({"X-API-Key": api_key, "Content-Type": "application/json"})
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        resp = self.session.request(
-            method, self._url(path), timeout=self.timeout, **kwargs
-        )
+        resp = self.session.request(method, self._url(path), timeout=self.timeout, **kwargs)
         resp.raise_for_status()
         return resp.json()
 
@@ -98,21 +94,15 @@ class SpecifyPlusClient:
 
     def update_status(self, ticket_id: str, status: str) -> dict[str, Any]:
         """PATCH /tickets/{id}/status — open|in_progress|resolved|escalated|closed."""
-        return self._request(
-            "PATCH", f"/tickets/{ticket_id}/status", json={"status": status}
-        )
+        return self._request("PATCH", f"/tickets/{ticket_id}/status", json={"status": status})
 
     def reply_to_ticket(self, ticket_id: str, message: str) -> dict[str, Any]:
         """POST /tickets/{id}/reply — append a message to the conversation."""
-        return self._request(
-            "POST", f"/tickets/{ticket_id}/reply", json={"message": message}
-        )
+        return self._request("POST", f"/tickets/{ticket_id}/reply", json={"message": message})
 
     def ticket_messages(self, ticket_id: str, limit: int = 50) -> dict[str, Any]:
         """GET /tickets/{id}/messages — conversation history."""
-        return self._request(
-            "GET", f"/tickets/{ticket_id}/messages", params={"limit": limit}
-        )
+        return self._request("GET", f"/tickets/{ticket_id}/messages", params={"limit": limit})
 
     # --- Customers & Knowledge Base ---
 
@@ -164,7 +154,9 @@ class SpecifyPlusClient:
             "category": category,
             "priority": priority,
         }
-        return requests.post(self._url("/webhooks/webform"), json=payload, timeout=self.timeout).json()
+        return requests.post(
+            self._url("/webhooks/webform"), json=payload, timeout=self.timeout
+        ).json()
 
 
 if __name__ == "__main__":

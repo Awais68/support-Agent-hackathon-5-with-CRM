@@ -9,7 +9,6 @@ Must run BEFORE any agent processing. Checks:
 """
 
 import re
-from typing import Optional, Dict
 from enum import Enum
 
 import structlog
@@ -31,11 +30,11 @@ class GateResult:
         action: GateAction,
         reason: str = "",
         priority: str = "medium",
-        sentiment_score: Optional[float] = None,
+        sentiment_score: float | None = None,
         emotion: str = "neutral",
         urgency_score: float = 0.0,
         is_urgent: bool = False,
-        aspect_scores: Optional[Dict[str, float]] = None,
+        aspect_scores: dict[str, float] | None = None,
         sentiment_drop_detected: bool = False,
         sentiment_drop_amount: float = 0.0,
     ):
@@ -91,7 +90,7 @@ INTERNAL_DETAIL_PATTERNS = [
 ]
 
 
-def check_pricing_refund(message: str) -> Optional[str]:
+def check_pricing_refund(message: str) -> str | None:
     """Check if message is about pricing or refunds."""
     for pattern in PRICING_REFUND_PATTERNS:
         if re.search(pattern, message):
@@ -100,7 +99,7 @@ def check_pricing_refund(message: str) -> Optional[str]:
     return None
 
 
-def check_legal(message: str) -> Optional[str]:
+def check_legal(message: str) -> str | None:
     """Check if message mentions legal topics."""
     for pattern in LEGAL_PATTERNS:
         if re.search(pattern, message):
@@ -109,7 +108,7 @@ def check_legal(message: str) -> Optional[str]:
     return None
 
 
-def check_internal_details(message: str) -> Optional[str]:
+def check_internal_details(message: str) -> str | None:
     """Check if customer is asking about internal system details."""
     for pattern in INTERNAL_DETAIL_PATTERNS:
         if re.search(pattern, message):
