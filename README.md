@@ -77,8 +77,8 @@ Build backend: `hatchling`. Lint: `ruff` (py313, line length 100). Format: `blac
 | PostgreSQL + pgvector | `pgvector/pgvector:0.8.0-pg16`. Extensions: `vector`, `uuid-ossp`, `pg_trgm`, `fuzzystrmatch` | `docker-compose.yml`, `database/schema.sql` |
 | Kafka | `confluentinc/cp-kafka:7.6.0` + `cp-zookeeper:7.6.0` (or KRaft via `docker-compose.kraft.yml`) | compose, `k8s/kafka.yaml` |
 | Prometheus / Grafana | `prom/prometheus:v2.50.1`, `grafana/grafana:10.3.3`, `postgres-exporter:v0.15.0` | `docker-compose.yml`, `monitoring/` |
-| Chat LLM | **DeepSeek** (`deepseek-chat`) if `DEEPSEEK_API_KEY` is set, otherwise **OpenRouter** (`openai/gpt-4o`) | `chat_provider.py` |
-| Embeddings | **Gemini** `gemini-embedding-001` (1536 dims) if `GEMINI_API_KEY` is set, otherwise the chat provider with `EMBEDDING_MODEL` | `embeddings_provider.py` |
+| Chat LLM | **DeepSeek** (`deepseek-chat`, `DEEPSEEK_API_KEY`). **OpenRouter** (`openai/gpt-4o`) only as an optional fallback when `DEEPSEEK_API_KEY` is empty and `OPENROUTER_API_KEY` is set | `chat_provider.py` |
+| Embeddings | **Gemini** `gemini-embedding-001` (1536 dims, `GEMINI_API_KEY`). Without the key: error at startup, `/readyz` `embeddings: missing`, lexical-only KB search, alerts | `embeddings_provider.py`, `monitoring/alerts.yml` |
 | Speech-to-text | Groq Whisper `whisper-large-v3-turbo`, falling back to OpenAI `whisper-1` | `channels/voice_handler.py` |
 | Text-to-speech | OpenAI `tts-1` (voice `alloy`), falling back to gTTS, then text only | `channels/voice_handler.py` |
 | Voice translation | Chat provider, falling back to Groq `llama-3.3-70b-versatile` | `channels/voice_handler.py` |
@@ -95,8 +95,8 @@ Only tracked files are shown. Local-only folders such as `.venv/`, `.kilo/`, and
 specifyplus/
 ├── main.py                    # Entrypoint: RUN_MODE=api → uvicorn, RUN_MODE=worker → message processor
 ├── env_config.py              # Layered .env loading (.env.<ENVIRONMENT> over .env); no validation
-├── chat_provider.py           # Builds the chat client: DeepSeek, otherwise OpenRouter
-├── embeddings_provider.py     # Builds the embeddings client: Gemini, otherwise chat provider
+├── chat_provider.py           # Builds the chat client: DeepSeek (OpenRouter optional fallback)
+├── embeddings_provider.py     # Builds the embeddings client (Gemini); counts lexical fallbacks
 ├── embeddings_service.py      # EmbeddingsService class (not referenced by app code)
 ├── kafka_client.py            # aiokafka producer/consumer, topic names, NoOp producer, DLQ routing
 ├── metrics.py                 # Prometheus metric definitions
@@ -294,9 +294,9 @@ Then edit `.env`. These are the minimum values needed to boot the API without Ka
 ```dotenv
 DATABASE_URL=postgresql://techflow:techflow@localhost:5433/techflow
 ENABLE_KAFKA=false
-DEEPSEEK_API_KEY=<your key>     # or OPENROUTER_API_KEY — at least one is required or startup fails
+DEEPSEEK_API_KEY=<your key>     # chat; startup fails without it (or the OpenRouter fallback key)
 API_KEY=local-dev-key           # value clients must send as X-API-Key
-# optional: GEMINI_API_KEY=<key> to enable semantic KB search
+GEMINI_API_KEY=<key>            # KB embeddings; without it /readyz reports embeddings=missing
 ```
 
 ### 4. Run the API ✅
@@ -391,15 +391,15 @@ Precedence (`env_config.py`): shell env > `.env.<ENVIRONMENT>` > `.env`. `ENVIRO
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | — | When set, DeepSeek is the chat provider |
-| `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | `https://api.deepseek.com` / `deepseek-chat` | |
-| `OPENROUTER_API_KEY` | — | Chat provider when DeepSeek isn't set |
+| `DEEPSEEK_API_KEY` | — | Chat provider (required) |
+| `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | `https://api.deepseek.com` / `deepseek-chat` | Keep `deepseek-chat`: `deepseek-reasoner` has no tool calling |
+| `OPENROUTER_API_KEY` | — | Optional fallback, used only when `DEEPSEEK_API_KEY` is empty |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | |
 | `OPENAI_MODEL` | `openai/gpt-4o` | Chat model used on OpenRouter |
-| `GEMINI_API_KEY` | — | When set, embeddings go to Gemini |
+| `GEMINI_API_KEY` | — | Embeddings for KB vector search (required; missing = error log, `embeddings: missing`, alerts) |
 | `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta/openai/` | |
 | `GEMINI_EMBEDDING_MODEL` | `gemini-embedding-001` | Requested with `dimensions=1536` |
-| `EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Embedding model used when Gemini isn't set |
+| `EMBEDDING_MODEL` | unset | Explicit opt-in to embed through the chat client instead of Gemini (DeepSeek has no embedding models) |
 
 ### Voice
 
@@ -511,7 +511,7 @@ Error responses use the shape `{"error": "<CODE>", "message": "...", "details"?}
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| GET | `/health` | — | `{status: "healthy"\|"degraded", db: "ok"\|"error", kafka: "ok"\|"disabled"\|"error"}` |
+| GET | `/health` | — | `{status: "healthy"\|"degraded", db: "ok"\|"error", kafka: "ok"\|"disabled"\|"error", embeddings: "ok"\|"missing"}`. 503 only for DB/Kafka; missing embeddings is `degraded` with 200 |
 | GET | `:9100/metrics` (internal port `METRICS_PORT`, not the API port) | — | Prometheus text format; not exposed by ingress, Render or the compose host mapping |
 | GET | `/metrics/summary` | `?hours=24` | `{period_hours, metrics, count}` |
 | GET | `/metrics/dashboard` | — | `{status_counts, avg_resolution_hours, escalation_rate_percent, channel_counts, total_tickets}` |
@@ -768,13 +768,13 @@ machine. The items marked ✅ were fixed on branch `fix/known-issues`; see
 
 1. **Missing Gmail token/credential files become root-owned directories** through the compose bind
    mounts.
-2. **In Kubernetes, the worker liveness/readiness probes are no-ops** (`sys.exit(0)`), and the
-   worker Deployment lacks `GEMINI_*`/`DEEPSEEK_*` env.
-3. **The browser can't reach the API in Kubernetes or Render.** `NEXT_PUBLIC_API_URL` is baked into
-   the browser bundle as a cluster-internal name, and `API_INTERNAL_URL`/`API_KEY_SECRET` aren't set
-   for the web form there. Compose is fixed.
-4. **WhatsApp signature validation uses `request.url`,** so it fails behind a TLS-terminating
-   proxy/ingress. The voice webhook already has a `TWILIO_VOICE_WEBHOOK_URL` override; WhatsApp has none.
+2. **In Kubernetes, the worker liveness/readiness probes are no-ops** (`sys.exit(0)`). The API and
+   worker Deployments read `deepseek-api-key` and `gemini-api-key` from `techflow-secrets`, which
+   must exist before the first deploy.
+3. **Live ticket updates need a browser-reachable API in Kubernetes or Render.** Form submits, ticket
+   lookups and voice go through the web form's route handlers (runtime `API_INTERNAL_URL`), but the
+   WebSocket still uses `NEXT_PUBLIC_API_URL`, which is baked into the bundle at build time.
+4. *(Fixed, S10.)* WhatsApp signatures are checked against `TWILIO_WHATSAPP_WEBHOOK_URL` when set.
 5. **`KafkaProducerClient` retries only connection/timeout errors,** so the first publish to a cold
    broker can fail.
 6. **The k8s Ingress routes `/api` to the backend,** which has no `/api` prefix. It also shadows the

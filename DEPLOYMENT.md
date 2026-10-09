@@ -23,7 +23,9 @@ Required variables in `.env`:
 |----------|-------------|---------|
 | `DATABASE_URL` | Postgres connection string | `postgresql://techflow:techflow@postgres:5432/techflow` |
 | `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address | `kafka:29092` |
-| `OPENAI_API_KEY` | OpenAI API key (sk-...) | *(required)* |
+| `DEEPSEEK_API_KEY` | DeepSeek chat key (model `deepseek-chat`) | *(required)* |
+| `GEMINI_API_KEY` | Gemini key for KB embeddings; without it `/readyz` is `degraded` and KB search is lexical-only | *(required)* |
+| `OPENROUTER_API_KEY` | Optional chat fallback, used only when `DEEPSEEK_API_KEY` is empty | — |
 | `API_KEY` | API key for X-API-Key header (required; API refuses to start without it) | — |
 | `CORS_ORIGINS` | Allowed CORS origins | `http://localhost:3000,http://localhost:8000` |
 
@@ -144,15 +146,17 @@ kubectl apply -f k8s/ingress.yaml
 Before applying, encode real values in base64:
 
 ```bash
-echo -n "sk-proj-..." | base64   # OPENAI_API_KEY
-echo -n "test-key-12345" | base64 # APP_API_KEY
+echo -n "sk-..." | base64        # DEEPSEEK_API_KEY
+echo -n "test-key-12345" | base64 # API_KEY
 ```
 
 Replace placeholder values in `k8s/secrets.yaml` with the encoded output. Secrets that must be replaced:
 - `database-url`
 - `kafka-bootstrap-servers`
-- `openai-api-key`
-- `app-api-key`
+- `deepseek-api-key`
+- `gemini-api-key`
+- `openrouter-api-key` (optional fallback)
+- `api-key`
 - `twilio-account-sid` (optional)
 - `twilio-auth-token` (optional)
 - `twilio-whatsapp-number` (optional)
@@ -222,6 +226,6 @@ kubectl port-forward -n techflow service/techflow-grafana 3001:3001 &
 | Kafka container restarting | `KAFKA_ADVERTISED_LISTENERS` wrong | Check kafka healthcheck: `kafka-broker-api-versions` (no `.sh`) |
 | Worker crashes on startup | Gmail credentials missing/invalid | Set `GMAIL_CREDENTIALS_FILE` to empty and restart |
 | 500 instead of 401 | API key middleware HTTPException | Verify `verify_api_key` uses `request.headers` not `Header()` |
-| Agent returns no response | OpenAI API key missing/misconfigured | Check `OPENAI_API_KEY` in `.env` |
+| Agent returns no response | Chat key missing/misconfigured | Check `DEEPSEEK_API_KEY` in `.env` |
 | "Extension vector not found" | Extension name mismatch | Use `CREATE EXTENSION vector` (not `pgvector`) |
 | Grafana blank dashboard | No metrics data | Submit a ticket via webform to generate metrics |

@@ -35,13 +35,14 @@ git push origin main
 4. Render `render.yaml` ko read karke 4 cheezein banayega. **Deploy** dabao.
 
 ### 3. Secrets set karo
-Blueprint ke baad Render dashboard me 2 cheezein manually fill karni hain
-(`sync: false` wale):
+Blueprint ke baad Render dashboard me ye `sync: false` keys manually fill karni hain
+(**techflow-api** aur **techflow-worker** dono pe):
 
-- **techflow-api** → Environment → `OPENROUTER_API_KEY`:
-  - Free key [openrouter.ai/keys](https://openrouter.ai/keys) se banao
-  - Model free chahiye to `OPENAI_MODEL` = `meta-llama/llama-3.1-8b-instruct` kar do (gpt-4o charge karta hai)
-- **techflow-worker** → same `OPENROUTER_API_KEY`
+- `DEEPSEEK_API_KEY` (chat, required): key [platform.deepseek.com](https://platform.deepseek.com/api_keys) se.
+  Model `deepseek-chat` hi rakho; `deepseek-reasoner` tool calls support nahi karta.
+- `GEMINI_API_KEY` (KB embeddings, required): [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+  Iske bina `/readyz` `embeddings: missing` dikhata hai aur KB search sirf lexical chalti hai.
+- `OPENROUTER_API_KEY` (optional): sirf fallback, jab `DEEPSEEK_API_KEY` khali ho.
 
 `API_KEY` (X-API-Key header) auto-generate ho jayega — use karna hoga `/tickets` jaise protected endpoints pe.
 
@@ -80,7 +81,7 @@ Agar agent.whatsapp / agent.email channels bhi chahiye (worker ke through):
 
 | Problem | Fix |
 |---|---|
-| API crash-loop (status: crash) | Logs dekho. Sabse common: `OPENROUTER_API_KEY` nahi set / `DATABASE_URL` galat. |
+| API crash-loop (status: crash) | Logs dekho. Sabse common: `DEEPSEEK_API_KEY` nahi set / `DATABASE_URL` galat. |
 | `psql: could not connect` in pre-deploy | Database deploy hone ka wait karo, phir API ko `Deploy` se retry karo. |
 | Migration fail | Logs me exact SQL error dekho. `_migrations_applied` table idempotent hai — dobara deploy safe hai. |
 | Webform pe form submit → 404 | `NEXT_PUBLIC_API_URL` check karo (techflow-webform env me). API ka URL (`https://techflow-api.onrender.com`) hona chahiye. |
