@@ -334,9 +334,18 @@ npm run dev                      # http://localhost:3000
 ### 7. Run tests ✅
 
 ```bash
-uv run pytest                    # 141 passed; tests/test_e2e_playwright.py skips 12 without a live stack
+uv run python -m pytest -m "not slow and not integration and not e2e"   # what CI runs
+uv run python -m pytest          # everything; tests that need a live stack skip without one
 bash scripts/setup_e2e.sh        # full e2e: compose postgres+kafka, Playwright, live API
 ```
+
+Tests that need live services skip unless you point them at one:
+
+| Variable | Used by | Value |
+|---|---|---|
+| `OUTBOUND_TEST_DATABASE_URL` (or `DATABASE_URL`) | `test_notification_sender.py`, `test_kb_category.py` | Any PostgreSQL with pgvector; each test uses a throwaway schema |
+| `OUTBOUND_TEST_KAFKA` | Kafka test in `test_notification_sender.py` (`integration`) | e.g. `localhost:9092` |
+| `E2E_API_KEY` | `test_e2e_playwright.py` (`e2e`, needs the API on `:8000` and `playwright install chromium`) | Optional. Falls back to `API_KEY`, then `API_KEY_SECRET`, the same order the server reads them. Set it only when the server under test uses a different key |
 
 ### Full stack with Docker Compose ⚠️ not run, and fails as written
 
@@ -360,7 +369,7 @@ Precedence (`env_config.py`): shell env > `.env.<ENVIRONMENT>` > `.env`. `ENVIRO
 | `API_HOST` / `API_PORT` / `API_RELOAD` | `0.0.0.0` / `8000` / `false` | uvicorn settings used by `main.py` |
 | `PORT` | `8000` | Port used by the Dockerfile CMD (for Render) |
 | `API_KEY` | — | Required `X-API-Key` value. Checked first. |
-| `API_KEY_SECRET` | `test-key-12345` if both are unset | Backend fallback key. The web form's server route uses it to call the API. |
+| `API_KEY_SECRET` | — | Read when `API_KEY` is unset. With neither set the API refuses to start (except `RUN_MODE=test`). The web form's server route uses it to call the API. |
 | `CORS_ORIGINS` | `http://localhost:3000,http://localhost:8000` | Comma-separated list of allowed origins |
 | `DEBUG` | empty | Truthy values add tracebacks to error responses |
 | `RATE_LIMIT_PER_MINUTE` | `100` | Global per-IP limit |

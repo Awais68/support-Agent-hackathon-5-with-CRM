@@ -29,9 +29,15 @@ if not _PLAYWRIGHT_AVAILABLE:
         allow_module_level=True,
     )
 
+pytestmark = pytest.mark.e2e
+
 BASE_URL = "http://localhost:8000"
-# Must match the live server's API_KEY; scripts/setup_e2e.sh exports it.
-API_KEY = os.getenv("E2E_API_KEY", "")
+# Must match the live server's key. The server reads API_KEY, then
+# API_KEY_SECRET; E2E_API_KEY overrides both when the server runs elsewhere
+# with a different key (scripts/setup_e2e.sh exports it).
+API_KEY = (
+    os.getenv("E2E_API_KEY") or os.getenv("API_KEY") or os.getenv("API_KEY_SECRET") or ""
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -53,7 +59,10 @@ def server_available():
 async def browser():
     """Provide a browser instance."""
     async with async_playwright() as p:
-        browser = await p.chromium.launch()
+        try:
+            browser = await p.chromium.launch()
+        except Exception as e:  # browsers not downloaded
+            pytest.skip(f"Chromium not available ({e}). Run: playwright install chromium")
         yield browser
         await browser.close()
 
