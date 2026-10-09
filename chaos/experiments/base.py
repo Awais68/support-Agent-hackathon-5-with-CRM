@@ -120,8 +120,8 @@ class ChaosExperiment(ABC):
         cmd.extend(services)
         return self._run_cmd(cmd)
 
-    def _docker(self, action: str, container: str) -> tuple[int, str]:
-        return self._run_cmd(["docker", action, container])
+    def _docker(self, action: str, container: str, *args: str) -> tuple[int, str]:
+        return self._run_cmd(["docker", action, container, *args])
 
     def log(self, message: str) -> None:
         ts = datetime.now(UTC).strftime("%H:%M:%S")
