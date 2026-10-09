@@ -2,26 +2,26 @@
 
 import json
 from dataclasses import dataclass
-from typing import List, Optional
-from uuid import UUID
 from datetime import UTC, datetime
+from uuid import UUID
 
 import asyncpg
 import structlog
 from openai import AsyncOpenAI
-from exceptions import sanitize_error_message
-from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
 
+from agent.reply_guard import operator_voice_reason
 from database import queries as db
 from embeddings_provider import (
     EMBEDDING_CIRCUIT_BREAKER,
     EmbeddingProvider,
     resolve_embedding_provider,
 )
+from exceptions import sanitize_error_message
 from kafka_client import (
     KafkaProducerClient,
     create_escalation_message,
 )
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
 
@@ -36,7 +36,7 @@ class ToolContext:
     openai_client: AsyncOpenAI
     # Embeddings run on their own provider (see embeddings_provider). Left
     # unset, embeddings fall back to openai_client.
-    embedding_provider: Optional[EmbeddingProvider] = None
+    embedding_provider: EmbeddingProvider | None = None
 
 
 # OpenAI tool schemas (proper format for chat.completions.create)
@@ -60,7 +60,10 @@ OPENAI_TOOL_SCHEMAS = [
                     },
                     "category": {
                         "type": "string",
-                        "description": "Optional category filter: 'technical', 'billing', 'onboarding', 'general'",
+                        "description": (
+                            "Optional KB category filter: 'technical', 'billing', "
+                            "'onboarding' or 'product'. Omit it for general questions."
+                        ),
                     },
                     "max_results": {
                         "type": "integer",
@@ -189,7 +192,10 @@ OPENAI_TOOL_SCHEMAS = [
                     },
                     "response_body": {
                         "type": "string",
-                        "description": "The response message to send",
+                        "description": (
+                            "The exact message the customer will read, written directly "
+                            "to them (second person). Never describe what you did."
+                        ),
                     },
                     "response_type": {
                         "type": "string",
@@ -220,10 +226,8 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             category=category,
         )
 
-        provider = resolve_embedding_provider(
-            context.embedding_provider, context.openai_client
-        )
-        embedding: Optional[List[float]] = None
+        provider = resolve_embedding_provider(context.embedding_provider, context.openai_client)
+        embedding: list[float] | None = None
         degraded_reason = None
 
         if provider is None:
@@ -280,9 +284,7 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
                     max_results=max_results,
                 )
                 search_mode = "text"
-                degraded_reason = (
-                    "Knowledge base not indexed for the active embedding model"
-                )
+                degraded_reason = "Knowledge base not indexed for the active embedding model"
 
         found = len(results) > 0
         logger.info(
@@ -297,9 +299,11 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             "found": found,
             "results": [dict(r) for r in results] if results else [],
             "search_mode": search_mode,
-            "message": f"Found {len(results)} relevant articles about '{query}' for {customer_tier} tier."
-            if found
-            else f"No articles found for '{query}'. Please escalate to human support.",
+            "message": (
+                f"Found {len(results)} relevant articles about '{query}' for {customer_tier} tier."
+                if found
+                else f"No articles found for '{query}'. Please escalate to human support."
+            ),
         }
         if degraded_reason:
             response["degraded"] = True
@@ -307,7 +311,11 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
         return response
 
     except (asyncpg.PostgresError, ConnectionError) as e:
-        logger.error("Knowledge base search failed (DB)", error=sanitize_error_message(str(e)), query=args.get("query"))
+        logger.error(
+            "Knowledge base search failed (DB)",
+            error=sanitize_error_message(str(e)),
+            query=args.get("query"),
+        )
         return {
             "found": False,
             "results": [],
@@ -315,7 +323,11 @@ async def search_knowledge_base(args: dict, context: ToolContext) -> dict:
             "error": sanitize_error_message(str(e)),
         }
     except Exception as e:
-        logger.error("Knowledge base search failed", error=sanitize_error_message(str(e)), query=args.get("query"))
+        logger.error(
+            "Knowledge base search failed",
+            error=sanitize_error_message(str(e)),
+            query=args.get("query"),
+        )
         return {
             "found": False,
             "results": [],
@@ -418,9 +430,7 @@ async def get_customer_history(args: dict, context: ToolContext) -> dict:
         if not history:
             phone = args.get("customer_phone")
             if phone:
-                customer = await db.get_customer_by_identifier(
-                    context.db_pool, "phone", phone
-                )
+                customer = await db.get_customer_by_identifier(context.db_pool, "phone", phone)
                 if customer:
                     customer_email = customer["email"]
                     history = await db.get_customer_history(
@@ -439,9 +449,11 @@ async def get_customer_history(args: dict, context: ToolContext) -> dict:
         return {
             "ticket_count": len(history),
             "tickets": [dict(t) for t in history] if history else [],
-            "message": f"Found {len(history)} previous tickets for {customer_email}."
-            if history
-            else f"No previous tickets found for {customer_email}.",
+            "message": (
+                f"Found {len(history)} previous tickets for {customer_email}."
+                if history
+                else f"No previous tickets found for {customer_email}."
+            ),
         }
 
     except (asyncpg.PostgresError, ConnectionError) as e:
@@ -565,6 +577,21 @@ async def send_response(args: dict, context: ToolContext) -> dict:
         channel = args.get("channel", "email")
         response_body = args.get("response_body", "")
         response_type = args.get("response_type", "informational")
+
+        # Refuse internal or empty text before it is stored or delivered; the
+        # error tells the model to rewrite it for the customer.
+        rejection = operator_voice_reason(response_body)
+        if rejection:
+            logger.warning("send_response rejected", ticket_id=ticket_id, reason=rejection)
+            return {
+                "sent": False,
+                "message_id": None,
+                "message": "Response not sent.",
+                "error": (
+                    f"response_body rejected ({rejection}). Write it directly to the "
+                    "customer in the second person; do not describe your own actions."
+                ),
+            }
 
         logger.info(
             "Sending response",

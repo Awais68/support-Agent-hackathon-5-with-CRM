@@ -3,7 +3,7 @@
 import os
 import re
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 class AppError(Exception):
@@ -14,7 +14,7 @@ class AppError(Exception):
         message: str = "An unexpected error occurred",
         status_code: int = 500,
         error_code: str = "INTERNAL_ERROR",
-        details: Optional[Dict[str, Any]] = None,
+        details: dict[str, Any] | None = None,
     ):
         self.message = message
         self.status_code = status_code
@@ -26,7 +26,9 @@ class AppError(Exception):
 class DatabaseError(AppError):
     """Database operation failed."""
 
-    def __init__(self, message: str = "Database operation failed", details: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self, message: str = "Database operation failed", details: dict[str, Any] | None = None
+    ):
         super().__init__(
             message=message,
             status_code=500,
@@ -38,7 +40,7 @@ class DatabaseError(AppError):
 class NotFoundError(AppError):
     """Resource not found."""
 
-    def __init__(self, message: str = "Resource not found", details: Optional[Dict[str, Any]] = None):
+    def __init__(self, message: str = "Resource not found", details: dict[str, Any] | None = None):
         super().__init__(
             message=message,
             status_code=404,
@@ -50,7 +52,7 @@ class NotFoundError(AppError):
 class ValidationError(AppError):
     """Input validation failed."""
 
-    def __init__(self, message: str = "Validation failed", details: Optional[Dict[str, Any]] = None):
+    def __init__(self, message: str = "Validation failed", details: dict[str, Any] | None = None):
         super().__init__(
             message=message,
             status_code=400,
@@ -62,7 +64,7 @@ class ValidationError(AppError):
 class ConfigurationError(AppError):
     """System configuration error."""
 
-    def __init__(self, message: str = "Configuration error", details: Optional[Dict[str, Any]] = None):
+    def __init__(self, message: str = "Configuration error", details: dict[str, Any] | None = None):
         super().__init__(
             message=message,
             status_code=500,
@@ -74,7 +76,12 @@ class ConfigurationError(AppError):
 class ExternalServiceError(AppError):
     """External service (OpenAI, Kafka, Twilio, Gmail) failed."""
 
-    def __init__(self, message: str = "External service error", service: str = "unknown", details: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        message: str = "External service error",
+        service: str = "unknown",
+        details: dict[str, Any] | None = None,
+    ):
         _details = dict(details or {})
         _details["service"] = service
         super().__init__(
@@ -86,10 +93,13 @@ class ExternalServiceError(AppError):
 
 
 SENSITIVE_PATTERNS = [
-    (r'(postgresql|mysql|mongodb)://[^@\s]+:[^@\s]+@', lambda m: m.group(0).split(":")[0] + "://****:****@"),
-    (r'(postgresql|mysql|mongodb)://[^@\s]+@', lambda m: m.group(0).split("://")[0] + "://****@"),
-    (r'(api[_-]?key|secret|token|password|apikey)\s*[:=]\s*\S{4,}', lambda m: m.group(1) + "=***"),
-    (r'/[a-zA-Z]{2,}/[a-zA-Z0-9_/.-]{10,}', '/***/'),
+    (
+        r"(postgresql|mysql|mongodb)://[^@\s]+:[^@\s]+@",
+        lambda m: m.group(0).split(":")[0] + "://****:****@",
+    ),
+    (r"(postgresql|mysql|mongodb)://[^@\s]+@", lambda m: m.group(0).split("://")[0] + "://****@"),
+    (r"(api[_-]?key|secret|token|password|apikey)\s*[:=]\s*\S{4,}", lambda m: m.group(1) + "=***"),
+    (r"/[a-zA-Z]{2,}/[a-zA-Z0-9_/.-]{10,}", "/***/"),
 ]
 
 
@@ -105,18 +115,21 @@ def sanitize_error_message(msg: str) -> str:
     return msg
 
 
-def to_error_response(exc: Exception, include_traceback: bool = False) -> Dict[str, Any]:
+def to_error_response(exc: Exception, include_traceback: bool = False) -> dict[str, Any]:
     """Convert an exception to a structured error response dict (safe for client exposure).
 
     Never includes raw exception strings that could leak sensitive info.
     """
     if isinstance(exc, AppError):
-        resp: Dict[str, Any] = {
+        resp: dict[str, Any] = {
             "error": exc.error_code,
             "message": exc.message,
         }
         if exc.details:
-            safe_details = {k: sanitize_error_message(str(v)) if isinstance(v, str) else v for k, v in exc.details.items()}
+            safe_details = {
+                k: sanitize_error_message(str(v)) if isinstance(v, str) else v
+                for k, v in exc.details.items()
+            }
             resp["details"] = safe_details
     else:
         resp = {

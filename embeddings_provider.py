@@ -15,7 +15,6 @@ module rather than calling ``client.embeddings.create`` directly.
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional
 
 import structlog
 from openai import AsyncOpenAI
@@ -40,7 +39,7 @@ class EmbeddingProvider:
     client: AsyncOpenAI
     model: str
 
-    async def embed(self, text: str) -> List[float]:
+    async def embed(self, text: str) -> list[float]:
         """Embed one string at the dimension the schema's vector column expects."""
         response = await self.client.embeddings.create(
             input=text,
@@ -49,7 +48,7 @@ class EmbeddingProvider:
         )
         return response.data[0].embedding
 
-    async def embed_many(self, texts: List[str]) -> List[List[float]]:
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch in one request."""
         if not texts:
             return []
@@ -67,8 +66,8 @@ def gemini_api_key() -> str:
 
 
 def build_embedding_provider(
-    chat_client: Optional[AsyncOpenAI] = None,
-) -> Optional[EmbeddingProvider]:
+    chat_client: AsyncOpenAI | None = None,
+) -> EmbeddingProvider | None:
     """Build the embedding provider for this process.
 
     Prefers Gemini when ``GEMINI_API_KEY`` is set; otherwise falls back to the
@@ -96,9 +95,9 @@ def build_embedding_provider(
 
 
 def resolve_embedding_provider(
-    provider: Optional[EmbeddingProvider],
-    chat_client: Optional[AsyncOpenAI],
-) -> Optional[EmbeddingProvider]:
+    provider: EmbeddingProvider | None,
+    chat_client: AsyncOpenAI | None,
+) -> EmbeddingProvider | None:
     """Return ``provider`` if wired at startup, else embed via the chat client.
 
     Call sites that were never updated to carry a provider keep working, and

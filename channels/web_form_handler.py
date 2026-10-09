@@ -1,11 +1,12 @@
 """Web form channel handler for TechFlow CRM Digital FTE."""
 
-from typing import Optional, Dict, Any
+from typing import Any
+
+import structlog
 from pydantic import BaseModel, EmailStr, field_validator
 from pydantic import ValidationError as PydanticValidationError
-from exceptions import sanitize_error_message
-import structlog
 
+from exceptions import sanitize_error_message
 from kafka_client import KafkaProducerClient, create_inbound_webform_message
 
 logger = structlog.get_logger(__name__)
@@ -20,8 +21,8 @@ class WebFormSubmission(BaseModel):
     message: str
     category: str = "general"
     priority: str = "medium"
-    company: Optional[str] = None
-    phone: Optional[str] = None
+    company: str | None = None
+    phone: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -72,7 +73,9 @@ class WebFormHandler:
     def __init__(self, kafka_producer: KafkaProducerClient):
         self.kafka_producer = kafka_producer
 
-    async def validate_submission(self, data: Dict[str, Any]) -> tuple[bool, Optional[WebFormSubmission], Optional[str]]:
+    async def validate_submission(
+        self, data: dict[str, Any]
+    ) -> tuple[bool, WebFormSubmission | None, str | None]:
         """Validate a web form submission."""
         try:
             submission = WebFormSubmission(**data)
@@ -82,8 +85,8 @@ class WebFormHandler:
             return False, None, sanitize_error_message(str(e))
 
     async def process_submission(
-        self, submission: WebFormSubmission, ticket_id: Optional[str] = None
-    ) -> Dict[str, Any]:
+        self, submission: WebFormSubmission, ticket_id: str | None = None
+    ) -> dict[str, Any]:
         """Process a web form submission."""
         try:
             logger.info(
@@ -133,9 +136,7 @@ class WebFormHandler:
             )
             raise
 
-    async def handle_attachment(
-        self, email: str, filename: str, file_data: bytes
-    ) -> Optional[str]:
+    async def handle_attachment(self, email: str, filename: str, file_data: bytes) -> str | None:
         """Handle file attachment from web form.
 
         In production, this would upload to cloud storage (S3, GCS, etc.)
@@ -163,7 +164,7 @@ class WebFormHandler:
             )
             return None
 
-    def get_form_metadata(self) -> Dict[str, Any]:
+    def get_form_metadata(self) -> dict[str, Any]:
         """Get metadata about the form for frontend."""
         return {
             "categories": ["general", "technical", "billing", "onboarding"],

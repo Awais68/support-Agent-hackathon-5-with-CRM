@@ -11,8 +11,6 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
-      - ./database/migrations/001_initial.sql:/docker-entrypoint-initdb.d/02-migrations.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-techflow}"]
       interval: 10s
@@ -55,14 +53,55 @@ services:
     networks:
       - techflow
 
+  # One-shot: applies database/schema.sql + migrations/001..NNN in order,
+  # once each (tracked in _migrations_applied), then exits. Same runner as
+  # Render's pre-deploy step. The postgres image is reused for its psql.
+  migrate:
+    image: pgvector/pgvector:0.8.0-pg16
+    container_name: techflow-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}
+    working_dir: /app
+    entrypoint: ["bash", "scripts/render_migrate.sh"]
+    volumes:
+      - ./database:/app/database:ro
+      - ./scripts/render_migrate.sh:/app/scripts/render_migrate.sh:ro
+    restart: "no"
+    networks:
+      - techflow
+
+  # One-shot: embeds knowledge_base rows that have no vector (or one from a
+  # different model) so KB vector search works on a fresh volume. Needs an
+  # embedding provider key (GEMINI_API_KEY) in .env; without one it logs a
+  # warning and exits 0, and search degrades to lexical.
+  kb-embed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: techflow-kb-embed
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}
+    command: python -m database.seed --embed-kb-only
+    volumes:
+      - .:/app
+    restart: "no"
+    networks:
+      - techflow
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: techflow-api
     depends_on:
-      postgres:
-        condition: service_healthy
+      kb-embed:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
     environment:
@@ -72,7 +111,7 @@ services:
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
-      API_KEY: ${API_KEY:-test-key-12345}
+      API_KEY: ${API_KEY:-${API_KEY_SECRET:?set API_KEY or API_KEY_SECRET in .env}}
       CORS_ORIGINS: http://localhost:3000,http://localhost:8000
     ports:
       - "8000:8000"
@@ -93,8 +132,8 @@ services:
       dockerfile: Dockerfile
     container_name: techflow-worker
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
     environment:
@@ -128,7 +167,9 @@ services:
       context: ./web-form
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: http://api:8000
+        # Baked into the browser bundle, so it must be reachable from the
+        # user's browser, not just from inside the compose network.
+        NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
         NEXT_PUBLIC_COMPANY_NAME: ${COMPANY_NAME:-TechFlow Analytics}
         NEXT_PUBLIC_SUPPORT_EMAIL: ${SUPPORT_EMAIL:-support@techflow-analytics.com}
     container_name: techflow-web-form
@@ -136,6 +177,10 @@ services:
       - "3000:3000"
     environment:
       NODE_ENV: production
+      # Server-side route handlers (/api/tickets, /api/voice) call the API
+      # over the compose network with the shared key.
+      API_INTERNAL_URL: http://api:8000
+      API_KEY_SECRET: ${API_KEY:-${API_KEY_SECRET:?set API_KEY or API_KEY_SECRET in .env}}
     depends_on:
       api:
         condition: service_healthy

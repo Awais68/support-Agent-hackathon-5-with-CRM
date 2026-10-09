@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Idempotent database migration runner for Render pre-deploy command.
-# Applies database/schema.sql + database/migrations/*.sql exactly once each.
+# Idempotent database migration runner (Render pre-deploy command and the
+# docker-compose `migrate` service).
+# Applies database/schema.sql + database/migrations/*.sql exactly once each,
+# in filename order. Each file runs in one transaction together with its
+# bookkeeping row, so a failure leaves nothing half-applied.
 set -uo pipefail
 
 if [ -z "${DATABASE_URL:-}" ]; then
@@ -9,7 +12,19 @@ if [ -z "${DATABASE_URL:-}" ]; then
 fi
 
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
-    "CREATE TABLE IF NOT EXISTS _migrations_applied (name TEXT PRIMARY KEY);"
+    "CREATE TABLE IF NOT EXISTS _migrations_applied (name TEXT PRIMARY KEY);" || exit 1
+
+# Baseline for databases created before this runner existed: the old
+# docker-compose init mounted schema.sql + 001 into docker-entrypoint-initdb.d,
+# leaving the tables but no bookkeeping. Neither file is re-runnable, so
+# record them as applied; 002+ are written to apply on top.
+tracked=$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM _migrations_applied") || exit 1
+has_core=$(psql "$DATABASE_URL" -tAc "SELECT to_regclass('public.customers') IS NOT NULL") || exit 1
+if [ "$tracked" = "0" ] && [ "$has_core" = "t" ]; then
+    echo "baseline: existing schema without bookkeeping; marking schema + 001 as applied"
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
+        "INSERT INTO _migrations_applied (name) VALUES ('schema'), ('001_initial.sql') ON CONFLICT DO NOTHING" || exit 1
+fi
 
 apply() {
     local name="$1"
@@ -21,8 +36,8 @@ apply() {
         return 0
     fi
     echo "applying $name"
-    if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$file"; then
-        psql "$DATABASE_URL" -q -c "INSERT INTO _migrations_applied (name) VALUES ('$name')"
+    if psql "$DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 -q -f "$file" \
+        -c "INSERT INTO _migrations_applied (name) VALUES ('$name')"; then
         echo "applied $name"
     else
         echo "FAILED: $name" >&2
@@ -30,9 +45,9 @@ apply() {
     fi
 }
 
-apply "schema" database/schema.sql
+apply "schema" database/schema.sql || exit 1
 for f in database/migrations/*.sql; do
-    apply "$(basename "$f")" "$f"
+    apply "$(basename "$f")" "$f" || exit 1
 done
 
 echo "Migrations complete."

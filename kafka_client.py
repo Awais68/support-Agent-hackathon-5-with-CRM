@@ -1,24 +1,25 @@
 """Kafka client for TechFlow CRM Digital FTE with DLQ routing and retry logic."""
 
-import json
-import os
-from datetime import UTC, datetime
-from typing import Any, Callable, Dict, Optional
-from uuid import UUID, uuid4
 import asyncio
 import inspect
+import json
+import os
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID, uuid4
 
-from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 import structlog
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from tenacity import (
     AsyncRetrying,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
 
 from exceptions import sanitize_error_message
-from utils.circuit_breaker import get_circuit_breaker, CircuitBreakerError
+from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker
 
 logger = structlog.get_logger(__name__)
 
@@ -65,10 +66,10 @@ class KafkaMessage:
     def __init__(
         self,
         topic: str,
-        payload: Dict[str, Any],
-        message_id: Optional[str] = None,
-        timestamp: Optional[datetime] = None,
-        headers: Optional[Dict[str, str]] = None,
+        payload: dict[str, Any],
+        message_id: str | None = None,
+        timestamp: datetime | None = None,
+        headers: dict[str, str] | None = None,
     ):
         self.topic = topic
         self.payload = payload
@@ -78,7 +79,7 @@ class KafkaMessage:
         self.timestamp = timestamp or datetime.now(UTC)
         self.headers = headers if headers is not None else {}
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
             "message_id": self.message_id,
@@ -93,15 +94,17 @@ class KafkaMessage:
         return json.dumps(self.to_dict(), cls=JSONEncoder)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "KafkaMessage":
+    def from_dict(cls, data: dict[str, Any]) -> "KafkaMessage":
         """Create from dictionary."""
         return cls(
             topic=data["topic"],
             payload=data["payload"],
             message_id=data.get("message_id"),
-            timestamp=datetime.fromisoformat(data["timestamp"])
-            if isinstance(data.get("timestamp"), str)
-            else data.get("timestamp"),
+            timestamp=(
+                datetime.fromisoformat(data["timestamp"])
+                if isinstance(data.get("timestamp"), str)
+                else data.get("timestamp")
+            ),
             headers=data.get("headers", {}),
         )
 
@@ -116,7 +119,7 @@ class KafkaProducerClient:
 
     def __init__(self, bootstrap_servers: str):
         self.bootstrap_servers = bootstrap_servers
-        self.producer: Optional[AIOKafkaProducer] = None
+        self.producer: AIOKafkaProducer | None = None
         self.retry_policy = AsyncRetrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -128,11 +131,13 @@ class KafkaProducerClient:
         protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
         config = {"security_protocol": protocol}
         if protocol in ("SASL_PLAINTEXT", "SASL_SSL"):
-            config.update({
-                "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
-                "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
-                "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
-            })
+            config.update(
+                {
+                    "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+                    "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
+                    "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
+                }
+            )
         return config
 
     async def start(self) -> None:
@@ -153,7 +158,7 @@ class KafkaProducerClient:
             logger.info("Kafka producer stopped")
 
     async def send_message(
-        self, topic: str, payload: Dict[str, Any], key: Optional[str] = None
+        self, topic: str, payload: dict[str, Any], key: str | None = None
     ) -> str:
         """Send a message to a Kafka topic with retry logic."""
         message = KafkaMessage(topic, payload)
@@ -240,18 +245,20 @@ class KafkaConsumerClient:
     def __init__(self, bootstrap_servers: str, group_id: str):
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
-        self.consumer: Optional[AIOKafkaConsumer] = None
+        self.consumer: AIOKafkaConsumer | None = None
 
     def _sasl_config(self) -> dict:
         """Build SASL config dict from environment variables."""
         protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
         config = {"security_protocol": protocol}
         if protocol in ("SASL_PLAINTEXT", "SASL_SSL"):
-            config.update({
-                "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
-                "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
-                "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
-            })
+            config.update(
+                {
+                    "sasl_mechanism": os.getenv("KAFKA_SASL_MECHANISM", "PLAIN"),
+                    "sasl_plain_username": os.getenv("KAFKA_SASL_USERNAME", ""),
+                    "sasl_plain_password": os.getenv("KAFKA_SASL_PASSWORD", ""),
+                }
+            )
         return config
 
     async def start(self, topics: list[str]) -> None:
@@ -329,7 +336,7 @@ def create_inbound_email_message(
     sender_name: str,
     subject: str,
     body: str,
-    message_id: Optional[str] = None,
+    message_id: str | None = None,
 ) -> KafkaMessage:
     """Create an inbound email message."""
     return KafkaMessage(
@@ -350,8 +357,8 @@ def create_inbound_whatsapp_message(
     customer_phone: str,
     customer_name: str,
     message_body: str,
-    media_url: Optional[str] = None,
-    message_id: Optional[str] = None,
+    media_url: str | None = None,
+    message_id: str | None = None,
 ) -> KafkaMessage:
     """Create an inbound WhatsApp message."""
     return KafkaMessage(
@@ -375,9 +382,9 @@ def create_inbound_webform_message(
     message_body: str,
     category: str = "general",
     priority: str = "medium",
-    customer_phone: Optional[str] = None,
-    message_id: Optional[str] = None,
-    ticket_id: Optional[str] = None,
+    customer_phone: str | None = None,
+    message_id: str | None = None,
+    ticket_id: str | None = None,
 ) -> KafkaMessage:
     """Create an inbound web form message.
 
@@ -440,7 +447,7 @@ def create_agent_processing_message(
     customer_id: str,
     input_message: str,
     channel: str,
-    message_id: Optional[str] = None,
+    message_id: str | None = None,
 ) -> KafkaMessage:
     """Create an agent processing event."""
     return KafkaMessage(
@@ -462,8 +469,8 @@ def create_escalation_message(
     customer_id: str,
     reason: str,
     priority: str = "high",
-    context: Optional[Dict[str, Any]] = None,
-    message_id: Optional[str] = None,
+    context: dict[str, Any] | None = None,
+    message_id: str | None = None,
 ) -> KafkaMessage:
     """Create an escalation event."""
     return KafkaMessage(

@@ -26,11 +26,12 @@ Usage:
 """
 
 import asyncio
+import functools
 import os
 import time
-import functools
+from collections.abc import Awaitable, Callable
 from enum import Enum
-from typing import Optional, Callable, Any, Awaitable
+from typing import Any
 
 import structlog
 
@@ -53,9 +54,9 @@ class CircuitBreaker:
     def __init__(
         self,
         name: str,
-        failure_threshold: Optional[int] = None,
-        recovery_timeout: Optional[float] = None,
-        half_open_max_calls: Optional[int] = None,
+        failure_threshold: int | None = None,
+        recovery_timeout: float | None = None,
+        half_open_max_calls: int | None = None,
     ):
         self.name = name
 
@@ -79,7 +80,7 @@ class CircuitBreaker:
 
         self.state = CircuitState.CLOSED
         self.failure_count = 0
-        self.last_failure_time: Optional[float] = None
+        self.last_failure_time: float | None = None
         self.half_open_calls = 0
         self._lock = asyncio.Lock()
 
@@ -100,9 +101,9 @@ class CircuitBreaker:
 
     async def __aexit__(
         self,
-        exc_type: Optional[type],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[object],
+        exc_type: type | None,
+        exc_val: BaseException | None,
+        exc_tb: object | None,
     ) -> bool:
         if exc_type is CircuitBreakerError:
             return False
@@ -215,9 +216,9 @@ _breakers: dict[str, CircuitBreaker] = {}
 
 def get_circuit_breaker(
     name: str,
-    failure_threshold: Optional[int] = None,
-    recovery_timeout: Optional[float] = None,
-    half_open_max_calls: Optional[int] = None,
+    failure_threshold: int | None = None,
+    recovery_timeout: float | None = None,
+    half_open_max_calls: int | None = None,
 ) -> CircuitBreaker:
     """Return (or create) the named singleton :class:`CircuitBreaker`.
 
@@ -237,11 +238,12 @@ def get_circuit_breaker(
 
 # ── decorator ────────────────────────────────────────────────────────────
 
+
 def circuit_breaker(
     name: str,
-    failure_threshold: Optional[int] = None,
-    recovery_timeout: Optional[float] = None,
-    half_open_max_calls: Optional[int] = None,
+    failure_threshold: int | None = None,
+    recovery_timeout: float | None = None,
+    half_open_max_calls: int | None = None,
 ) -> Callable:
     """Decorator: wrap an async function with a named circuit breaker.
 
@@ -260,5 +262,7 @@ def circuit_breaker(
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
             async with breaker:
                 return await func(*args, **kwargs)
+
         return wrapper
+
     return decorator

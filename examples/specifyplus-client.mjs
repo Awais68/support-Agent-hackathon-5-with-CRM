@@ -124,7 +124,7 @@ export class SpecifyPlusClient {
 if (process.argv[1] === new URL(import.meta.url).pathname) {
   const client = new SpecifyPlusClient(
     process.env.SPECIFYPLUS_URL || "http://localhost:8000",
-    process.env.SPECIFYPLUS_API_KEY || "test-key-12345",
+    process.env.SPECIFYPLUS_API_KEY,
   );
 
   const run = async () => {

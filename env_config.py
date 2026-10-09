@@ -9,12 +9,11 @@ them — was invisible to those processes.
 
 import os
 from pathlib import Path
-from typing import List
 
 from dotenv import load_dotenv
 
 
-def load_environment(verbose: bool = False) -> List[str]:
+def load_environment(verbose: bool = False) -> list[str]:
     """Load .env files in precedence order and return the files applied.
 
     Priority (highest to lowest):
@@ -27,7 +26,7 @@ def load_environment(verbose: bool = False) -> List[str]:
     order.
     """
     env = os.getenv("ENVIRONMENT", "development")
-    loaded: List[str] = []
+    loaded: list[str] = []
 
     for path in (Path(f".env.{env}"), Path(".env")):
         if path.exists():

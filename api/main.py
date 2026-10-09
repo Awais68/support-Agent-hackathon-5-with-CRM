@@ -1,5 +1,6 @@
 """FastAPI application for TechFlow CRM Digital FTE."""
 
+import hmac
 import os
 import re
 import traceback as tb
@@ -11,8 +12,16 @@ from xml.sax.saxutils import escape as xml_escape
 
 import asyncpg
 import structlog
-from env_config import load_environment
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -23,6 +32,9 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from twilio.request_validator import RequestValidator
+
+from env_config import load_environment
 
 # Load .env BEFORE the first-party imports below: `uvicorn api.main:app` bypasses
 # main.py's entrypoint, and modules like api.rate_limiter read os.getenv() at
@@ -31,12 +43,12 @@ from slowapi.middleware import SlowAPIMiddleware
 load_environment()
 
 from agent.customer_success_agent import AgentContext, CustomerSuccessAgent  # noqa: E402
-from chat_provider import build_chat_client, chat_model, chat_provider_config  # noqa: E402
 from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit  # noqa: E402
 from api.websocket_manager import WebSocketManager  # noqa: E402
 from channels.voice_handler import VoiceHandler, twilio_language  # noqa: E402
 from channels.web_form_handler import WebFormHandler, WebFormSubmission  # noqa: E402
 from channels.whatsapp_handler import WhatsAppHandler  # noqa: E402
+from chat_provider import build_chat_client, chat_model, chat_provider_config  # noqa: E402
 from database import queries as db  # noqa: E402
 from embeddings_provider import (  # noqa: E402
     EMBEDDING_CIRCUIT_BREAKER,
@@ -116,21 +128,19 @@ class MessageResponse(BaseModel):
 
 
 # Mirrors the tickets.status CHECK constraint in database/schema.sql
-VALID_TICKET_STATUSES = frozenset(
-    {"open", "in_progress", "resolved", "escalated", "closed"}
-)
+VALID_TICKET_STATUSES = frozenset({"open", "in_progress", "resolved", "escalated", "closed"})
 
 
 class UpdateStatusRequest(BaseModel):
-    status: str = Field(..., description="New status: open, in_progress, resolved, escalated, closed")
+    status: str = Field(
+        ..., description="New status: open, in_progress, resolved, escalated, closed"
+    )
 
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
         if v not in VALID_TICKET_STATUSES:
-            raise ValueError(
-                f"status must be one of: {', '.join(sorted(VALID_TICKET_STATUSES))}"
-            )
+            raise ValueError(f"status must be one of: {', '.join(sorted(VALID_TICKET_STATUSES))}")
         return v
 
 
@@ -140,9 +150,12 @@ class ReplyRequest(BaseModel):
 
 class MergeCustomerRequest(BaseModel):
     source_customer_id: UUID = Field(
-        ..., description="Customer to absorb; its tickets move to the path customer and it is deleted"
+        ...,
+        description="Customer to absorb; its tickets move to the path customer and it is deleted",
     )
-    reason: str | None = Field(None, max_length=500, description="Why the two records are the same person")
+    reason: str | None = Field(
+        None, max_length=500, description="Why the two records are the same person"
+    )
 
 
 class MetricsResponse(BaseModel):
@@ -227,9 +240,21 @@ async def get_embedding_provider(request: Request) -> EmbeddingProvider | None:
     return getattr(request.app.state, "embedding_provider", None)
 
 
-async def verify_api_key(
-    request: Request, x_api_key: str | None = Header(None)
-) -> bool:
+def configured_api_key() -> str | None:
+    """Return the API key the server expects, or None when none is configured.
+
+    Deploy configs (docker-compose, render.yaml, k8s) set API_KEY; the .env
+    files set API_KEY_SECRET. Accept both so the key is never silently ignored.
+    """
+    return os.getenv("API_KEY") or os.getenv("API_KEY_SECRET") or None
+
+
+def _is_test_mode() -> bool:
+    """Whether the process runs in the explicit test mode (RUN_MODE=test)."""
+    return os.getenv("RUN_MODE", "").lower() == "test"
+
+
+async def verify_api_key(request: Request, x_api_key: str | None = Header(None)) -> bool:
     """Verify API key for non-webhook endpoints."""
     # Skip verification for webhook, health, and metrics endpoints
     if request.url.path in [
@@ -237,16 +262,15 @@ async def verify_api_key(
         "/metrics",
         "/webhooks/whatsapp",
         "/webhooks/webform",
-        "/webhooks/voice/message",
+        # Authenticated by Twilio signature inside the handler, not by API key.
         "/webhooks/voice/call",
     ]:
         return True
 
-    # Deploy configs (docker-compose, render.yaml, k8s) set API_KEY; the .env
-    # files set API_KEY_SECRET. Accept both so the key is never silently ignored.
-    api_key = os.getenv("API_KEY") or os.getenv("API_KEY_SECRET") or "test-key-12345"
+    # Fail closed: with no key configured every protected request is rejected.
+    api_key = configured_api_key()
     key = request.headers.get("X-API-Key")
-    if not key or key != api_key:
+    if not api_key or not key or not hmac.compare_digest(key, api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     return True
@@ -258,6 +282,12 @@ async def lifespan(app: FastAPI):
     """Application lifespan management."""
     # Startup
     logger.info("Initializing FastAPI application")
+
+    if not configured_api_key() and not _is_test_mode():
+        raise ConfigurationError(
+            message="API_KEY (or API_KEY_SECRET) is not set. Refusing to start "
+            "without an API key; set RUN_MODE=test only for test runs."
+        )
 
     # Initialize database
     db_url = os.getenv(
@@ -304,7 +334,9 @@ async def lifespan(app: FastAPI):
         raise ConfigurationError(
             message=f"{e}. The agent cannot run without an AI provider key."
         ) from e
-    logger.info("Chat provider initialized", provider=chat_provider_config().name, model=chat_model())
+    logger.info(
+        "Chat provider initialized", provider=chat_provider_config().name, model=chat_model()
+    )
 
     # Embeddings go to their own provider: OpenRouter serves chat here but has
     # no embedding credits, so knowledge base search runs on Gemini.
@@ -317,6 +349,7 @@ async def lifespan(app: FastAPI):
     # Initialize MCP Server for extensible tools
     # NOTE: MCP server provides alternative tool execution path via Model Context Protocol
     from mcp_server import mcp_server
+
     app.state.mcp_server = mcp_server
     logger.info("MCP server initialized")
 
@@ -337,17 +370,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 # Rate limiting
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
@@ -358,16 +380,47 @@ app.add_middleware(SlowAPIMiddleware)
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     """Verify API key for all endpoints except webhooks and health."""
+    # CORS preflights carry no credentials by design; let CORSMiddleware
+    # answer them instead of rejecting them with a 401.
+    if request.method == "OPTIONS":
+        return await call_next(request)
     try:
         await verify_api_key(request)
     except HTTPException as e:
         from starlette.responses import JSONResponse
+
         return JSONResponse(
             status_code=e.status_code,
             content={"detail": e.detail},
         )
     response = await call_next(request)
     return response
+
+
+def cors_origins_from_env() -> list[str]:
+    """Parse CORS_ORIGINS (comma-separated) into an explicit origin allowlist."""
+    raw = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000")
+    origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+    if "*" in origins:
+        # A wildcard together with allow_credentials would let any site make
+        # credentialed requests; refuse it rather than guess.
+        raise ConfigurationError(
+            message="CORS_ORIGINS must list explicit origins; '*' is not allowed."
+        )
+    return origins
+
+
+# CORS is registered after the API key middleware so it wraps it: preflights
+# are answered here, and 401 responses still carry CORS headers so browsers
+# surface the real status instead of an opaque CORS error.
+cors_origins = cors_origins_from_env()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
+)
 
 
 # Health check endpoint
@@ -700,14 +753,16 @@ async def webhook_webform(
                 channel="webform",
                 ticket_number=ticket["ticket_number"],
             )
-            await db.add_message(
-                pool,
-                ticket_id=ticket["id"],
-                customer_id=ticket["customer_id"],
-                direction="outbound",
-                content=result["response"],
-                channel="webform",
-            )
+            # send_response already stored the reply; a blocked reply is empty.
+            if result["response"] and not result.get("reply_persisted"):
+                await db.add_message(
+                    pool,
+                    ticket_id=ticket["id"],
+                    customer_id=ticket["customer_id"],
+                    direction="outbound",
+                    content=result["response"],
+                    channel="webform",
+                )
         except Exception as e:
             logger.warning(
                 "Synchronous agent reply failed",
@@ -730,6 +785,15 @@ async def webhook_webform(
 # ---------------------------------------------------------------------------
 # Voice channel (voice messages + phone calls)
 # ---------------------------------------------------------------------------
+VOICE_FALLBACK_REPLY = (
+    "I'm sorry, I'm having trouble right now. A human agent will call you back shortly."
+)
+VOICE_HANDOFF_REPLY = (
+    "Thanks for your patience. I've passed your request to our support team, "
+    "and a human agent will follow up with you shortly."
+)
+
+
 async def _run_voice_agent(
     pool: asyncpg.Pool,
     kafka_producer: KafkaProducerClient,
@@ -779,7 +843,8 @@ async def _run_voice_agent(
     )
 
     return {
-        "response": result["response"],
+        # Empty when the agent's reply was blocked and the ticket escalated.
+        "response": result["response"] or VOICE_HANDOFF_REPLY,
         "ticket_id": result["ticket_id"],
         "ticket_number": ticket["ticket_number"],
     }
@@ -824,6 +889,25 @@ async def webhook_voice_message(
     return result.to_dict()
 
 
+def _require_twilio_signature(request: Request, params: dict[str, str]) -> None:
+    """Reject a Twilio webhook unless its X-Twilio-Signature is valid.
+
+    Fails closed: without TWILIO_AUTH_TOKEN nothing can be verified, so the
+    request is refused. TWILIO_VOICE_WEBHOOK_URL overrides the URL used for
+    the check when a proxy terminates TLS and request.url would differ from
+    the public URL Twilio signed.
+    """
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not auth_token:
+        logger.error("Rejected Twilio voice webhook: TWILIO_AUTH_TOKEN not configured")
+        raise HTTPException(status_code=403, detail="Webhook signature validation unavailable")
+    url = os.getenv("TWILIO_VOICE_WEBHOOK_URL") or str(request.url)
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature or not RequestValidator(auth_token).validate(url, params, signature):
+        logger.warning("Rejected Twilio voice webhook: invalid signature")
+        raise HTTPException(status_code=403, detail="Invalid webhook signature")
+
+
 @app.post("/webhooks/voice/call")
 @limiter.limit(strict_limit)
 async def webhook_voice_call(request: Request) -> Response:
@@ -833,6 +917,7 @@ async def webhook_voice_call(request: Request) -> Response:
     request, then the agent's spoken reply in the customer's own language.
     """
     form = await request.form()
+    _require_twilio_signature(request, {k: str(v) for k, v in form.items()})
     speech_result = str(form.get("SpeechResult") or "").strip()
     try:
         speech_confidence = float(str(form.get("Confidence") or 1.0))
@@ -882,10 +967,7 @@ async def webhook_voice_call(request: Request) -> Response:
         reply = agent_result["response"]
     except Exception as e:
         logger.error("Voice call agent failed", error=sanitize_error_message(str(e)))
-        reply = (
-            "I'm sorry, I'm having trouble right now. "
-            "A human agent will call you back shortly."
-        )
+        reply = VOICE_FALLBACK_REPLY
 
     if was_translated:
         reply = await handler.translate_to_language(reply, lang)
@@ -958,7 +1040,9 @@ async def get_customer_history(
     pool: asyncpg.Pool = Depends(get_db),
 ) -> dict[str, Any]:
     """Get customer history."""
-    history = await db.get_customer_history(pool, email, limit=limit, include_resolved=include_resolved)
+    history = await db.get_customer_history(
+        pool, email, limit=limit, include_resolved=include_resolved
+    )
 
     return {
         "email": email,

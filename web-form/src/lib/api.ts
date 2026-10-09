@@ -124,7 +124,8 @@ export interface VoiceResponse {
 export async function submitVoiceMessage(
   payload: VoiceMessagePayload
 ): Promise<VoiceResponse> {
-  const response = await fetch(`${API_URL}/webhooks/voice/message`, {
+  // Same-origin proxy: the backend endpoint needs the server-side API key.
+  const response = await fetch('/api/voice', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

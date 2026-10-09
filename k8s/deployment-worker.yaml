@@ -26,6 +26,9 @@ spec:
       - name: worker
         image: techflow-api:latest
         imagePullPolicy: Always
+        # The image's default CMD starts the API (uvicorn). Run the Kafka
+        # consumer instead, same entrypoint as docker-compose's worker service.
+        command: ["python", "-m", "workers.message_processor"]
         env:
         - name: DATABASE_URL
           valueFrom:

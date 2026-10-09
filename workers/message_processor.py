@@ -8,26 +8,27 @@ import asyncpg
 import structlog
 from openai import APIError as OpenAIAPIError
 
-from channels.gmail_handler import run_gmail_polling_loop
-from workers.metrics_collector import run_metrics_collector
-from kafka_client import (
-    KafkaProducerClient,
-    KafkaConsumerClient,
-    NoOpKafkaProducer,
-    INBOUND_EMAIL_TOPIC,
-    INBOUND_WHATSAPP_TOPIC,
-    INBOUND_WEBFORM_TOPIC,
-    KafkaMessage,
-)
 from agent.customer_success_agent import (
-    build_agent,
     AgentContext,
+    build_agent,
 )
-from database import queries as db
+from channels.gmail_handler import run_gmail_polling_loop
 from chat_provider import build_chat_client
+from database import queries as db
 from embeddings_provider import build_embedding_provider
 from env_config import load_environment
 from exceptions import sanitize_error_message
+from kafka_client import (
+    INBOUND_EMAIL_TOPIC,
+    INBOUND_WEBFORM_TOPIC,
+    INBOUND_WHATSAPP_TOPIC,
+    KafkaConsumerClient,
+    KafkaMessage,
+    KafkaProducerClient,
+    NoOpKafkaProducer,
+)
+from workers.metrics_collector import run_metrics_collector
+from workers.notification_sender import run_notification_sender_loop
 
 logger = structlog.get_logger(__name__)
 
@@ -180,7 +181,9 @@ class MessageProcessor:
                 ticket_number=ticket["ticket_number"],
             )
 
-            logger.info("WhatsApp message processed successfully", ticket_number=ticket["ticket_number"])
+            logger.info(
+                "WhatsApp message processed successfully", ticket_number=ticket["ticket_number"]
+            )
 
         except (asyncpg.PostgresError, Exception) as e:
             logger.error("Error processing WhatsApp message", error=sanitize_error_message(str(e)))
@@ -322,6 +325,7 @@ async def main():
         tasks = [
             run_gmail_polling_loop(kafka_producer, poll_interval_seconds=60),
             run_kafka_consumer_loop(db_pool, kafka_producer, kafka_bootstrap),
+            run_notification_sender_loop(db_pool, kafka_producer, kafka_bootstrap),
             run_metrics_collector(db_pool, kafka_producer, collection_interval=300),
         ]
     else:
@@ -332,7 +336,7 @@ async def main():
         ]
 
     try:
-        # Run Gmail polling, Kafka consumer, and metrics collector
+        # Run Gmail polling, inbound consumer, outbound sender and metrics
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
         logger.info("Worker shutting down...")

@@ -11,12 +11,14 @@ instead of failing collection.
 """
 
 import json
+import os
 
 import httpx
 import pytest
 
 try:
     from playwright.async_api import Page, async_playwright
+
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:  # pragma: no cover - depends on optional dependency
     _PLAYWRIGHT_AVAILABLE = False
@@ -27,8 +29,13 @@ if not _PLAYWRIGHT_AVAILABLE:
         allow_module_level=True,
     )
 
+pytestmark = pytest.mark.e2e
+
 BASE_URL = "http://localhost:8000"
-API_KEY = "test-key-12345"
+# Must match the live server's key. API_KEY can't be used here: conftest.py
+# overwrites it with the in-process test key. Falls back to API_KEY_SECRET,
+# which is what a server started from .env reads when API_KEY is unset.
+API_KEY = os.getenv("E2E_API_KEY") or os.getenv("API_KEY_SECRET") or ""
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -50,7 +57,10 @@ def server_available():
 async def browser():
     """Provide a browser instance."""
     async with async_playwright() as p:
-        browser = await p.chromium.launch()
+        try:
+            browser = await p.chromium.launch()
+        except Exception as e:  # browsers not downloaded
+            pytest.skip(f"Chromium not available ({e}). Run: playwright install chromium")
         yield browser
         await browser.close()
 
@@ -71,14 +81,16 @@ class TestWebFormFlow:
         # Mock web form endpoint (would be in real HTML page)
         response = await page.request.post(
             f"{BASE_URL}/webhooks/webform",
-            data=json.dumps({
-                "name": "Jane Smith",
-                "email": "jane.smith@example.com",
-                "subject": "How to set up connectors?",
-                "message": "I'm trying to set up my first data connector but need guidance.",
-                "category": "onboarding",
-                "priority": "medium",
-            }),
+            data=json.dumps(
+                {
+                    "name": "Jane Smith",
+                    "email": "jane.smith@example.com",
+                    "subject": "How to set up connectors?",
+                    "message": "I'm trying to set up my first data connector but need guidance.",
+                    "category": "onboarding",
+                    "priority": "medium",
+                }
+            ),
             headers={"Content-Type": "application/json"},
         )
 
@@ -97,14 +109,16 @@ class TestWebFormFlow:
         """Test ticket creation through REST API."""
         response = await page.request.post(
             f"{BASE_URL}/tickets",
-            data=json.dumps({
-                "name": "John Doe",
-                "email": "john@example.com",
-                "subject": "API integration issue",
-                "category": "technical",
-                "priority": "high",
-                "message": "Getting 401 errors when calling the API",
-            }),
+            data=json.dumps(
+                {
+                    "name": "John Doe",
+                    "email": "john@example.com",
+                    "subject": "API integration issue",
+                    "category": "technical",
+                    "priority": "high",
+                    "message": "Getting 401 errors when calling the API",
+                }
+            ),
             headers={
                 "Content-Type": "application/json",
                 "X-API-Key": API_KEY,
@@ -124,14 +138,16 @@ class TestWebFormFlow:
         # 1. Create ticket
         ticket_response = await page.request.post(
             f"{BASE_URL}/tickets",
-            data=json.dumps({
-                "name": "Test User",
-                "email": "test@example.com",
-                "subject": "Test ticket lifecycle",
-                "category": "support",
-                "priority": "low",
-                "message": "Testing full lifecycle",
-            }),
+            data=json.dumps(
+                {
+                    "name": "Test User",
+                    "email": "test@example.com",
+                    "subject": "Test ticket lifecycle",
+                    "category": "support",
+                    "priority": "low",
+                    "message": "Testing full lifecycle",
+                }
+            ),
             headers={
                 "Content-Type": "application/json",
                 "X-API-Key": API_KEY,
@@ -196,14 +212,16 @@ class TestWebFormFlow:
         for i in range(3):
             await page.request.post(
                 f"{BASE_URL}/tickets",
-                data=json.dumps({
-                    "name": "History Test",
-                    "email": customer_email,
-                    "subject": f"Issue #{i+1}",
-                    "category": "support",
-                    "priority": "low",
-                    "message": f"Support issue number {i+1}",
-                }),
+                data=json.dumps(
+                    {
+                        "name": "History Test",
+                        "email": customer_email,
+                        "subject": f"Issue #{i+1}",
+                        "category": "support",
+                        "priority": "low",
+                        "message": f"Support issue number {i+1}",
+                    }
+                ),
                 headers={
                     "Content-Type": "application/json",
                     "X-API-Key": API_KEY,
@@ -226,13 +244,15 @@ class TestWebFormFlow:
         # First, ingest an article
         ingest_response = await page.request.post(
             f"{BASE_URL}/knowledge-base/ingest",
-            data=json.dumps({
-                "title": "Getting Started with Connectors",
-                "content": "This guide explains how to set up and configure data connectors...",
-                "category": "onboarding",
-                "tags": ["connectors", "setup", "guide"],
-                "embedding": [],
-            }),
+            data=json.dumps(
+                {
+                    "title": "Getting Started with Connectors",
+                    "content": "This guide explains how to set up and configure data connectors...",
+                    "category": "onboarding",
+                    "tags": ["connectors", "setup", "guide"],
+                    "embedding": [],
+                }
+            ),
             headers={
                 "Content-Type": "application/json",
                 "X-API-Key": API_KEY,
@@ -288,14 +308,16 @@ class TestMultiChannelFlow:
         for channel_info in channels_data:
             response = await page.request.post(
                 f"{BASE_URL}/tickets",
-                data=json.dumps({
-                    "name": channel_info["name"],
-                    "email": channel_info["email"],
-                    "subject": f"Test from {channel_info['channel']}",
-                    "category": "support",
-                    "priority": "medium",
-                    "message": f"Message from {channel_info['channel']} channel",
-                }),
+                data=json.dumps(
+                    {
+                        "name": channel_info["name"],
+                        "email": channel_info["email"],
+                        "subject": f"Test from {channel_info['channel']}",
+                        "category": "support",
+                        "priority": "medium",
+                        "message": f"Message from {channel_info['channel']} channel",
+                    }
+                ),
                 headers={
                     "Content-Type": "application/json",
                     "X-API-Key": API_KEY,
@@ -311,14 +333,16 @@ class TestErrorHandling:
         """Test that invalid API key is rejected."""
         response = await page.request.post(
             f"{BASE_URL}/tickets",
-            data=json.dumps({
-                "name": "Test",
-                "email": "test@example.com",
-                "subject": "Test",
-                "category": "support",
-                "priority": "low",
-                "message": "Test",
-            }),
+            data=json.dumps(
+                {
+                    "name": "Test",
+                    "email": "test@example.com",
+                    "subject": "Test",
+                    "category": "support",
+                    "priority": "low",
+                    "message": "Test",
+                }
+            ),
             headers={
                 "Content-Type": "application/json",
                 "X-API-Key": "invalid-key",
@@ -330,11 +354,13 @@ class TestErrorHandling:
         """Test that missing required fields are rejected."""
         response = await page.request.post(
             f"{BASE_URL}/tickets",
-            data=json.dumps({
-                "name": "Test",
-                # Missing email
-                "subject": "Test",
-            }),
+            data=json.dumps(
+                {
+                    "name": "Test",
+                    # Missing email
+                    "subject": "Test",
+                }
+            ),
             headers={
                 "Content-Type": "application/json",
                 "X-API-Key": API_KEY,

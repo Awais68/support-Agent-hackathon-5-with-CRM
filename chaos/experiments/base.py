@@ -1,8 +1,8 @@
 import json
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -50,6 +50,7 @@ class ChaosExperiment(ABC):
 
     def _health_check(self) -> bool:
         import httpx
+
         try:
             r = httpx.get(
                 f"{self.config.api_url}/health",
@@ -70,6 +71,7 @@ class ChaosExperiment(ABC):
         interval: float | None = None,
     ) -> bool:
         import httpx
+
         timeout = timeout or self.config.recovery_timeout
         interval = interval or self.config.recovery_interval
         deadline = time.time() + timeout
@@ -94,6 +96,7 @@ class ChaosExperiment(ABC):
 
     def _run_cmd(self, cmd: list[str], shell: bool = False) -> tuple[int, str]:
         import subprocess
+
         try:
             result = subprocess.run(
                 cmd if not shell else " ".join(cmd),
@@ -121,11 +124,11 @@ class ChaosExperiment(ABC):
         return self._run_cmd(["docker", action, container])
 
     def log(self, message: str) -> None:
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ts = datetime.now(UTC).strftime("%H:%M:%S")
         print(f"[{ts}] [{self.name}] {message}")
 
     def run(self) -> ExperimentResult:
-        started_at = datetime.now(timezone.utc).isoformat()
+        started_at = datetime.now(UTC).isoformat()
         self._start_time = time.time()
         self.log("Starting experiment")
 
@@ -137,7 +140,7 @@ class ChaosExperiment(ABC):
                 recovery_time_seconds=None,
                 errors_observed=self.errors + ["System not healthy before experiment"],
                 started_at=started_at,
-                finished_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(UTC).isoformat(),
             )
 
         self.log("Injecting failure")
@@ -151,7 +154,7 @@ class ChaosExperiment(ABC):
                 recovery_time_seconds=None,
                 errors_observed=self.errors + [f"Injection error: {e}"],
                 started_at=started_at,
-                finished_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(UTC).isoformat(),
             )
 
         recovery_start = time.time()
@@ -172,5 +175,5 @@ class ChaosExperiment(ABC):
             recovery_time_seconds=round(recovery_time, 1),
             errors_observed=self.errors,
             started_at=started_at,
-            finished_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=datetime.now(UTC).isoformat(),
         )

@@ -1,7 +1,8 @@
 """Prometheus metrics for system monitoring."""
 
-from prometheus_client import Counter, Histogram, Gauge
 import time
+
+from prometheus_client import Counter, Gauge, Histogram
 
 # Counter metrics
 tickets_created = Counter(
