@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { useParams, useSearchParams } from 'next/navigation';
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { getTicketStatus, TicketCredential, TicketDetail } from '@/lib/api';
@@ -21,36 +22,48 @@ export default function TicketPage() {
   const [error, setError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const fetchTicket = useCallback(async () => {
-    if (!credential) return;
-    try {
-      const data = await getTicketStatus(ticketId, credential);
-      setTicket(data);
-      setError(null);
-      // After an email check, switch to the token so refreshes and the
-      // WebSocket use it.
-      if (!credential.token && data.tracking_token) {
-        setCredential({ token: data.tracking_token });
-      }
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : 'Failed to load ticket'
-      );
-      setTicket(null);
-    } finally {
-      setLoading(false);
-    }
-  }, [ticketId, credential]);
+  // Fetches the ticket and stores the result; callers use the returned
+  // promise. `isCurrent` drops responses for a credential that is no longer
+  // the active one.
+  const loadTicket = useCallback(
+    (isCurrent: () => boolean = () => true) => {
+      if (!credential) return Promise.resolve();
+      return getTicketStatus(ticketId, credential)
+        .then((data) => {
+          if (!isCurrent()) return;
+          setTicket(data);
+          setError(null);
+          // After an email check, switch to the token so refreshes and the
+          // WebSocket use it.
+          if (!credential.token && data.tracking_token) {
+            setCredential({ token: data.tracking_token });
+          }
+        })
+        .catch((err) => {
+          if (!isCurrent()) return;
+          setError(err instanceof Error ? err.message : 'Failed to load ticket');
+          setTicket(null);
+        })
+        .finally(() => {
+          if (isCurrent()) setLoading(false);
+        });
+    },
+    [ticketId, credential]
+  );
 
   const handleRefresh = useCallback(async () => {
     setIsRefreshing(true);
-    await fetchTicket();
+    await loadTicket();
     setIsRefreshing(false);
-  }, [fetchTicket]);
+  }, [loadTicket]);
 
   useEffect(() => {
-    fetchTicket();
-  }, [fetchTicket]);
+    let current = true;
+    loadTicket(() => current);
+    return () => {
+      current = false;
+    };
+  }, [loadTicket]);
 
   const handleEmailSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -115,12 +128,12 @@ export default function TicketPage() {
           <p className="text-gray-600 mb-4">
             Unable to load ticket details. Please check the ticket number and try again.
           </p>
-          <a
+          <Link
             href="/"
             className="inline-block px-4 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors"
           >
             Submit New Request
-          </a>
+          </Link>
         </div>
       </div>
     );
@@ -130,12 +143,12 @@ export default function TicketPage() {
     return (
       <div className="bg-white rounded-lg shadow-lg p-8 text-center">
         <p className="text-gray-600 mb-4">Ticket not found</p>
-        <a
+        <Link
           href="/"
           className="inline-block px-4 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors"
         >
           Submit New Request
-        </a>
+        </Link>
       </div>
     );
   }

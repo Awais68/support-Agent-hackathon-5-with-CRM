@@ -8,7 +8,7 @@ export const dynamic = 'force-dynamic';
 // Only the public, per-ticket endpoint is reachable from here, and no API key
 // is ever attached: the customer proves access with the tracking token from
 // the submission (?t=) or the email the ticket was filed under (?email=).
-// params.id arrives URL-decoded, so a strict whitelist is what stops `..%2F`
+// The id param arrives URL-decoded, so a strict whitelist is what stops `..%2F`
 // and friends from rewriting the upstream path.
 const TICKET_NUMBER_RE = /^TKT-\d{8}-[A-Z0-9]{4,12}$/;
 const TOKEN_RE = /^[0-9a-f]{32}$/;
@@ -19,9 +19,9 @@ const notFound = () =>
 
 export async function GET(
   request: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const ticketNumber = params.id;
+  const { id: ticketNumber } = await params;
   if (!TICKET_NUMBER_RE.test(ticketNumber)) {
     return NextResponse.json({ message: 'Invalid ticket number' }, { status: 400 });
   }

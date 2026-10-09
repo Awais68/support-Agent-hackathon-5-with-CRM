@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { useEffect, useRef } from 'react';
 import { TicketDetail, Message, connectTicketWebSocket } from '@/lib/api';
 
@@ -37,16 +38,16 @@ function formatDate(isoDate: string): string {
 
 export default function TicketStatus({ ticket, onRefresh, isRefreshing }: TicketStatusProps) {
   const wsRef = useRef<WebSocket | null>(null);
+  const wsTicketId = (ticket as { id?: string }).id || ticket.ticket_id;
+  const wsToken = ticket.tracking_token;
 
   useEffect(() => {
     let reconnectTimer: ReturnType<typeof setTimeout>;
     let isMounted = true;
 
     function connect() {
-      const ticketId = (ticket as any).id || ticket.ticket_id;
-      const token = ticket.tracking_token;
-      if (!ticketId || !token) return;
-      const ws = connectTicketWebSocket(ticketId, token);
+      if (!wsTicketId || !wsToken) return;
+      const ws = connectTicketWebSocket(wsTicketId, wsToken);
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
@@ -83,7 +84,7 @@ export default function TicketStatus({ ticket, onRefresh, isRefreshing }: Ticket
         wsRef.current = null;
       }
     };
-  }, [(ticket as any).id, ticket.ticket_id, ticket.tracking_token, onRefresh]);
+  }, [wsTicketId, wsToken, onRefresh]);
 
   return (
     <div className="bg-white rounded-lg shadow-lg p-6 sm:p-8">
@@ -93,7 +94,7 @@ export default function TicketStatus({ ticket, onRefresh, isRefreshing }: Ticket
           <div>
             <h1 className="text-3xl font-bold text-gray-900">{ticket.subject}</h1>
             <p className="text-sm text-gray-600 mt-1">
-              Ticket ID: <code className="bg-gray-100 px-2 py-1 rounded">{ticket.ticket_number}</code>
+              Ticket ID: <code className="bg-gray-100 px-2 py-1 rounded-sm">{ticket.ticket_number}</code>
             </p>
           </div>
           <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
@@ -155,7 +156,7 @@ export default function TicketStatus({ ticket, onRefresh, isRefreshing }: Ticket
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
                     {msg.sender_type === 'agent' && (
-                      <span className="inline-block px-2 py-1 bg-blue-100 text-blue-700 text-xs font-medium rounded">
+                      <span className="inline-block px-2 py-1 bg-blue-100 text-blue-700 text-xs font-medium rounded-sm">
                         TechFlow Support
                       </span>
                     )}
@@ -163,13 +164,13 @@ export default function TicketStatus({ ticket, onRefresh, isRefreshing }: Ticket
                       <span className="text-sm font-medium text-gray-700">{msg.agent_name}</span>
                     )}
                   </div>
-                  <span className="inline-block px-2 py-1 bg-gray-100 text-gray-700 text-xs font-medium rounded">
+                  <span className="inline-block px-2 py-1 bg-gray-100 text-gray-700 text-xs font-medium rounded-sm">
                     {channelLabels[msg.channel] || msg.channel}
                   </span>
                 </div>
 
                 {/* Message Content */}
-                <p className="text-gray-700 text-sm mb-2 whitespace-pre-wrap break-words">{msg.content}</p>
+                <p className="text-gray-700 text-sm mb-2 whitespace-pre-wrap wrap-break-word">{msg.content}</p>
 
                 {/* Timestamp */}
                 <p className="text-xs text-gray-500">{formatDate(msg.timestamp)}</p>
@@ -183,12 +184,12 @@ export default function TicketStatus({ ticket, onRefresh, isRefreshing }: Ticket
 
       {/* Action Links */}
       <div className="pt-6 border-t border-gray-200 flex flex-col sm:flex-row gap-3">
-        <a
+        <Link
           href="/"
           className="px-4 py-2 text-sm font-medium text-blue-600 bg-blue-50 rounded-lg hover:bg-blue-100 transition-colors text-center"
         >
           Submit New Request
-        </a>
+        </Link>
         <button
           onClick={() => {
             navigator.clipboard.writeText(ticket.ticket_number);

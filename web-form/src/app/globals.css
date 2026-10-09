@@ -1,25 +1,47 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
 
-@layer components {
-  .input-base {
-    @apply w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all;
-  }
+@theme {
+  --color-status-open: #3b82f6;
+  --color-status-in_progress: #eab308;
+  --color-status-resolved: #22c55e;
+  --color-status-escalated: #ef4444;
+  --color-status-closed: #9ca3af;
+}
 
-  .button-primary {
-    @apply w-full px-4 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed;
-  }
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
 
-  .error-text {
-    @apply text-red-600 text-sm mt-1;
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
   }
+}
 
-  .success-banner {
-    @apply w-full p-4 bg-green-50 border border-green-200 rounded-lg text-green-800;
-  }
+@utility input-base {
+  @apply w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all;
+}
 
-  .error-banner {
-    @apply w-full p-4 bg-red-50 border border-red-200 rounded-lg text-red-800;
-  }
+@utility button-primary {
+  @apply w-full px-4 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed;
+}
+
+@utility error-text {
+  @apply text-red-600 text-sm mt-1;
+}
+
+@utility success-banner {
+  @apply w-full p-4 bg-green-50 border border-green-200 rounded-lg text-green-800;
+}
+
+@utility error-banner {
+  @apply w-full p-4 bg-red-50 border border-red-200 rounded-lg text-red-800;
 }
