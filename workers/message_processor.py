@@ -10,6 +10,7 @@ from openai import APIError as OpenAIAPIError
 
 from channels.gmail_handler import run_gmail_polling_loop
 from workers.metrics_collector import run_metrics_collector
+from workers.notification_sender import run_notification_sender_loop
 from kafka_client import (
     KafkaProducerClient,
     KafkaConsumerClient,
@@ -322,6 +323,7 @@ async def main():
         tasks = [
             run_gmail_polling_loop(kafka_producer, poll_interval_seconds=60),
             run_kafka_consumer_loop(db_pool, kafka_producer, kafka_bootstrap),
+            run_notification_sender_loop(db_pool, kafka_producer, kafka_bootstrap),
             run_metrics_collector(db_pool, kafka_producer, collection_interval=300),
         ]
     else:
@@ -332,7 +334,7 @@ async def main():
         ]
 
     try:
-        # Run Gmail polling, Kafka consumer, and metrics collector
+        # Run Gmail polling, inbound consumer, outbound sender and metrics
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
         logger.info("Worker shutting down...")
