@@ -337,17 +337,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 # Rate limiting
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
@@ -358,6 +347,10 @@ app.add_middleware(SlowAPIMiddleware)
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
     """Verify API key for all endpoints except webhooks and health."""
+    # CORS preflights carry no credentials by design; let CORSMiddleware
+    # answer them instead of rejecting them with a 401.
+    if request.method == "OPTIONS":
+        return await call_next(request)
     try:
         await verify_api_key(request)
     except HTTPException as e:
@@ -368,6 +361,32 @@ async def api_key_middleware(request: Request, call_next):
         )
     response = await call_next(request)
     return response
+
+
+def cors_origins_from_env() -> list[str]:
+    """Parse CORS_ORIGINS (comma-separated) into an explicit origin allowlist."""
+    raw = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000")
+    origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+    if "*" in origins:
+        # A wildcard together with allow_credentials would let any site make
+        # credentialed requests; refuse it rather than guess.
+        raise ConfigurationError(
+            message="CORS_ORIGINS must list explicit origins; '*' is not allowed."
+        )
+    return origins
+
+
+# CORS is registered after the API key middleware so it wraps it: preflights
+# are answered here, and 401 responses still carry CORS headers so browsers
+# surface the real status instead of an opaque CORS error.
+cors_origins = cors_origins_from_env()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
+)
 
 
 # Health check endpoint
