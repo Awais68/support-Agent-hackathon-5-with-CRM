@@ -53,10 +53,11 @@ const FormDataSchema = z.object({
 export type ValidatedFormData = z.infer<typeof FormDataSchema>;
 
 // API client functions
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export async function submitSupportForm(data: WebFormPayload): Promise<SubmitResponse> {
-  const response = await fetch(`${API_URL}/webhooks/webform`, {
+  // Same-origin route handler (src/app/webhooks/webform) that forwards to the
+  // API with the real client address; no credentials.
+  const response = await fetch('/webhooks/webform', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),

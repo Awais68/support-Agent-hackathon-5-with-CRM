@@ -35,6 +35,10 @@ spec:
           name: http
           protocol: TCP
         env:
+        # Server-side routes call the API in-cluster at runtime; the
+        # NEXT_PUBLIC_* values below are frozen into the browser bundle.
+        - name: API_INTERNAL_URL
+          value: http://techflow-api.techflow.svc.cluster.local
         - name: NEXT_PUBLIC_API_URL
           valueFrom:
             configMapKeyRef:

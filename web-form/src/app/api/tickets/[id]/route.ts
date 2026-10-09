@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+import { apiBaseUrl, clientAddressHeaders } from '@/lib/upstream';
+
 // Route handlers and their fetches are cached by default in the App Router,
 // so the tracking page kept serving the pre-agent snapshot of the ticket even
 // after the worker had written the reply.
@@ -29,7 +31,10 @@ export async function GET(
   const token = request.nextUrl.searchParams.get('t');
   const email = request.nextUrl.searchParams.get('email');
   const upstreamParams = new URLSearchParams();
-  const headers: Record<string, string> = { Accept: 'application/json' };
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    ...clientAddressHeaders(request),
+  };
   if (token && TOKEN_RE.test(token)) {
     headers['X-Tracking-Token'] = token;
   } else if (email && email.length <= MAX_EMAIL_LENGTH) {
@@ -38,12 +43,7 @@ export async function GET(
     return notFound();
   }
 
-  // Server-side call: inside compose the browser-facing URL (localhost) is
-  // not the API, so prefer the internal service URL when it is set.
-  const apiUrl =
-    process.env.API_INTERNAL_URL ||
-    process.env.NEXT_PUBLIC_API_URL ||
-    'http://localhost:8000';
+  const apiUrl = apiBaseUrl();
   const query = upstreamParams.toString();
   const upstream =
     `${apiUrl}/public/tickets/${encodeURIComponent(ticketNumber)}` +

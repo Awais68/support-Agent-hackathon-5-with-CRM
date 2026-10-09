@@ -101,8 +101,13 @@ jobs:
       # The API refuses to start without a chat provider key. This placeholder
       # points at a closed local port, so any LLM or embedding call fails fast
       # and the API takes its degraded path; nothing leaves the runner.
-      OPENROUTER_API_KEY: ci-placeholder-not-a-key
-      OPENROUTER_BASE_URL: http://127.0.0.1:9/v1
+      DEEPSEEK_API_KEY: ci-placeholder-not-a-key
+      DEEPSEEK_BASE_URL: http://127.0.0.1:9/v1
+      # The web form runs on this host and overwrites X-Forwarded-For with the
+      # browser address, so the API trusts it from 127.0.0.1 (AUDIT S8);
+      # tests/test_client_ip_live.py checks spoofing and per-client buckets.
+      TRUSTED_PROXIES: 127.0.0.1
+      E2E_CLIENT_IP_TEST: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -205,6 +210,9 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      - name: Unit tests (client-ip preload)
+        run: npm test
 
       - name: Build
         run: npm run build

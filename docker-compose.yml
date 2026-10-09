@@ -77,9 +77,9 @@ services:
       - techflow
 
   # One-shot: embeds knowledge_base rows that have no vector (or one from a
-  # different model) so KB vector search works on a fresh volume. Needs an
-  # embedding provider key (GEMINI_API_KEY) in .env; without one it logs a
-  # warning and exits 0, and search degrades to lexical.
+  # different model) so KB vector search works on a fresh volume. Needs
+  # GEMINI_API_KEY; without it it logs an error and exits 0, and the API
+  # reports embeddings=missing and alerts on every lexical fallback.
   kb-embed:
     build:
       context: .
@@ -90,6 +90,8 @@ services:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
     command: python -m database.seed --embed-kb-only
     volumes:
       - .:/app
@@ -111,14 +113,24 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # Chat: DeepSeek. OpenRouter is an optional fallback, used only when
+      # DEEPSEEK_API_KEY is empty and OPENROUTER_API_KEY is set.
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      # Embeddings (KB search): Gemini.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
       API_KEY: ${API_KEY:-${API_KEY_SECRET:?set API_KEY or API_KEY_SECRET in .env}}
       CORS_ORIGINS: http://localhost:3000,http://localhost:8000
       # Base of the customer tracking link returned by /webhooks/webform.
       PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-http://localhost:3000}
+      # Only the web form may set the client address for rate limiting: it
+      # overwrites X-Forwarded-For with the browser's address (client-ip.js).
+      # Pinned below so a container restart cannot change it (AUDIT S8).
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.20.0.250}
     ports:
       - "8000:8000"
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -146,10 +158,16 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-techflow}:${POSTGRES_PASSWORD:-techflow}@postgres:5432/${POSTGRES_DB:-techflow}
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # Chat: DeepSeek. OpenRouter is an optional fallback, used only when
+      # DEEPSEEK_API_KEY is empty and OPENROUTER_API_KEY is set.
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      # Embeddings (KB search): Gemini.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
       TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER}
@@ -186,15 +204,18 @@ services:
       - "3000:3000"
     environment:
       NODE_ENV: production
-      # Server-side route handlers (/api/tickets, /api/voice) call the API's
-      # public endpoints over the compose network. No API key on purpose
+      # Read at runtime by the server-side routes (/webhooks/webform,
+      # /api/tickets, /api/voice), which call the API's public endpoints over
+      # the compose network. Not NEXT_PUBLIC_*: those are frozen at build. No API key on purpose
       # (AUDIT S7): nothing in the web form may hold the master key.
       API_INTERNAL_URL: http://api:8000
     depends_on:
       api:
         condition: service_healthy
     networks:
-      - techflow
+      techflow:
+        # The API's TRUSTED_PROXIES entry; keep the two in sync.
+        ipv4_address: 172.20.0.250
 
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:v0.15.0
@@ -218,6 +239,7 @@ services:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -253,3 +275,7 @@ volumes:
 networks:
   techflow:
     driver: bridge
+    ipam:
+      config:
+        # Fixed so the web form's pinned address (TRUSTED_PROXIES) is valid.
+        - subnet: 172.20.0.0/16
