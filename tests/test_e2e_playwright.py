@@ -11,6 +11,7 @@ instead of failing collection.
 """
 
 import json
+import os
 
 import httpx
 import pytest
@@ -28,7 +29,8 @@ if not _PLAYWRIGHT_AVAILABLE:
     )
 
 BASE_URL = "http://localhost:8000"
-API_KEY = "test-key-12345"
+# Must match the live server's API_KEY; scripts/setup_e2e.sh exports it.
+API_KEY = os.getenv("E2E_API_KEY", "")
 
 
 @pytest.fixture(scope="session", autouse=True)

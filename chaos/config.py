@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 @dataclass
 class ChaosConfig:
     api_url: str = os.getenv("TECHFLOW_API_URL", "http://localhost:8000")
-    api_key: str = os.getenv("TECHFLOW_API_KEY", "test-key-12345")
+    api_key: str = os.getenv("TECHFLOW_API_KEY", "")
     docker_network: str = os.getenv("TECHFLOW_DOCKER_NETWORK", "techflow_default")
     compose_project: str = os.getenv("TECHFLOW_COMPOSE_PROJECT", "")
 

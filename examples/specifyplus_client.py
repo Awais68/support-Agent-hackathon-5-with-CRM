@@ -172,7 +172,7 @@ if __name__ == "__main__":
 
     client = SpecifyPlusClient(
         base_url=os.getenv("SPECIFYPLUS_URL", "http://localhost:8000"),
-        api_key=os.getenv("SPECIFYPLUS_API_KEY", "test-key-12345"),
+        api_key=os.environ["SPECIFYPLUS_API_KEY"],
     )
 
     print("health:", client.health())

@@ -11,7 +11,7 @@ Usage:
     python scripts/load_test.py --base-url http://localhost:8000 --requests 200 --concurrency 10
 
 Environment variables:
-    API_KEY: API key for authentication (default: "test-api-key-2024")
+    API_KEY: API key for authentication (required, must match the server)
 """
 
 import argparse
@@ -28,7 +28,7 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-API_KEY = os.getenv("API_KEY", "test-api-key-2024")
+API_KEY = os.getenv("API_KEY", "")
 
 
 # --- Test data generators ---

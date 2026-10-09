@@ -24,7 +24,7 @@ Required variables in `.env`:
 | `DATABASE_URL` | Postgres connection string | `postgresql://techflow:techflow@postgres:5432/techflow` |
 | `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address | `kafka:29092` |
 | `OPENAI_API_KEY` | OpenAI API key (sk-...) | *(required)* |
-| `API_KEY` | API key for X-API-Key header | `test-key-12345` |
+| `API_KEY` | API key for X-API-Key header (required; API refuses to start without it) | — |
 | `CORS_ORIGINS` | Allowed CORS origins | `http://localhost:3000,http://localhost:8000` |
 
 Optional variables:

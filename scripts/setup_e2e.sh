@@ -87,7 +87,9 @@ fi
 echo "==> Starting API server on $BASE_URL"
 export DATABASE_URL="postgresql://techflow:techflow@localhost:5433/techflow"
 export KAFKA_BOOTSTRAP_SERVERS="localhost:9092"
-export API_KEY="test-key-12345"
+# Reuse a caller-provided key, otherwise generate a throwaway one for this run.
+export API_KEY="${API_KEY:-$(openssl rand -hex 16)}"
+export E2E_API_KEY="$API_KEY"
 # Only export these when actually set: exporting an empty value would shadow
 # the key that api/main.py loads from .env.
 if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then

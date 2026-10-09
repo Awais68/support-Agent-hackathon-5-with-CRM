@@ -1,5 +1,6 @@
 """FastAPI application for TechFlow CRM Digital FTE."""
 
+import hmac
 import os
 import re
 import traceback as tb
@@ -227,6 +228,20 @@ async def get_embedding_provider(request: Request) -> EmbeddingProvider | None:
     return getattr(request.app.state, "embedding_provider", None)
 
 
+def configured_api_key() -> str | None:
+    """Return the API key the server expects, or None when none is configured.
+
+    Deploy configs (docker-compose, render.yaml, k8s) set API_KEY; the .env
+    files set API_KEY_SECRET. Accept both so the key is never silently ignored.
+    """
+    return os.getenv("API_KEY") or os.getenv("API_KEY_SECRET") or None
+
+
+def _is_test_mode() -> bool:
+    """Whether the process runs in the explicit test mode (RUN_MODE=test)."""
+    return os.getenv("RUN_MODE", "").lower() == "test"
+
+
 async def verify_api_key(
     request: Request, x_api_key: str | None = Header(None)
 ) -> bool:
@@ -242,11 +257,10 @@ async def verify_api_key(
     ]:
         return True
 
-    # Deploy configs (docker-compose, render.yaml, k8s) set API_KEY; the .env
-    # files set API_KEY_SECRET. Accept both so the key is never silently ignored.
-    api_key = os.getenv("API_KEY") or os.getenv("API_KEY_SECRET") or "test-key-12345"
+    # Fail closed: with no key configured every protected request is rejected.
+    api_key = configured_api_key()
     key = request.headers.get("X-API-Key")
-    if not key or key != api_key:
+    if not api_key or not key or not hmac.compare_digest(key, api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     return True
@@ -258,6 +272,12 @@ async def lifespan(app: FastAPI):
     """Application lifespan management."""
     # Startup
     logger.info("Initializing FastAPI application")
+
+    if not configured_api_key() and not _is_test_mode():
+        raise ConfigurationError(
+            message="API_KEY (or API_KEY_SECRET) is not set. Refusing to start "
+            "without an API key; set RUN_MODE=test only for test runs."
+        )
 
     # Initialize database
     db_url = os.getenv(

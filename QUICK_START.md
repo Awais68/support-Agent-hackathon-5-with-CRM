@@ -399,7 +399,7 @@ curl http://localhost:9090/api/v1/query?query=up
 ## 🔐 Security Notes
 
 - API Key required for all endpoints except `/health` and webhooks
-- Default key: `test-key-12345` (change in production!)
+- No default key: the API refuses to start unless `API_KEY` (or `API_KEY_SECRET`) is set. The `test-key-12345` value in these examples is a placeholder.
 - Set `API_KEY` environment variable
 - Webhook signatures validated for Twilio
 - CORS configured for trusted origins

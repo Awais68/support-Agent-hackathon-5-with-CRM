@@ -5,6 +5,12 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+# Explicit test mode: the API refuses to start without a key outside it, and
+# tests authenticate with this fixed, non-secret value. Set before any app
+# import so module-level config sees it.
+os.environ["RUN_MODE"] = "test"
+os.environ["API_KEY"] = "test-key-12345"
+
 from openai import AsyncOpenAI
 from kafka_client import KafkaProducerClient
 
