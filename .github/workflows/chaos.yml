@@ -33,6 +33,9 @@ env:
   TECHFLOW_API_URL: http://localhost:8000
   # Throwaway key for the job's own stack, never a real secret.
   API_KEY: chaos-ci-key
+  # Compose checks the nested ${API_KEY_SECRET:?} even when API_KEY is set
+  # (runner Compose version), so both must be present.
+  API_KEY_SECRET: chaos-ci-key
   TECHFLOW_API_KEY: chaos-ci-key
   OPENROUTER_API_KEY: mock-not-a-key
   OPENROUTER_BASE_URL: http://127.0.0.1:9/v1
@@ -93,7 +96,10 @@ jobs:
         if: failure()
         run: |
           docker ps -a
-          docker inspect -f '{{.Name}} restarts={{.RestartCount}} exit={{.State.ExitCode}}' $(docker ps -aq)
+          ids=$(docker ps -aq)
+          if [ -n "$ids" ]; then
+            docker inspect -f '{{.Name}} restarts={{.RestartCount}} exit={{.State.ExitCode}}' $ids
+          fi
           docker compose logs --no-color --tail=200 api worker
 
       - name: Upload results
