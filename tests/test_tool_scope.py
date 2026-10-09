@@ -23,7 +23,7 @@ from agent.pre_processing_gate import GateAction, GateResult
 from agent.tools import OPENAI_TOOL_SCHEMAS, ToolContext, execute_tool, tool_schemas_for
 from database import queries as db
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
+pytestmark = pytest.mark.integration
 
 ALICE = "alice@acmecorp.com"
 MALLORY = "mallory@evil.example"
@@ -123,6 +123,7 @@ async def _seed(pool):
     return alice_ticket, mallory
 
 
+@pytest.mark.asyncio
 async def test_prompt_injection_cannot_reach_another_customer(pool):
     alice_ticket, mallory = await _seed(pool)
     alice_id = str(alice_ticket["id"])
@@ -230,6 +231,7 @@ async def test_prompt_injection_cannot_reach_another_customer(pool):
             assert key not in params.get("required", [])
 
 
+@pytest.mark.asyncio
 async def test_bound_tools_act_on_the_bound_ticket(pool):
     alice_ticket, mallory = await _seed(pool)
     producer = MagicMock()
