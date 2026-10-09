@@ -65,7 +65,7 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 | G2 / S8 (rate limit) | Medium | In-memory per-replica limiter, keyed on proxy IP | Documented, code still open: `docs/RATE_LIMITING.md` (limits per route, Redis needed for >1 replica, why keying on raw `X-Forwarded-For` is wrong, the trusted-proxy setup that fixes it). Live: 34 requests via the web form with 34 different `X-Forwarded-For` → one bucket (`client_ip=172.20.0.10`), `404×18, 429×16`. Global spend cap / CAPTCHA (S8) not done. |
 | N1 | High | CI never green | Fixed locally (ruff, black, mypy all clean and blocking); CI run not yet observed (push pending) |
 | N16 | Medium | mypy aborts on duplicate module | Fixed |
-| N2 | High | CD 0/7 (uppercase GHCR name, not gated on CI, no migrations) | Open |
+| N2 | High | CD 0/7 (uppercase GHCR name, not gated on CI, no migrations) | Fixed in the workflow, not run yet: `workflow_run` on a successful CI push to main, builds that SHA, lower-case image name, migration Job (`scripts/render_migrate.sh`) before `kubectl set image`. Deploy is opt-in via repo variable `K8S_DEPLOY=true`; needs a cluster, a `KUBE_CONFIG` secret, a `techflow-secrets` secret with `database-url`, and GHCR pull access from the cluster |
 | N3 | High | chaos.yml invalid YAML (0/7) | Open |
 | R2-A/B/C | — | Round 2 items | Already fixed (see reconciliation) |
 
