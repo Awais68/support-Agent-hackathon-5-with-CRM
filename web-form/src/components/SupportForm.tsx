@@ -66,6 +66,7 @@ export default function SupportForm() {
     return (
       <SuccessMessage
         ticketNumber={submitSuccess.ticket_number}
+        trackingToken={submitSuccess.tracking_token}
         estimatedResponse={submitSuccess.estimated_response}
         onNewRequest={() => {
           setSubmitSuccess(null);

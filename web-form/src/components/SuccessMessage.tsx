@@ -5,12 +5,14 @@ import { useState } from 'react';
 
 interface SuccessMessageProps {
   ticketNumber: string;
+  trackingToken?: string | null;
   estimatedResponse: string;
   onNewRequest: () => void;
 }
 
 export default function SuccessMessage({
   ticketNumber,
+  trackingToken,
   estimatedResponse,
   onNewRequest,
 }: SuccessMessageProps) {
@@ -24,7 +26,10 @@ export default function SuccessMessage({
   };
 
   const handleTrackTicket = () => {
-    router.push(`/ticket/${ticketNumber}`);
+    // The tracking token is the customer's proof of access; without it the
+    // tracking page asks for the ticket's email instead.
+    const query = trackingToken ? `?t=${encodeURIComponent(trackingToken)}` : '';
+    router.push(`/ticket/${encodeURIComponent(ticketNumber)}${query}`);
   };
 
   return (

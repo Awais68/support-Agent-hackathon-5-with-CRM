@@ -14,6 +14,7 @@ export interface SubmitResponse {
   ticket_number: string;
   message: string;
   estimated_response: string;
+  tracking_token: string | null;
   tracking_url: string;
 }
 
@@ -35,7 +36,7 @@ export interface TicketDetail {
   priority: string;
   created_at: string;
   updated_at: string;
-  customer_email: string;
+  tracking_token: string | null;
   messages: Message[];
 }
 
@@ -69,16 +70,25 @@ export async function submitSupportForm(data: WebFormPayload): Promise<SubmitRes
   return response.json();
 }
 
-export async function getTicketStatus(ticketId: string): Promise<TicketDetail> {
-  const response = await fetch(`/api/tickets/${ticketId}`, {
-    method: 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-  });
+export interface TicketCredential {
+  token?: string | null;
+  email?: string | null;
+}
+
+export async function getTicketStatus(
+  ticketNumber: string,
+  credential: TicketCredential
+): Promise<TicketDetail> {
+  const params = new URLSearchParams();
+  if (credential.token) params.set('t', credential.token);
+  else if (credential.email) params.set('email', credential.email);
+  const response = await fetch(
+    `/api/tickets/${encodeURIComponent(ticketNumber)}?${params.toString()}`,
+    { method: 'GET', headers: { Accept: 'application/json' } }
+  );
 
   if (!response.ok) {
-    if (response.status === 404) {
+    if (response.status === 404 || response.status === 400) {
       throw new Error('Ticket not found');
     }
     const error = await response.json().catch(() => ({ message: 'Failed to fetch ticket' }));

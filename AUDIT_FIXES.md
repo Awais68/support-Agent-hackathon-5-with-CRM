@@ -33,8 +33,8 @@ nothing new; their open follow-ups are R2-1…R2-8 below.
 
 | ID | Sev | Finding | Status | Exploit test (before → after) |
 |---|---|---|---|---|
-| S1 | Critical | Web-form proxy `/api/tickets/[id]` attaches the master key; `..%2F` reaches any GET | Open | |
-| S13 | Low | `get_ticket` exposes `agent_runs` (internal prompts, errors) | Open (fixed with S1's public view) | |
+| S1 | Critical | Web-form proxy `/api/tickets/[id]` attaches the master key; `..%2F` reaches any GET | Fixed (S1 commit) | `tests/test_proxy_exploits_live.py`: 10 failed (all audit URLs 200 with ticket/customer/metrics data) → 11 passed (400; own ticket via token/email 200, wrong token 404) |
+| S13 | Low | `get_ticket` exposes `agent_runs` (internal prompts, errors) | Fixed (S1 commit): customers only see `/public/tickets/*`, which drops agent_runs, customer identity, assignment and message metadata; `/tickets/{id}` stays key-only | `tests/test_ticket_tracking.py::test_valid_token_returns_redacted_view` |
 | S2 | High | Fuzzy email identity merge (`alice1@` → Alice) | Open | |
 | S3 | High | LLM tools take model-supplied `ticket_id` / `customer_email` | Open | |
 | S4 | High | WebSocket `/ws/tickets/{id}` unauthenticated | Open | |

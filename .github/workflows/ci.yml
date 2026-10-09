@@ -145,6 +145,31 @@ jobs:
           cat api.log
           exit 1
 
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web-form/package-lock.json
+
+      # The web form's /api/* route handlers are an attack surface of their
+      # own (AUDIT S1/S7); the proxy exploit tests need it running.
+      - name: Start web form
+        working-directory: web-form
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+          API_INTERNAL_URL: http://localhost:8000
+        run: |
+          npm ci
+          npm run build
+          nohup npm start > ../web-form.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000/ > /dev/null && exit 0
+            sleep 2
+          done
+          cat ../web-form.log
+          exit 1
+
       - name: Run live-stack tests
         run: pytest tests -m "integration or e2e" -v
         env:
@@ -154,7 +179,9 @@ jobs:
 
       - name: API log
         if: failure()
-        run: tail -200 api.log
+        run: |
+          tail -200 api.log
+          tail -100 web-form.log || true
 
   frontend:
     name: Frontend (Next.js) — Lint & Build

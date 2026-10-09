@@ -5,66 +5,69 @@ import { NextRequest, NextResponse } from 'next/server';
 // after the worker had written the reply.
 export const dynamic = 'force-dynamic';
 
+// Only the public, per-ticket endpoint is reachable from here, and no API key
+// is ever attached: the customer proves access with the tracking token from
+// the submission (?t=) or the email the ticket was filed under (?email=).
+// params.id arrives URL-decoded, so a strict whitelist is what stops `..%2F`
+// and friends from rewriting the upstream path.
+const TICKET_NUMBER_RE = /^TKT-\d{8}-[A-Z0-9]{4,12}$/;
+const TOKEN_RE = /^[0-9a-f]{32}$/;
+const MAX_EMAIL_LENGTH = 320;
+
+const notFound = () =>
+  NextResponse.json({ message: 'Ticket not found' }, { status: 404 });
+
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: { id: string } }
 ) {
-  const ticketId = params.id;
+  const ticketNumber = params.id;
+  if (!TICKET_NUMBER_RE.test(ticketNumber)) {
+    return NextResponse.json({ message: 'Invalid ticket number' }, { status: 400 });
+  }
+
+  const token = request.nextUrl.searchParams.get('t');
+  const email = request.nextUrl.searchParams.get('email');
+  const upstreamParams = new URLSearchParams();
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (token && TOKEN_RE.test(token)) {
+    headers['X-Tracking-Token'] = token;
+  } else if (email && email.length <= MAX_EMAIL_LENGTH) {
+    upstreamParams.set('email', email);
+  } else {
+    return notFound();
+  }
+
   // Server-side call: inside compose the browser-facing URL (localhost) is
   // not the API, so prefer the internal service URL when it is set.
   const apiUrl =
     process.env.API_INTERNAL_URL ||
     process.env.NEXT_PUBLIC_API_URL ||
     'http://localhost:8000';
-  const apiKey = process.env.API_KEY_SECRET;
-
-  if (!apiKey) {
-    return NextResponse.json(
-      { message: 'Server configuration error' },
-      { status: 500 }
-    );
-  }
+  const query = upstreamParams.toString();
+  const upstream =
+    `${apiUrl}/public/tickets/${encodeURIComponent(ticketNumber)}` +
+    (query ? `?${query}` : '');
 
   try {
-    const response = await fetch(`${apiUrl}/tickets/${ticketId}`, {
+    const response = await fetch(upstream, {
       method: 'GET',
-      headers: {
-        'X-API-Key': apiKey,
-        'Content-Type': 'application/json',
-      },
+      headers,
       cache: 'no-store',
+      redirect: 'error',
     });
 
+    if (response.status === 404) {
+      return notFound();
+    }
     if (!response.ok) {
-      if (response.status === 404) {
-        return NextResponse.json(
-          { message: 'Ticket not found' },
-          { status: 404 }
-        );
-      }
-      const error = await response.json().catch(() => ({}));
-      return NextResponse.json(error, { status: response.status });
+      return NextResponse.json(
+        { message: 'Failed to fetch ticket status' },
+        { status: response.status === 429 ? 429 : 502 }
+      );
     }
 
-    const data = await response.json();
-
-    // The API returns messages as { direction, created_at }; the tracking UI
-    // reads { sender_type, timestamp }. Without this mapping every message
-    // rendered as a customer bubble with an "Invalid Date" stamp.
-    const messages = Array.isArray(data.messages)
-      ? data.messages.map((m: Record<string, unknown>) => ({
-          ...m,
-          sender_type:
-            m.sender_type ?? (m.direction === 'outbound' ? 'agent' : 'customer'),
-          timestamp: m.timestamp ?? m.created_at,
-        }))
-      : [];
-
-    return NextResponse.json({
-      ...data,
-      ticket_id: data.ticket_id ?? data.id,
-      messages,
-    });
+    return NextResponse.json(await response.json());
   } catch (error) {
     console.error('Error fetching ticket:', error);
     return NextResponse.json(

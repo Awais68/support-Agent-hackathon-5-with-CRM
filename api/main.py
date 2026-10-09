@@ -43,6 +43,7 @@ from env_config import load_environment
 load_environment()
 
 from agent.customer_success_agent import AgentContext, CustomerSuccessAgent  # noqa: E402
+from api import tracking  # noqa: E402
 from api.rate_limiter import limiter, rate_limit_exceeded_handler, strict_limit  # noqa: E402
 from api.websocket_manager import WebSocketManager  # noqa: E402
 from channels.voice_handler import VoiceHandler, twilio_language  # noqa: E402
@@ -254,8 +255,15 @@ def _is_test_mode() -> bool:
     return os.getenv("RUN_MODE", "").lower() == "test"
 
 
+# Customer ticket view: authorized per ticket (tracking token or email) inside
+# the handler. One path segment only, so nothing else can ride on the prefix.
+PUBLIC_TICKET_PATH_RE = re.compile(r"^/public/tickets/[^/]+$")
+
+
 async def verify_api_key(request: Request, x_api_key: str | None = Header(None)) -> bool:
     """Verify API key for non-webhook endpoints."""
+    if PUBLIC_TICKET_PATH_RE.match(request.url.path):
+        return True
     # Skip verification for webhook, health, and metrics endpoints
     if request.url.path in [
         "/health",
@@ -575,6 +583,72 @@ async def get_ticket(
     }
 
 
+def public_web_url() -> str:
+    return os.getenv("PUBLIC_WEB_URL", "http://localhost:3000").rstrip("/")
+
+
+def _public_message(m: dict[str, Any]) -> dict[str, Any]:
+    sender = "agent" if m.get("direction") == "outbound" else "customer"
+    return {
+        "id": str(m["id"]),
+        "direction": m.get("direction"),
+        "sender_type": sender,
+        "content": m.get("content"),
+        "channel": m.get("channel"),
+        "created_at": m.get("created_at"),
+        "timestamp": m.get("created_at"),
+    }
+
+
+@app.get("/public/tickets/{ticket_number}")
+@limiter.limit("30/minute")
+async def get_public_ticket(
+    request: Request,
+    ticket_number: str,
+    token: str | None = Query(None, max_length=64),
+    email: str | None = Query(None, max_length=320),
+    x_tracking_token: str | None = Header(None, max_length=64),
+    pool: asyncpg.Pool = Depends(get_db),
+) -> dict[str, Any]:
+    """Customer-facing ticket view, no API key.
+
+    Needs the ticket's tracking token (header or ``token``) or the email the
+    ticket was filed under. Unknown ticket and bad credential both return the
+    same 404 so ticket numbers can't be enumerated. Internal fields
+    (agent_runs, customer identity, assignment, message metadata) are dropped.
+    """
+    not_found = NotFoundError(message="Ticket not found")
+    if not tracking.TICKET_NUMBER_RE.match(ticket_number):
+        raise not_found
+
+    ticket = await db.get_ticket_by_number(pool, ticket_number)
+    if not ticket:
+        raise not_found
+
+    supplied = x_tracking_token or token
+    if not (
+        tracking.verify_tracking_token(ticket["id"], supplied)
+        or tracking.email_matches(ticket.get("customer_email"), email)
+    ):
+        raise not_found
+
+    messages = await db.get_ticket_messages(pool, ticket["id"])
+    return {
+        "ticket_id": str(ticket["id"]),
+        "ticket_number": ticket["ticket_number"],
+        "subject": ticket.get("subject"),
+        "category": ticket.get("category"),
+        "priority": ticket.get("priority"),
+        "status": ticket.get("status"),
+        "channel": ticket.get("channel"),
+        "created_at": ticket.get("created_at"),
+        "updated_at": ticket.get("updated_at"),
+        "resolved_at": ticket.get("resolved_at"),
+        "tracking_token": tracking.tracking_token(ticket["id"]),
+        "messages": [_public_message(m) for m in messages],
+    }
+
+
 @app.patch("/tickets/{ticket_id}/status")
 async def update_ticket_status(
     ticket_id: UUID,
@@ -770,6 +844,7 @@ async def webhook_webform(
                 email=body.email,
             )
 
+    token = tracking.tracking_token(ticket["id"])
     return {
         "ticket_number": ticket["ticket_number"],
         "message": (
@@ -778,7 +853,11 @@ async def webhook_webform(
         "estimated_response": (
             "24 hours for Starter tier, 8 hours for Growth tier, 2 hours for Enterprise tier"
         ),
-        "tracking_url": f"https://support.techflow.com/track/{ticket['ticket_number']}",
+        "tracking_token": token,
+        "tracking_url": (
+            f"{public_web_url()}/ticket/{ticket['ticket_number']}"
+            + (f"?t={token}" if token else "")
+        ),
     }
 
 
