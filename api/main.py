@@ -76,12 +76,22 @@ from utils.circuit_breaker import CircuitBreakerError, get_circuit_breaker  # no
 logger = structlog.get_logger(__name__)
 
 
-# Fail closed on unsigned Twilio webhooks in production deployments.
-REQUIRE_TWILIO_SIGNATURE = os.getenv("REQUIRE_TWILIO_SIGNATURE", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+def require_twilio_signature() -> bool:
+    """Fail closed on unsigned Twilio webhooks unless explicitly turned off (S10).
+
+    Without a token nothing can be verified, so an unsigned webhook would let
+    anyone post as any phone number. Only local testing should set this false.
+    """
+    return os.getenv("REQUIRE_TWILIO_SIGNATURE", "true").lower() not in ("0", "false", "no")
+
+
+def whatsapp_signature_url(request: Request) -> str:
+    """The URL Twilio signed: the public one when a proxy terminates TLS."""
+    return (
+        os.getenv("TWILIO_WHATSAPP_WEBHOOK_URL")
+        or os.getenv("TWILIO_WEBHOOK_URL")
+        or str(request.url)
+    )
 
 
 def _kafka_requested() -> bool:
@@ -880,10 +890,12 @@ async def webhook_whatsapp(
         signature = request.headers.get("X-Twilio-Signature", "")
         params = {k: str(v) for k, v in form_data.items()}
         if handler.signature_validation_enabled:
-            if not handler.validate_webhook(signature, params=params, url=str(request.url)):
+            if not handler.validate_webhook(
+                signature, params=params, url=whatsapp_signature_url(request)
+            ):
                 logger.warning("Rejected WhatsApp webhook: invalid Twilio signature")
                 raise HTTPException(status_code=403, detail="Invalid webhook signature")
-        elif REQUIRE_TWILIO_SIGNATURE:
+        elif require_twilio_signature():
             logger.error("Rejected WhatsApp webhook: TWILIO_AUTH_TOKEN not configured")
             raise HTTPException(status_code=403, detail="Webhook signature validation unavailable")
         else:

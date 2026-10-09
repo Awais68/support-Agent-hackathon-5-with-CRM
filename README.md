@@ -423,9 +423,9 @@ Precedence (`env_config.py`): shell env > `.env.<ENVIRONMENT>` > `.env`. `ENVIRO
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_WHATSAPP_NUMBER` | — | Twilio credentials. Setting the token turns on signature checks. |
-| `TWILIO_WEBHOOK_URL` | `http://localhost:8000/webhooks/whatsapp` | URL used for signature validation |
-| `REQUIRE_TWILIO_SIGNATURE` | `false` | Reject WhatsApp webhooks when no token is configured |
+| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_WHATSAPP_NUMBER` | — | Twilio credentials. The token is needed to verify WhatsApp webhook signatures. |
+| `TWILIO_WHATSAPP_WEBHOOK_URL` (or `TWILIO_WEBHOOK_URL`) | the request URL | Public URL Twilio signs; set it when a proxy terminates TLS |
+| `REQUIRE_TWILIO_SIGNATURE` | `true` | Reject WhatsApp webhooks that cannot be verified (no token). Set `false` only for local testing |
 | `GMAIL_CREDENTIALS_FILE` / `GMAIL_TOKEN_FILE` | `gmail_credentials.json` / `gmail_token.json` | Gmail OAuth files |
 
 ### Identity resolution & circuit breakers
@@ -800,7 +800,7 @@ machine. The items marked ✅ were fixed on branch `fix/known-issues`; see
 
 - **Public endpoints that cost money:**
   - `/webhooks/webform` is public, and each request triggers LLM spend (rate limit 10/min per IP).
-  - WhatsApp signature checking is optional unless `REQUIRE_TWILIO_SIGNATURE=true`.
+  - WhatsApp webhooks without a verifiable signature are refused unless `REQUIRE_TWILIO_SIGNATURE=false`.
 - **`audio_url` DNS-rebinding window:** `utils/safe_fetch.py` resolves the host and then connects
   separately. The host allowlist mitigates this.
 - **`database/seed.py` logs `db_url`, password included.**

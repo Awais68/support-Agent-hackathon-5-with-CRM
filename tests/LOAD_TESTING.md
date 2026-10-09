@@ -32,6 +32,10 @@ locust -f tests/locustfile.py --headless -u 20 -r 5 -t 1m --host=$INGRESS_URL
 | Gmail         | 1           | 50+             | `POST /tickets`          |
 | WhatsApp      | 1           | 50+             | `POST /webhooks/whatsapp` (form-encoded) |
 
+The WhatsApp task sends unsigned webhooks, which the API refuses (403)
+unless it runs with `REQUIRE_TWILIO_SIGNATURE=false`. Use that only on a
+local or load-test stack.
+
 ## Metrics Tracked
 
 - **P95 Latency** — flagged per-request when > 3s
