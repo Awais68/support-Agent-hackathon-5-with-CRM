@@ -1,11 +1,6 @@
 node_modules
 .next
 out
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
 .git
 .gitignore
 *.md
@@ -14,3 +9,25 @@ Dockerfile
 .pytest_cache/
 __pycache__/
 *.pyc
+
+# Secrets and local state: never in an image (AUDIT S5). `**/` also catches
+# copies in subdirectories.
+**/.env
+**/.env.*
+!**/.env*.example
+**/*.bak
+**/credentials.json
+**/client_secret*.json
+**/gmail_*.json
+**/gmail_*.pickle
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+/*.sql
+.claude/
+.kilo/
+**/scratch/
+**/scratchpad/
+tmp/
+.coverage
