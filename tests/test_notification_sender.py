@@ -8,6 +8,9 @@ so no real email or WhatsApp message is sent. Everything else is real:
   (or DATABASE_URL) to a reachable server; otherwise these tests skip.
 - ``test_kafka_topic_message_triggers_send`` additionally needs a broker at
   OUTBOUND_TEST_KAFKA (e.g. localhost:9092) and is marked ``integration``.
+  It uses a throwaway copy of the outbound topic: publishing to the real
+  ``notifications.outbound`` would let a running worker on the same broker
+  consume the test event and try a real send.
 """
 
 import asyncio
@@ -224,33 +227,43 @@ async def test_mid_run_tool_event_is_superseded(pool):
 
 @pytest.mark.integration
 async def test_kafka_topic_message_triggers_send(pool):
-    """Publish to the real topic; the sender's consumer group delivers it."""
+    """Publish an outbound event to Kafka; the sender consumes and delivers it."""
     bootstrap = os.getenv("OUTBOUND_TEST_KAFKA")
     if not bootstrap:
         pytest.skip("OUTBOUND_TEST_KAFKA not set")
 
+    from aiokafka.admin import AIOKafkaAdminClient, NewTopic
+
     from kafka_client import KafkaConsumerClient, KafkaProducerClient
+
+    topic = f"{NOTIFICATIONS_OUTBOUND_TOPIC}.test-{uuid.uuid4().hex[:8]}"
+    admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap)
+    await admin.start()
+    # Create it up front so the first publish does not race auto-creation.
+    await admin.create_topics([NewTopic(topic, num_partitions=1, replication_factor=1)])
 
     ticket_id = await _ticket(pool)
     agent_run_id = str(uuid.uuid4())
-    delivered = asyncio.Event()
-
-    async def fake_email(to, subject, body):
-        if body == f"reply for {agent_run_id}":
-            delivered.set()
+    handled = asyncio.Event()
+    email = AsyncMock()
 
     producer = KafkaProducerClient(bootstrap)
     await producer.start()
-    sender = OutboundSender(
-        pool, producer, email_sender=AsyncMock(side_effect=fake_email)
-    )
+    sender = OutboundSender(pool, producer, email_sender=email)
+
+    async def on_message(message):
+        await sender.handle(message)
+        # Signal only after handle() has recorded the final status.
+        if message.payload.get("agent_run_id") == agent_run_id:
+            handled.set()
+
     # Fresh group so this test does not steal from a running worker.
     consumer = KafkaConsumerClient(bootstrap, f"outbound-test-{uuid.uuid4().hex[:6]}")
-    await consumer.start([NOTIFICATIONS_OUTBOUND_TOPIC])
-    task = asyncio.create_task(consumer.consume_messages(sender.handle))
+    await consumer.start([topic])
+    task = asyncio.create_task(consumer.consume_messages(on_message))
     try:
         await producer.send_message(
-            NOTIFICATIONS_OUTBOUND_TOPIC,
+            topic,
             {
                 "ticket_id": ticket_id,
                 "customer_email": "jane@example.com",
@@ -260,13 +273,18 @@ async def test_kafka_topic_message_triggers_send(pool):
             },
             key=ticket_id,
         )
-        await asyncio.wait_for(delivered.wait(), timeout=30)
+        await asyncio.wait_for(handled.wait(), timeout=30)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await consumer.stop()
         await producer.stop()
+        await admin.delete_topics([topic])
+        await admin.close()
 
+    email.assert_awaited_once_with(
+        "jane@example.com", "Cannot export CSV", f"reply for {agent_run_id}"
+    )
     row = await _row(pool, agent_run_id)
     assert row["status"] == "sent"
 
