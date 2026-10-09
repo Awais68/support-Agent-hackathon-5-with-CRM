@@ -307,7 +307,7 @@ uv run uvicorn api.main:app --reload --port 8000
 
 curl localhost:8000/health
 # {"status":"healthy","db":"ok","kafka":"disabled"}
-curl -H "X-API-Key: local-dev-key" "localhost:8000/tickets?limit=2"
+curl -H "X-API-Key: $API_KEY" "localhost:8000/tickets?limit=2"   # the API_KEY value from .env
 ```
 
 ### 5. Run the worker (needs Kafka) ⚠️ not run during verification
